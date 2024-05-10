@@ -74,7 +74,7 @@ except ImportError:
         mysql = None
 
 
-__version__ = '3.17.3'
+__version__ = '3.17.5'
 __all__ = [
     'AnyField',
     'AsIs',
@@ -223,12 +223,12 @@ if sqlite3:
             date, time = t.split(b' ')
             y, m, d = map(int, date.split(b'-'))
             t_full = time.split(b'.')
-            h, m, s = map(int, t_full[0].split(b':'))
+            hour, minute, second = map(int, t_full[0].split(b':'))
             if len(t_full) == 2:
                 usec = int('{:0<6.6}'.format(t_full[1].decode()))
             else:
                 usec = 0
-            return datetime.datetime(y, m, d, h, m, s, usec)
+            return datetime.datetime(y, m, d, hour, minute, second, usec)
         sqlite3.register_adapter(datetime.datetime, datetime_adapter)
         sqlite3.register_converter('date', convert_date)
         sqlite3.register_converter('timestamp', convert_timestamp)
