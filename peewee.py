@@ -74,7 +74,7 @@ except ImportError:
         mysql = None
 
 
-__version__ = '3.18.3'
+__version__ = '3.19.0'
 __all__ = [
     'AnyField',
     'AsIs',
@@ -334,6 +334,7 @@ DJANGO_MAP = attrdict({
     'ne': operator.ne,
     'in': operator.lshift,
     'is': lambda l, r: Expression(l, OP.IS, r),
+    'is_not': lambda l, r: Expression(l, OP.IS_NOT, r),
     'like': lambda l, r: Expression(l, OP.LIKE, r),
     'ilike': lambda l, r: Expression(l, OP.ILIKE, r),
     'regexp': lambda l, r: Expression(l, OP.REGEXP, r),
