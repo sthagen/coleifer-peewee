@@ -5325,6 +5325,8 @@ class DateTimeField(_BaseFormattedField):
     formats = [
         '%Y-%m-%d %H:%M:%S.%f',
         '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d %H:%M:%S.%f%z',
+        '%Y-%m-%d %H:%M:%S%z',
         '%Y-%m-%d',
     ]
 
