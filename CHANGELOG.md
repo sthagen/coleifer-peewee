@@ -13,6 +13,14 @@ https://github.com/coleifer/peewee/releases
 * Adds new `ISODateTimeField` for Sqlite that encodes datetimes in ISO format
   (more friendly when db is shared with other tools), and also properly reads
   back UTC offset info.
+* Add a `Model.dirty_field_names` attribute that is safe for membership
+  testing, since testing `x in dirty_fields` returns True if one or more field
+  exists due to operator overloads returning a truthy Expression object.
+  Refs #3028.
+* **Significant**: removal of Cython `_sqlite_ext` extension. The C
+  implementations of the FTS rank functions are moved to `sqlite_udf`. Most of
+  the remaining functionality is moved to `playhouse.cysqlite_ext` which
+  supports it natively (no more hacks).
 
 [View commits](https://github.com/coleifer/peewee/compare/3.19.0...master)
 

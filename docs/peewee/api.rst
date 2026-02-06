@@ -841,56 +841,6 @@ Database
                 def finalize(self):
                     return self._value
 
-    .. py:method:: table_function([name=None])
-
-        Class-decorator for registering a :py:class:`TableFunction`. Table
-        functions are user-defined functions that, rather than returning a
-        single, scalar value, can return any number of rows of tabular data.
-
-        Example:
-
-        .. code-block:: python
-
-            from playhouse.sqlite_ext import TableFunction
-
-            @db.table_function('series')
-            class Series(TableFunction):
-                columns = ['value']
-                params = ['start', 'stop', 'step']
-
-                def initialize(self, start=0, stop=None, step=1):
-                    """
-                    Table-functions declare an initialize() method, which is
-                    called with whatever arguments the user has called the
-                    function with.
-                    """
-                    self.start = self.current = start
-                    self.stop = stop or float('Inf')
-                    self.step = step
-
-                def iterate(self, idx):
-                    """
-                    Iterate is called repeatedly by the SQLite database engine
-                    until the required number of rows has been read **or** the
-                    function raises a `StopIteration` signalling no more rows
-                    are available.
-                    """
-                    if self.current > self.stop:
-                        raise StopIteration
-
-                    ret, self.current = self.current, self.current + self.step
-                    return (ret,)
-
-            # Usage:
-            cursor = db.execute_sql('SELECT * FROM series(?, ?, ?)', (0, 5, 2))
-            for value, in cursor:
-                print(value)
-
-            # Prints:
-            # 0
-            # 2
-            # 4
-
     .. py:method:: unregister_aggregate(name)
 
         :param name: Name of the user-defined aggregate function.
@@ -906,13 +856,6 @@ Database
     .. py:method:: unregister_function(name)
 
         :param name: Name of the user-defined scalar function.
-
-        Unregister the user-defined scalar function.
-
-    .. py:method:: unregister_table_function(name)
-
-        :param name: Name of the user-defined table function.
-        :returns: True or False, depending on whether the function was removed.
 
         Unregister the user-defined scalar function.
 
@@ -4646,6 +4589,19 @@ Model
             field attribute is set on a model instance. If the field contains a
             value that is mutable, such as a dictionary instance, and that
             dictionary is then modified, Peewee will not notice the change.
+
+        .. warning::
+            Do not do membership tests on this list, e.g. ``f in dirty_fields``
+            because if there is one or more fields in the dirty fields list,
+            the field equality override will return a truthy Expression object.
+            If you want to test if a field is dirty, instead
+            check ``f.name in model.dirty_field_names``.
+
+    .. py:attribute:: dirty_field_names
+
+        Return list of field names that have been modified.
+
+        :rtype: list
 
     .. py:method:: is_dirty()
 
