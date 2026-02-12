@@ -17,7 +17,8 @@ make up the ``playhouse``.
 
 **Database drivers / vendor-specific database functionality**
 
-* :ref:`sqlite_ext` (on its own page)
+* :ref:`sqlite_ext`
+* :ref:`cysqlite_ext`
 * :ref:`sqliteq`
 * :ref:`sqlite_udf`
 * :ref:`apsw`
@@ -44,11 +45,6 @@ make up the ``playhouse``.
 * :ref:`db_url`
 * :ref:`test_utils`
 * :ref:`flask_utils`
-
-Sqlite Extensions
------------------
-
-The Sqlite extensions have been moved to :ref:`their own page <sqlite_ext>`.
 
 .. _sqliteq:
 
@@ -1658,6 +1654,7 @@ Additional MySQL-specific helpers:
 
 .. py:function:: Match(columns, expr[, modifier=None])
 
+    :noindex:
     :param columns: a single :py:class:`Field` or a tuple of multiple fields.
     :param str expr: the full-text search expression.
     :param str modifier: optional modifiers for the search, e.g. *'in boolean mode'*.

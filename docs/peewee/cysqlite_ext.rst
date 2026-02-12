@@ -1,10 +1,23 @@
-.. _cysqlite:
+.. _cysqlite_ext:
 
 cysqlite Extension
 ==================
 
 SQLite database implementation using `cysqlite <https://cysqlite.readthedocs.io/>`_
-as the driver.
+as the driver. The ``cysqlite`` extension also works with the following SQLite
+extensions, which can be imported from ``playhouse.cysqlite_ext``:
+
+* :py:class:`RowIDField`
+* :py:class:`DocIDField`
+* :py:class:`AutoIncrementField`
+* :py:class:`ISODateTimeField`
+* :py:class:`JSONField` and :py:class:`JSONPath`
+* :py:class:`JSONBField` and :py:class:`JSONBPath`
+* :py:class:`SearchField`
+* :py:class:`VirtualModel`
+* :py:class:`FTSModel`, providing full-text search.
+* :py:class:`FTS5Model`, providing full-text search using FTS5.
+
 
 .. py:class:: CySqliteDatabase(database[, pragmas=None[, timeout=5[, rank_functions=True[, regexp_function=False[, json_contains=False]]]]])
 
@@ -15,9 +28,10 @@ as the driver.
     :param bool regexp_function: Make the REGEXP function available.
     :param bool json_contains: Make json_containts() function available.
 
-    Extends :py:class:`SqliteDatabase` and inherits methods for declaring
-    user-defined functions, aggregates, window functions, collations, pragmas,
-    etc.
+    .. seealso::
+       CySqliteDatabase extends :py:class:`SqliteDatabase` and inherits all
+       methods for declaring user-defined functions, aggregates, window
+       functions, collations, pragmas, etc.
 
     Example:
 
@@ -308,3 +322,5 @@ as the driver.
             # Read the data back out of the blob.
             blob.seek(0)
             image_data = blob.read(img_size)
+
+    .. include:: sqlite-method-defs.rst

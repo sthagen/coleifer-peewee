@@ -56,6 +56,7 @@ For more information on database extensions, see:
 * :ref:`postgres_ext`
 * :ref:`sqlite_ext`
 * :ref:`sqlcipher_ext` (encrypted SQLite database).
+* :ref:`cysqlite_ext`
 * :ref:`apsw`
 * :ref:`sqliteq`
 
@@ -93,7 +94,8 @@ Consult your database driver's documentation for the available parameters:
 * Postgres: `psycopg2 <https://www.psycopg.org/docs/module.html#psycopg2.connect>`_
 * MySQL: `pymysql <https://github.com/PyMySQL/PyMySQL/blob/f08f01fe8a59e8acfb5f5add4a8fe874bec2a196/pymysql/connections.py#L494-L513>`_
 * MySQL: `mysqlclient <https://github.com/PyMySQL/mysqlclient>`_
-* SQLite: `sqlite3 <https://docs.python.org/2/library/sqlite3.html#sqlite3.connect>`_
+* SQLite: `sqlite3 <https://docs.python.org/3/library/sqlite3.html#sqlite3.connect>`_
+* CySQLite: `cysqlite <https://cysqlite.readthedocs.io/en/latest/api.html#connect>`_
 
 .. _using_postgresql:
 
@@ -181,7 +183,7 @@ To connect to a SQLite database, we will use :py:class:`SqliteDatabase`. The
 first parameter is the filename containing the database, or the string
 ``':memory:'`` to create an in-memory database. After the database filename,
 you can specify a list or pragmas or any other arbitrary `sqlite3 parameters
-<https://docs.python.org/2/library/sqlite3.html#sqlite3.connect>`_.
+<https://docs.python.org/3/library/sqlite3.html#sqlite3.connect>`_.
 
 .. code-block:: python
 
@@ -199,12 +201,27 @@ you can specify a list or pragmas or any other arbitrary `sqlite3 parameters
 Peewee includes a :ref:`SQLite extension module <sqlite_ext>` which provides
 many SQLite-specific features such as :ref:`full-text search <sqlite-fts>`,
 :ref:`json extension support <sqlite-json1>`, and much, much more. If you would
-like to use these awesome features, use the :py:class:`SqliteExtDatabase` from
-the ``playhouse.sqlite_ext`` module:
+like to use these awesome features, use:
+
+* :py:class:`SqliteExtDatabase` from the ``playhouse.sqlite_ext`` module, or
+* :py:class:`CySqliteDatabase` from the ``playhouse.cysqlite_ext`` module.
+
+Using ``SqliteExtDatabase``:
 
 .. code-block:: python
 
     from playhouse.sqlite_ext import SqliteExtDatabase
+
+    sqlite_db = SqliteExtDatabase('my_app.db', pragmas={
+        'journal_mode': 'wal',  # WAL-mode.
+        'cache_size': -64 * 1000,  # 64MB cache.
+        'synchronous': 0})  # Let the OS manage syncing.
+
+Using ``CySqliteDatabase``:
+
+.. code-block:: python
+
+    from playhouse.cysqlite_ext import CySqliteDatabase
 
     sqlite_db = SqliteExtDatabase('my_app.db', pragmas={
         'journal_mode': 'wal',  # WAL-mode.
@@ -304,10 +321,6 @@ extensions:
 * Window Functions - aggregates which support operating on windows of data.
 * Collations - which describe how to sort some value.
 * Table Functions - fully user-defined tables (requres ``cysqlite``).
-
-.. note::
-    For even more extension support, see :py:class:`SqliteExtDatabase`, which
-    is in the ``playhouse.sqlite_ext`` module.
 
 Example user-defined function:
 
@@ -518,6 +531,21 @@ If you would like to use APSW, use the :py:class:`APSWDatabase` from the
 
     apsw_db = APSWDatabase('my_app.db')
 
+cysqlite, an alternate DB-API driver
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Peewee comes with support for the `cysqlite <https://cysqlite.readthedocs.io>`_
+driver. Additional functionality is provided by :py:class:`CySqliteDatabase`:
+
+* :py:meth:`~CySqliteDatabase.table_function` - user-defined table functions.
+* :py:meth:`~CySqliteDatabase.on_commit`  / :py:meth:`~CySqliteDatabase.on_rollback` - commit and rollback hooks.
+* :py:meth:`~CySqliteDatabase.on_update` - update hook.
+* :py:meth:`~CySqliteDatabase.authorizer` - authorizer callback.
+* :py:meth:`~CySqliteDatabase.trace` - trace callback.
+* :py:meth:`~CySqliteDatabase.progress` - progress handler.
+* :py:meth:`~CySqliteDatabase.backup` / :py:meth:`~CySqliteDatabase.backup_to_file` - online backup APIs.
+* :py:meth:`~CySqliteDatabase.blob_open` - incremental BLOB I/O.
+
 .. _using_mariadb:
 
 Using MariaDB
@@ -559,7 +587,7 @@ Driver information:
   and is legacy and should not be used. Since this shares the same module name
   as mysqlclient, same applies.
 * `mysql-connector python <https://github.com/mysql/mysql-connector-python>`_ pure-python
-  (I think??) supports python 3. To use this driver you can use :ref:`MySQLConnectorDatabase`
+  (I think??) supports python 3. To use this driver you can use :py:class:`MySQLConnectorDatabase`
   from the ``playhouse.mysql_ext`` extension.
 
 Error 2006: MySQL server has gone away
@@ -995,6 +1023,7 @@ The following pooled database classes are available:
 * :py:class:`PooledMySQLDatabase`
 * :py:class:`PooledSqliteDatabase`
 * :py:class:`PooledSqliteExtDatabase`
+* :py:class:`PooledCySqliteDatabase`
 
 For an in-depth discussion of peewee's connection pool, see the :ref:`pool`
 section of the :ref:`playhouse <playhouse>` documentation.
