@@ -16,7 +16,6 @@ from playhouse.cockroachdb import CockroachDatabase
 from playhouse.cockroachdb import NESTED_TX_MIN_VERSION
 from playhouse.mysql_ext import MariaDBConnectorDatabase
 from playhouse.mysql_ext import MySQLConnectorDatabase
-from playhouse.psycopg3_ext import Psycopg3Database
 try:
     from playhouse.cysqlite_ext import CySqliteDatabase
 except ImportError:
@@ -32,8 +31,7 @@ def db_loader(engine, name='peewee_test', db_class=None, **params):
             SqliteDatabase: ['sqlite', 'sqlite3'],
             CySqliteDatabase: ['cysqlite'],
             MySQLDatabase: ['mysql'],
-            PostgresqlDatabase: ['postgres', 'postgresql'],
-            Psycopg3Database: ['psycopg3'],
+            PostgresqlDatabase: ['postgres', 'postgresql', 'psycopg3'],
             MySQLConnectorDatabase: ['mysqlconnector'],
             MariaDBConnectorDatabase: ['mariadb', 'maridbconnector'],
             CockroachDatabase: ['cockroach', 'cockroachdb', 'crdb'],
@@ -51,6 +49,7 @@ def db_loader(engine, name='peewee_test', db_class=None, **params):
         params.update(CRDB_PARAMS)
     elif issubclass(db_class, PostgresqlDatabase):
         params.update(PSQL_PARAMS)
+
     return db_class(name, **params)
 
 
@@ -67,12 +66,31 @@ BACKEND = os.environ.get('PEEWEE_TEST_BACKEND') or 'sqlite'
 VERBOSITY = int(os.environ.get('PEEWEE_TEST_VERBOSITY') or 1)
 SLOW_TESTS = bool(os.environ.get('PEEWEE_SLOW_TESTS'))
 
+# What family of database are we using.
 IS_SQLITE = BACKEND.startswith(('sqlite', 'cysqlite'))
 IS_MYSQL = BACKEND.startswith(('mysql', 'maria'))
 IS_POSTGRESQL = BACKEND.startswith(('postgres', 'psycopg'))
+
+# Specific database or driver.
 IS_CRDB = BACKEND in ('cockroach', 'cockroachdb', 'crdb')
 IS_PSYCOPG3 = BACKEND == 'psycopg3'
 IS_CYSQLITE = BACKEND == 'cysqlite'
+
+if IS_MYSQL:
+    try:
+        import pymysql
+    except ImportError:
+        raise ImportError('pymysql is not installed')
+if BACKEND.startswith('postgres'):
+    try:
+        import psycopg2
+    except ImportError:
+        raise ImportError('psycopg2 is not installed')
+if IS_PSYCOPG3:
+    try:
+        import psycopg
+    except ImportError:
+        raise ImportError('psycopg3 is not installed')
 
 
 def make_db_params(key):
@@ -88,6 +106,8 @@ def make_db_params(key):
 CRDB_PARAMS = make_db_params('CRDB')
 MYSQL_PARAMS = make_db_params('MYSQL')
 PSQL_PARAMS = make_db_params('PSQL')
+if IS_PSYCOPG3:
+    PSQL_PARAMS['prefer_psycopg3'] = True
 
 if VERBOSITY > 1:
     handler = logging.StreamHandler()

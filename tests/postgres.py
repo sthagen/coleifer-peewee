@@ -104,7 +104,7 @@ class TestTZField(ModelTestCase):
         tz = TZModel.create(dt=dt)
         self.assertTrue(tz.dt.tzinfo is None)
 
-        # When we retrieve the row, psycopg2 will attach the appropriate tzinfo
+        # When we retrieve the row, psycopg will attach the appropriate tzinfo
         # data. The value is returned as an "aware" datetime in US/Eastern.
         tz_db = TZModel[tz.id]
         self.assertTrue(tz_db.dt.tzinfo is not None)
@@ -473,11 +473,6 @@ class TestArrayUUIDField(ModelTestCase):
     database = db
     requires = [UUIDList]
 
-    def setUp(self):
-        super(TestArrayUUIDField, self).setUp()
-        import psycopg2.extras
-        psycopg2.extras.register_uuid()
-
     def test_array_of_uuids(self):
         u1, u2, u3, u4 = [uuid.uuid4() for _ in range(4)]
         a = UUIDList.create(key='a', id_list=[u1, u2, u3],
@@ -555,15 +550,15 @@ class TestTSVectorField(ModelTestCase):
 
 def pg93():
     with db:
-        return db.connection().server_version >= 90300
+        return db.server_version >= 90300
 
 def pg10():
     with db:
-        return db.connection().server_version >= 100000
+        return db.server_version >= 100000
 
 def pg12():
     with db:
-        return db.connection().server_version >= 120000
+        return db.server_version >= 120000
 
 JSON_SUPPORT = (JsonModel is not None) and pg93()
 
@@ -808,25 +803,42 @@ class TestServerSide(ModelTestCase):
 
     def test_server_side_cursor(self):
         query = Register.select().order_by(Register.value)
-        with self.assertQueryCount(1):
-            data = [row.value for row in ServerSide(query)]
-            self.assertEqual(data, list(range(100)))
+        with self.database.atomic():
+            with self.assertQueryCount(1):
+                data = [row.value for row in ServerSide(query)]
+                self.assertEqual(data, list(range(100)))
 
-        ss_query = ServerSide(query.limit(10), array_size=3)
-        self.assertEqual([row.value for row in ss_query], list(range(10)))
+            ss_query = ServerSide(query.limit(10), array_size=3)
+            self.assertEqual([row.value for row in ss_query], list(range(10)))
 
-        ss_query = ServerSide(query.where(SQL('1 = 0')))
-        self.assertEqual(list(ss_query), [])
+            ss_query = ServerSide(query.where(SQL('1 = 0')))
+            self.assertEqual(list(ss_query), [])
 
     def test_lower_level_apis(self):
         query = Register.select(Register.value).order_by(Register.value)
-        ssq = ServerSideQuery(query, array_size=10)
-        curs_wrapper = ssq._execute(self.database)
-        curs = curs_wrapper.cursor
-        self.assertTrue(isinstance(curs, FetchManyCursor))
-        self.assertEqual(curs.fetchone(), (0,))
-        self.assertEqual(curs.fetchone(), (1,))
-        curs.close()
+        with self.database.atomic():
+            ssq = ServerSideQuery(query, array_size=10)
+            curs_wrapper = ssq._execute(self.database)
+            curs = curs_wrapper.cursor
+            self.assertTrue(isinstance(curs, FetchManyCursor))
+            self.assertEqual(curs.fetchone(), (0,))
+            self.assertEqual(curs.fetchone(), (1,))
+            curs.close()
+
+    def test_close_cursor(self):
+        query = Register.select(Register.value).order_by(Register.value)
+        with self.database.atomic():
+            ssq = ServerSideQuery(query, array_size=10)
+            accum = []
+            for i, obj in enumerate(ssq.iterator()):
+                if i == 25:
+                    break
+                accum.append(obj.value)
+
+            self.assertTrue(ssq.close())
+
+        self.assertEqual(len(accum), 25)
+        self.assertEqual(accum, list(range(25)))
 
 
 class KX(TestModel):

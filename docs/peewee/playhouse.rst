@@ -24,7 +24,6 @@ make up the ``playhouse``.
 * :ref:`apsw`
 * :ref:`sqlcipher_ext`
 * :ref:`postgres_ext`
-* :ref:`psycopg3_ext`
 * :ref:`crdb`
 * :ref:`mysql_ext`
 
@@ -696,8 +695,6 @@ If there is a particular feature you would like to see added, please
 
 .. warning:: In order to start using the features described below, you will need to use the extension :py:class:`PostgresqlExtDatabase` class instead of :py:class:`PostgresqlDatabase`.
 
-.. seealso:: :py:class:`Psycopg3Database`
-
 The code below will assume you are using the following database and base model:
 
 .. code-block:: python
@@ -1067,7 +1064,7 @@ For more information, see the `Postgres full-text search docs <https://www.postg
 postgres_ext API notes
 ^^^^^^^^^^^^^^^^^^^^^^
 
-.. py:class:: PostgresqlExtDatabase(database[, server_side_cursors=False[, register_hstore=False[, ...]]])
+.. py:class:: PostgresqlExtDatabase(database[, server_side_cursors=False[, register_hstore=False[, prefer_psycopg3=False[, ...]]]])
 
     Identical to :py:class:`PostgresqlDatabase` but required in order to support:
 
@@ -1075,6 +1072,8 @@ postgres_ext API notes
     :param bool server_side_cursors: Whether ``SELECT`` queries should utilize
         server-side cursors.
     :param bool register_hstore: Register the HStore extension with the connection.
+    :param bool prefer_psycopg3: If both psycopg2 and psycopg3 are installed,
+        instruct Peewee to prefer psycopg3.
 
     * :ref:`server_side_cursors`
     * :py:class:`ArrayField`
@@ -1095,20 +1094,52 @@ postgres_ext API notes
     :rtype generator:
 
     Wrap the given select query in a transaction, and call its
-    :py:meth:`~SelectQuery.iterator` method to avoid caching row instances. In
-    order for the server-side resources to be released, be sure to exhaust the
-    generator (iterate over all the rows).
+    :py:meth:`~SelectQuery.iterator` method to avoid caching row instances.
+
+    .. warning::
+        Server-side cursors should only be used within a transaction. psycopg3
+        correctly supports this, but at the time of writing, psycopg2 does not
+        appropriately recognize that a transaction is active and
+        inappropriately raises an error. To work around this, psycopg2
+        server-side cursors are declared ``WITH HOLD`` and **must** be
+        exhausted in order to be released properly.
 
     Usage:
 
     .. code-block:: python
 
-        large_query = PageView.select()
-        for page_view in ServerSide(large_query):
-            # Do something interesting.
-            pass
+        # Must be in a transaction to use server-side cursors.
+        with db.atomic():
 
-        # At this point server side resources are released.
+            # Create a normal SELECT query.
+            large_query = PageView.select()
+
+            # Then wrap in `ServerSide` and iterate.
+            for page_view in ServerSide(large_query):
+                # Do something interesting.
+                pass
+
+            # At this point server side resources are released.
+
+    For more granular control or to close the cursor explicitly:
+
+    .. code-block:: python
+
+        with db.atomic():
+            large_query = PageView.select().order_by(PageView.id.desc())
+
+            # Rows will be fetched 1000 at-a-time, but iteration is transparent.
+            query = ServerSideQuery(query, array_size=1000)
+
+            # Read 9500 rows then close server-side cursor.
+            accum = []
+            for i, obj in enumerate(query.iterator()):
+                if i == 9500:
+                    break
+                accum.append(obj)
+
+            # Release server-side resource.
+            query.close()
 
 .. _pgarrays:
 
@@ -1592,44 +1623,6 @@ postgres_ext API notes
             terms = 'python & (sqlite | postgres)'
             results = Blog.select().where(Blog.search_content.match(terms))
 
-.. _psycopg3_ext:
-
-Psycopg3 Support
-----------------
-
-Peewee provides :py:class:`Psycopg3Database` which uses `psycopg3 <https://www.psycopg.org/psycopg3/docs/>`_.
-
-.. py:class:: Psycopg3Database(database[, ...])
-
-    Identical to :py:class:`PostgresqlDatabase` but required in order to support:
-
-    :param str database: Name of database to connect to.
-
-    .. seealso::
-        :py:class:`Psycopg3Database` and ``playhouse.psycopg3_ext`` supports most
-        of the same Postgres-specific functionality as :py:class:`PostgresqlExtDatabase`:
-
-        * :ref:`json support <pgjson>`, including *jsonb* for Postgres 9.4.
-        * :ref:`hstore support <hstore>`
-        * :ref:`full-text search <pg_fts>`
-        * :py:class:`ArrayField` field type, for storing arrays.
-        * :py:class:`IntervalField` field type, for storing ``timedelta`` objects.
-        * :py:class:`JSONField` field type, for storing JSON data.
-        * :py:class:`BinaryJSONField` field type for the ``jsonb`` JSON data type.
-        * :py:class:`TSVectorField` field type, for storing full-text search data.
-        * :py:class:`DateTimeTZField` field type, a timezone-aware datetime field.
-
-    Example:
-
-    .. code-block:: python
-
-        from playhouse.psycopg3_ext import Psycopg3Database
-
-        db = Psycopg3Database(
-            'app',
-            host='127.0.0.1',
-            user='postgres',
-            port=5432)
 
 .. include:: crdb.rst
 
@@ -3538,8 +3531,8 @@ URL connection string.
     * ``postgres+pool``: :py:class:`PooledPostgresqlDatabase`
     * ``postgresext``: :py:class:`PostgresqlExtDatabase`
     * ``postgresext+pool``: :py:class:`PooledPostgresqlExtDatabase`
-    * ``psycopg3``: :py:class:`Psycopg3Database`
-    * ``psycopg3+pool``: :py:class:`PooledPsycopg3Database`
+    * ``psycopg3``: :py:class:`PostgresqlDatabase`
+    * ``psycopg3+pool``: :py:class:`PooledPostgresqlDatabase`
     * ``sqlite``: :py:class:`SqliteDatabase`
     * ``sqliteext``: :py:class:`SqliteExtDatabase`
     * ``sqlite+pool``: :py:class:`PooledSqliteDatabase`

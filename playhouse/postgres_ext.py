@@ -1,8 +1,3 @@
-"""
-Collection of postgres-specific extensions, currently including:
-
-* Support for hstore, a key/value type storage
-"""
 import json
 import logging
 import uuid
@@ -12,7 +7,8 @@ from peewee import ColumnBase
 from peewee import Expression
 from peewee import Node
 from peewee import NodeList
-from peewee import __deprecated__
+from peewee import Psycopg2Adapter
+from peewee import Psycopg3Adapter
 from peewee import __exception_wrapper__
 
 try:
@@ -24,12 +20,13 @@ except ImportError:
 try:
     from psycopg2.extras import register_hstore
 except ImportError:
-    def register_hstore(c, globally):
-        pass
+    def register_hstore(*args): pass
+
 try:
-    from psycopg2.extras import Json
-except:
-    Json = None
+    from psycopg.types import TypeInfo
+    from psycopg.types.hstore import register_hstore as register_hstore_pg3
+except ImportError:
+    def register_hstore_pg3(*args): pass
 
 
 logger = logging.getLogger('peewee')
@@ -53,6 +50,16 @@ JSONB_CONTAINS_ALL_KEYS = '?&'
 JSONB_EXISTS = '?'
 JSONB_REMOVE = '-'
 JSONB_PATH = '#>'
+
+
+class Json(Node):
+    __slots__ = ('value',)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __sql__(self, ctx):
+        return ctx.value(self.value, json.dumps)
 
 
 class _LookupNode(ColumnBase):
@@ -283,7 +290,8 @@ class HStoreField(IndexedFieldMixin, Field):
         return Expression(self, HUPDATE, data)
 
     def delete(self, *keys):
-        return fn.delete(self, Value(list(keys), unpack=False))
+        value = Cast(Value(list(keys), unpack=False), 'text[]')
+        return fn.delete(self, value)
 
     def contains(self, value):
         if isinstance(value, dict):
@@ -359,10 +367,11 @@ class BinaryJSONField(IndexedFieldMixin, JSONField):
         return Expression(cast_jsonb(self), JSONB_CONTAINS_KEY, key)
 
     def remove(self, *items):
+        value = Cast(Value(list(items), unpack=False), 'text[]')
         return Expression(
             cast_jsonb(self),
             JSONB_REMOVE,
-            Value(list(items), unpack=False))
+            value)
 
 
 class TSVectorField(IndexedFieldMixin, TextField):
@@ -445,6 +454,18 @@ class ServerSideQuery(Node):
             self._execute(self.query._database)
         return iter(self._cursor_wrapper.iterator())
 
+    def close(self):
+        if self._cursor_wrapper is not None:
+            self._cursor_wrapper.cursor.close()
+            self._cursor_wrapper = None
+            return True
+        return False
+
+    def iterator(self):
+        if self._cursor_wrapper is None:
+            self._execute(self.query._database)
+        return self._cursor_wrapper.iterator()
+
     def _execute(self, database):
         if self._cursor_wrapper is None:
             cursor = database.execute(self.query, named_cursor=True,
@@ -453,9 +474,7 @@ class ServerSideQuery(Node):
         return self._cursor_wrapper
 
 
-def ServerSide(query, database=None, array_size=None):
-    if database is None:
-        database = query._database
+def ServerSide(query, array_size=None):
     server_side_query = ServerSideQuery(query, array_size=array_size)
     for row in server_side_query:
         yield row
@@ -468,7 +487,29 @@ class _empty_object(object):
     __bool__ = __nonzero__
 
 
+class Psycopg2ExtAdapter(Psycopg2Adapter):
+    def register_hstore(self, conn):
+        register_hstore(conn)
+
+    def server_side_cursor(self, conn):
+        # psycopg2 does not allow us to use these in autocommit, even if we ARE
+        # inside a transaction - so specify withhold (not desirable!).
+        return conn.cursor(name=str(uuid.uuid1()), withhold=True)
+
+
+class Psycopg3ExtAdapter(Psycopg3Adapter):
+    def register_hstore(self, conn):
+        info = TypeInfo.fetch(conn, 'hstore')
+        register_hstore_pg3(info, conn)
+
+    def server_side_cursor(self, conn):
+        return conn.cursor(name=str(uuid.uuid1()))
+
+
 class PostgresqlExtDatabase(PostgresqlDatabase):
+    psycopg2_adapter = Psycopg2ExtAdapter
+    psycopg3_adapter = Psycopg3ExtAdapter
+
     def __init__(self, *args, **kwargs):
         self._register_hstore = kwargs.pop('register_hstore', False)
         self._server_side_cursors = kwargs.pop('server_side_cursors', False)
@@ -477,27 +518,21 @@ class PostgresqlExtDatabase(PostgresqlDatabase):
     def _connect(self):
         conn = super(PostgresqlExtDatabase, self)._connect()
         if self._register_hstore:
-            register_hstore(conn, globally=True)
+            self._adapter.register_hstore(conn)
         return conn
 
-    def cursor(self, commit=None, named_cursor=None):
-        if commit is not None:
-            __deprecated__('"commit" has been deprecated and is a no-op.')
+    def cursor(self, named_cursor=None):
         if self.is_closed():
             if self.autoconnect:
                 self.connect()
             else:
                 raise InterfaceError('Error, database connection not opened.')
         if named_cursor:
-            curs = self._state.conn.cursor(name=str(uuid.uuid1()),
-                                           withhold=True)
-            return curs
+            return self._adapter.server_side_cursor(self._state.conn)
         return self._state.conn.cursor()
 
-    def execute(self, query, commit=None, named_cursor=False, array_size=None,
+    def execute(self, query, named_cursor=False, array_size=None,
                 **context_options):
-        if commit is not None:
-            __deprecated__('"commit" has been deprecated and is a no-op.')
         ctx = self.get_sql_context(**context_options)
         sql, params = ctx.sql(query).query()
         named_cursor = named_cursor or (self._server_side_cursors and
@@ -507,11 +542,15 @@ class PostgresqlExtDatabase(PostgresqlDatabase):
             cursor = FetchManyCursor(cursor, array_size)
         return cursor
 
-    def execute_sql(self, sql, params=None, commit=None, named_cursor=None):
-        if commit is not None:
-            __deprecated__('"commit" has been deprecated and is a no-op.')
+    def execute_sql(self, sql, params=None, named_cursor=None):
         logger.debug((sql, params))
         with __exception_wrapper__:
             cursor = self.cursor(named_cursor=named_cursor)
             cursor.execute(sql, params or ())
         return cursor
+
+
+class Psycopg3Database(PostgresqlExtDatabase):
+    def __init__(self, *args, **kwargs):
+        kwargs['prefer_psycopg3'] = True
+        super(Psycopg3Database, self).__init__(*args, **kwargs)
