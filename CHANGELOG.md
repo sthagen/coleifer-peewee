@@ -7,9 +7,12 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
-[View commits](https://github.com/coleifer/peewee/compare/3.20.0...master)
+* Ensure `gr_context` is set on greenlet in `greenlet_spawn` so that
+  contextvars will be operable in sync handlers.
 
-## 3.20.0 (pending)
+[View commits](https://github.com/coleifer/peewee/compare/4.0.0...master)
+
+## 4.0.0 (pending)
 
 * Adds preliminary support for `asyncio` via a new playhouse extension. See
   [the documentation](http://docs.peewee-orm.com/en/latest/peewee/asyncio.html)
@@ -40,7 +43,7 @@ You can either use `sqlite_ext.SqliteExtDatabase` or try the new
 `cysqlite_ext.CySqliteDatabase` if you want all the old functionality and are
 willing to try a new driver.
 
-[View commits](https://github.com/coleifer/peewee/compare/3.19.0...master)
+[View commits](https://github.com/coleifer/peewee/compare/3.19.0...4.0.0)
 
 ## 3.19.0
 

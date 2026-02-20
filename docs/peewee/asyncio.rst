@@ -29,7 +29,54 @@ asyncio event-loop.
 
     await db.run(User.create, name='Alice')
 
-Here is a larger example demonstration how :py:meth:`~AsyncDatabaseMixin.run`
+If you prefer a more ``async``-native approach, a number of helper methods are
+available on the async ``Database`` classes:
+
+.. code-block:: python
+
+    import asyncio
+    from peewee import *
+    from playhouse.pwasyncio import AsyncSqliteDatabase
+
+    db = AsyncSqliteDatabase('example.db')
+
+    class User(db.Model):
+        name = TextField()
+
+    async def demo():
+        async with db:
+            # Asynchronously create table(s).
+            await db.acreate_tables([User])
+
+            # Create a new user.
+            user = await db.run(User.create, name='Charlie')
+
+            # Retrieve new user from the database.
+            user_db = await db.get(User.select().where(User.name == 'Charlie'))
+            assert user.name == user_db.name == 'Charlie'
+
+            # Atomicity with async context managers.
+            async with db.atomic():
+                # Construct a normal Peewee INSERT query.
+                iq = (User
+                      .insert_many([{'name': 'Alice'}, {'name': 'Bob'}])
+                      .returning(User))
+
+                # Execute the query asynchronously, retrieving results.
+                users = await db.aexecute(iq)
+                print('Added users: %s' % list(users))
+
+            # Retrieve list of users from database.
+            for user in await db.list(User.select().order_by(User.name)):
+                print(user.name)
+
+        # Close the pool - the connection was released, but it still remains inside
+        # the pool, so this ensures we are ready to shutdown completely.
+        await db.close_pool()
+
+    asyncio.run(demo())
+
+Here is the same example as above demonstrating how :py:meth:`~AsyncDatabaseMixin.run`
 can be used to wrap synchronous ORM operations to be async:
 
 .. code-block:: python
@@ -45,15 +92,20 @@ can be used to wrap synchronous ORM operations to be async:
 
     async def demo():
         async with db:
+            # Asynchronously create table(s).
             await db.run(db.create_tables, [User])
+
+            # Create a new user.
             user = await db.run(User.create, name='Charlie')
 
+            # Retrieve new user from the database using a callable.
             def get_user():
                 return User.select().where(User.name == 'Charlie').get()
 
             user_db = await db.run(get_user)
             assert user.name == user_db.name == 'Charlie'
 
+            # Atomicity with a normal context manager.
             def bulk_insert():
                 with db.atomic():
                     iq = (User
@@ -61,51 +113,16 @@ can be used to wrap synchronous ORM operations to be async:
                           .returning(User))
                     users = iq.execute()
                     print('Added users: %s' % list(users))
+
             await db.run(bulk_insert)
 
+            # Retrieve list of users from database.
             users = await db.run(list, User.select().order_by(User.name))
             for user in users:
                 print(user.name)
 
         # Close the pool - the connection was released, but it still remains inside
         # the pool, so this ensures we are ready to shutdown completely.
-        await db.close_pool()
-
-    asyncio.run(demo())
-
-
-If you prefer a more ``async``-native approach, a number of helper methods are
-available on the async ``Database`` classes. Here is the exact same code
-implemented using a more natural asyncio style:
-
-.. code-block:: python
-
-    import asyncio
-    from peewee import *
-    from playhouse.pwasyncio import AsyncSqliteDatabase
-
-    db = AsyncSqliteDatabase('example.db')
-
-    class User(db.Model):
-        name = TextField()
-
-    async def demo():
-        async with db:
-            await db.acreate_tables([User])
-            user = await db.run(User.create, name='Charlie')
-            user_db = await db.get(User.select().where(User.name == 'Charlie'))
-            assert user.name == user_db.name == 'Charlie'
-
-            async with db.atomic():
-                iq = (User
-                      .insert_many([{'name': 'Alice'}, {'name': 'Bob'}])
-                      .returning(User))
-                users = await db.aexecute(iq)
-                print('Added users: %s' % list(users))
-
-            for user in await db.list(User.select().order_by(User.name)):
-                print(user.name)
-
         await db.close_pool()
 
     asyncio.run(demo())
@@ -492,7 +509,7 @@ expand this section or work to find other solutions to the problems.
 API
 ---
 
-.. py:class:: AsyncDatabaseMixin(database[, pool_size=10[, pool_min_size=1[, acquire_timeout=10[, validate_conn_timeout=2[, **kwargs]]]]])
+.. py:class:: AsyncDatabaseMixin(database, pool_size=10, pool_min_size=1, acquire_timeout=10, validate_conn_timeout=2, **kwargs)
 
     :param str database: Database name or filename for SQLite.
     :param int pool_size: Maximum size of the driver-managed connection pool
@@ -513,7 +530,7 @@ API
     acquired and released back to the pool when the task completes or the
     database context exits.
 
-    .. py:method:: run(fn[, *args[, **kwargs]])
+    .. py:method:: run(fn, *args, **kwargs)
         :async:
 
         :param fn: A synchronous callable.
@@ -593,17 +610,17 @@ API
         Return an asyncio-aware atomic transaction context manager.
         Supports use as a synchronous or async context manager.
 
-    .. py:method:: acreate_tables(models[, **options])
+    .. py:method:: acreate_tables(models, **options)
         :async:
 
         Asynchronously create database tables.
 
-    .. py:method:: adrop_tables(models[, **options])
+    .. py:method:: adrop_tables(models, **options)
         :async:
 
         Asynchronously drop database tables.
 
-    .. py:method:: aexecute_sql(sql[, params=None])
+    .. py:method:: aexecute_sql(sql, params=None)
         :async:
 
         :param str sql: SQL query to execute.
@@ -612,7 +629,7 @@ API
 
         Execute a SQL query asynchronously using the underlying async driver.
 
-    .. py:method:: execute_sql(sql[, params=None])
+    .. py:method:: execute_sql(sql, params=None)
 
         Synchronous wrapper around :py:meth:`aexecute_sql`.
 
@@ -620,7 +637,7 @@ API
         :py:meth:`~AsyncDatabaseMixin.run`.
 
 
-.. py:class:: AsyncSqliteDatabase(database[, **kwargs])
+.. py:class:: AsyncSqliteDatabase(database, **kwargs)
 
     Async SQLite database implementation.
 
@@ -630,7 +647,7 @@ API
     Inherits from :py:class:`AsyncDatabaseMixin` and
     :py:class:`peewee.SqliteDatabase`.
 
-.. py:class:: AsyncMySQLDatabase(database[, **kwargs])
+.. py:class:: AsyncMySQLDatabase(database, **kwargs)
 
     Async MySQL / MariaDB database implementation.
 
@@ -639,7 +656,7 @@ API
     Inherits from :py:class:`AsyncDatabaseMixin` and
     :py:class:`peewee.MySQLDatabase`.
 
-.. py:class:: AsyncPostgresqlDatabase(database[, **kwargs])
+.. py:class:: AsyncPostgresqlDatabase(database, **kwargs)
 
     Async PostgreSQL database implementation.
 
