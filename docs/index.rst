@@ -16,6 +16,7 @@ it easy to learn and intuitive to use.
 * supports sqlite, mysql, mariadb, postgresql.
 * asyncio support
 * :ref:`tons of extensions <playhouse>`
+* use with :ref:`flask <flask>`, :ref:`fastapi <fastapi>` and :ref:`more <framework-integration>`
 
 .. image:: postgresql.png
     :target: peewee/database.html#using-postgresql
@@ -43,6 +44,7 @@ New to peewee? These may help:
 * :ref:`Models and fields <models>`
 * :ref:`Querying <querying>`
 * :ref:`Relationships and joins <relationships>`
+* :ref:`Flask setup <flask>` or :ref:`FastAPI setup <fastapi>`
 
 Contents:
 ---------

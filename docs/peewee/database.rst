@@ -91,7 +91,7 @@ Using Postgresql
 To use Peewee with Postgresql the recommended driver is either ``psycopg2`` or
 ``psycopg3``:
 
-.. code-block:: sh
+.. code-block:: shell
 
    $ pip install "psycopg2-binary"  # Psycopg2.
 
@@ -135,7 +135,8 @@ parameters:
 Isolation level
 ^^^^^^^^^^^^^^^
 
-The isolation level can be specified as an initialization parameter.
+The isolation level can be specified as an initialization parameter or set at
+run-time with :py:meth:`~PostgresqlDatabase.set_isolation_level`.
 
 Psycopg2 exposes isolation level constants in ``psycopg2.extensions``:
 
@@ -255,13 +256,16 @@ the :py:class:`SqliteDatabase` object:
    db.pragma('foreign_keys', 1, permanent=True)
 
 .. attention::
-   Pragmas set using the :py:meth:`~SqliteDatabase.pragma` method, by default,
-   do not persist after the connection is closed. To configure a pragma to be
+   Pragmas set using the :py:meth:`~SqliteDatabase.pragma` method do not
+   get re-applied when a new connection opens. To configure a pragma to be
    run whenever a connection is opened, specify ``permanent=True``.
 
-.. note::
-   A full list of PRAGMA settings, their meaning and accepted values can be
-   found in the SQLite documentation: https://sqlite.org/pragma.html
+   .. code-block:: python
+
+      db.pragma('foreign_keys', 1, permanent=True)
+
+.. seealso::
+   SQLite PRAGMA documentation: https://sqlite.org/pragma.html
 
 Recommended Settings
 ^^^^^^^^^^^^^^^^^^^^
@@ -491,7 +495,7 @@ For more information, see the SQLite `locking documentation <https://sqlite.org/
 To learn more about transactions in Peewee, see the :ref:`transactions`
 documentation.
 
-.. attention::
+.. danger::
    Do not alter the ``isolation_level`` property of the ``sqlite3.Connection``
    object. Peewee requires the ``sqlite3`` driver be in autocommit-mode, which
    is handled automatically by :class:`SqliteDatabase`.
@@ -554,7 +558,7 @@ Using MySQL or MariaDB
 
 To use Peewee with MySQL or MariaDB the recommended driver is ``pymysql``:
 
-.. code-block:: sh
+.. code-block:: shell
 
    $ pip install "pymysql"
 
@@ -1114,11 +1118,11 @@ Examples:
           # wrapped block of code, the `atomic` context manager will
           # automatically call commit for us.
 
-.. note::
+.. tip::
    :py:meth:`~Database.atomic` can be used as either a **context manager** or
    a **decorator**.
 
-.. note::
+.. important::
    Peewee's behavior differs from the DB-API 2.0 behavior you may be used to
    (see PEP-249 for details). Peewee requires all connections be in
    **autocommit-mode** and transaction management is handled by Peewee.
@@ -1246,9 +1250,7 @@ block. When this happens, a new transaction will be started.
 .. note::
    If you attempt to nest transactions with peewee using the
    :py:meth:`~Database.transaction` context manager, only the outer-most
-   transaction will be used. If an exception occurs in a nested block, the
-   transaction will NOT be rolled-back -- only exceptions that bubble-up to
-   the outer-most transaction will trigger a rollback.
+   transaction will be used.
 
    As this may lead to unpredictable behavior, it is recommended that
    you use :py:meth:`~Database.atomic`.
@@ -1270,21 +1272,22 @@ occur within a transaction, but can be nested arbitrarily deep.
            User.create(username='zaizee')
            sp2.rollback()  # "zaizee" will not be saved, but "mickey" will be.
 
-.. warning::
-   If you manually commit or roll back a savepoint, a new savepoint **will
-   not** automatically be created. This differs from the behavior of
-   :py:class:`transaction`, which will automatically open a new transaction
-   after manual commit/rollback.
+           User.create(username='huey')
+
+   # mickey and huey were created.
+
+.. note::
+   If you manually commit or roll back a savepoint, a new savepoint will
+   automatically begin.
 
 Autocommit Mode
 ^^^^^^^^^^^^^^^
 
-By default, Peewee operates in *autocommit mode*, such that any statements
-executed outside of a transaction are run in their own transaction. To group
-multiple statements into a transaction, Peewee provides the
-:py:meth:`~Database.atomic` context-manager/decorator. This should cover all
-use-cases, but in the unlikely event you want to temporarily disable Peewee's
-transaction management completely, you can use the
+Peewee operates in *autocommit mode*, such that any statements executed outside
+of a transaction are run in their own transaction. To group multiple statements
+into a transaction, Peewee provides the :py:meth:`~Database.atomic` context-manager/decorator.
+This should cover all use-cases, but in the unlikely event you want to
+temporarily disable Peewee's transaction management completely, you can use the
 :py:meth:`Database.manual_commit` context-manager/decorator.
 
 Here is how you might emulate the behavior of the
@@ -1456,6 +1459,8 @@ Peewee provides support for the following asyncio database drivers:
 Peewee support for asyncio is described in detail in the :ref:`asyncio`
 documentation.
 
+.. seealso:: :ref:`fastapi`
+
 .. _framework-integration:
 
 Framework Integration
@@ -1470,10 +1475,7 @@ These steps will ensure that regardless of whether you're using a simple SQLite
 database, or a pool of multiple Postgres connections, peewee will handle the
 connections correctly.
 
-.. note::
-   Applications that receive lots of traffic may benefit from using a
-   :ref:`connection pool <pool>` to mitigate the cost of setting up and
-   tearing down connections on every request.
+.. _flask:
 
 Flask
 ^^^^^
@@ -1488,7 +1490,14 @@ is returned.
    from flask import Flask
    from peewee import *
 
+
    database = SqliteDatabase('my_app.db')
+
+   # Or, use a pooled database implementation:
+   from playhouse.pool import PooledPostgresqlDatabase
+   database = PooledPostgresqlDatabase('my_app', user='postgres')
+
+
    app = Flask(__name__)
 
    # This hook ensures that a connection is opened to handle any queries
@@ -1504,145 +1513,61 @@ is returned.
        if not database.is_closed():
            database.close()
 
-Django
-^^^^^^
+.. seealso:: :ref:`flask_utils`
 
-While it's less common to see peewee used with Django, it is actually very easy
-to use the two. To manage your peewee database connections with Django, the
-easiest way in my opinion is to add a middleware to your app. The middleware
-should be the very first in the list of middlewares, to ensure it runs first
-when a request is handled, and last when the response is returned.
+.. _fastapi:
 
-If you have a django project named *my_blog* and your peewee database is
-defined in the module ``my_blog.db``, you might add the following middleware
-class:
-
-.. code-block:: python
-
-   # middleware.py
-   from my_blog.db import database  # Import the peewee database instance.
-
-   def PeeweeConnectionMiddleware(get_response):
-       def middleware(request):
-           database.connect()
-           try:
-               response = get_response(request)
-           finally:
-               if not database.is_closed():
-                   database.close()
-           return response
-       return middleware
-
-To ensure this middleware gets executed, add it to your ``settings`` module:
-
-.. code-block:: python
-
-    # settings.py
-    MIDDLEWARE = [
-        # Our custom middleware appears first in the list.
-        'my_blog.middleware.PeeweeConnectionMiddleware',
-
-        # Other middleware classes.
-        'django....',
-        'django....',
-    ]
-
-Bottle
-^^^^^^
-
-I haven't used bottle myself, but looking at the documentation I believe the
-following code should ensure the database connections are properly managed:
-
-.. code-block:: python
-
-   # app.py
-   from bottle import hook  #, route, etc, etc.
-   from peewee import *
-
-   db = SqliteDatabase('my-bottle-app.db')
-
-   @hook('before_request')
-   def _connect_db():
-       db.connect()
-
-   @hook('after_request')
-   def _close_db():
-       if not db.is_closed():
-           db.close()
-
-   # Rest of your bottle app goes here.
-
-Web.py
-^^^^^^
-
-See the documentation for
-`application processors <http://webpy.org/cookbook/application_processors>`_.
-
-.. code-block:: python
-
-   db = SqliteDatabase('my_webpy_app.db')
-
-   def connection_processor(handler):
-       db.connect()
-       try:
-           return handler()
-       finally:
-           if not db.is_closed():
-               db.close()
-
-   app.add_processor(connection_processor)
-
-Tornado
+FastAPI
 ^^^^^^^
 
-It looks like Tornado's ``RequestHandler`` class implements two hooks which can
-be used to open and close connections when a request is handled.
+FastAPI is an :ref:`asyncio <asyncio>` framework.
+
+The following example demonstrates how to:
+
+* Ensure connection is opened and closed for each request.
+* Create tables/resources when app server starts.
+* Shut-down connection pool when app server exits.
 
 .. code-block:: python
 
-   from tornado.web import RequestHandler
+   from fastapi import FastAPI
+   from peewee import *
+   from playhouse.pwasyncio import *
 
-   db = SqliteDatabase('my_db.db')
 
-   class PeeweeRequestHandler(RequestHandler):
-       def prepare(self):
-           db.connect()
-           return super(PeeweeRequestHandler, self).prepare()
+   app = FastAPI()
 
-       def on_finish(self):
-           if not db.is_closed():
-               db.close()
-           return super(PeeweeRequestHandler, self).on_finish()
+   db = AsyncPostgresqlDatabase('peewee_test', host='10.8.0.1', user='postgres')
 
-In your app, instead of extending the default ``RequestHandler``, now you can
-extend ``PeeweeRequestHandler``.
-
-Note that this does not address how to use peewee asynchronously with Tornado
-or another event loop.
-
-Wheezy.web
-^^^^^^^^^^
-
-The connection handling code can be placed in a `middleware
-<https://pythonhosted.org/wheezy.http/userguide.html#middleware>`_.
-
-.. code-block:: python
-
-   def peewee_middleware(request, following):
-       db.connect()
+   @app.middleware('http')
+   async def database_connection(request, call_next):
+       await db.aconnect()  # Obtain connection from connection pool.
        try:
-           response = following(request)
+           response = await call_next(request)
        finally:
-           if not db.is_closed():
-               db.close()
+           await db.aclose()  # Release connection back to pool.
        return response
 
-   app = WSGIApplication(middleware=[
-       lambda x: peewee_middleware,
-       # ... other middlewares ...
-   ])
+   @app.on_event('startup')
+   async def on_startup():
+       async with db:
+           await db.acreate_tables([Model1, Model2, Model3, ...])
 
-Thanks to GitHub user *@tuukkamustonen* for submitting this code.
+   @app.on_event('shutdown')
+   async def on_shutdown():
+       await db.close_pool()
+
+Example demonstrating executing an async query:
+
+.. code-block:: python
+
+   @app.get('/message/')
+   async def message():
+       # Get the latest message from the database.
+       message = await db.get(Message.select().order_by(Message.id.desc()))
+       return {'content': message.content, 'id': message.id}
+
+.. seealso:: :ref:`asyncio`
 
 Falcon
 ^^^^^^
@@ -1655,7 +1580,13 @@ The connection handling code can be placed in a `middleware component
    import falcon
    from peewee import *
 
+
    database = SqliteDatabase('my_app.db')
+
+   # Or, use a pooled database implementation, e.g.
+   from playhouse.pool import PooledPostgresqlDatabase
+   database = PooledPostgresqlDatabase('my_app', user='postgres')
+
 
    class PeeweeConnectionMiddleware(object):
        def process_request(self, req, resp):
@@ -1677,6 +1608,7 @@ Set up a Request factory that handles database connection lifetime as follows:
 
 .. code-block:: python
 
+   from peewee import *
    from pyramid.request import Request
 
    db = SqliteDatabase('pyramidapp.db')
@@ -1700,54 +1632,63 @@ In your application `main()` make sure `MyRequest` is used as
        config = Configurator(settings=settings, ...)
        config.set_request_factory(MyRequest)
 
-CherryPy
-^^^^^^^^
-
-See `Publish/Subscribe pattern
-<http://docs.cherrypy.org/en/latest/extend.html#publish-subscribe-pattern>`_.
-
-.. code-block:: python
-
-   def _db_connect():
-       db.connect()
-
-   def _db_close():
-       if not db.is_closed():
-           db.close()
-
-   cherrypy.engine.subscribe('before_request', _db_connect)
-   cherrypy.engine.subscribe('after_request', _db_close)
-
 Sanic
 ^^^^^
 
-In Sanic, the connection handling code can be placed in the request and
-response middleware `sanic middleware <http://sanic.readthedocs.io/en/latest/sanic/middleware.html>`_.
+Sanic is an :ref:`asyncio <asyncio>` framework.
+
+The following example demonstrates how to:
+
+* Ensure connection is opened and closed for each request.
+* Create tables/resources when app server starts.
+* Shut-down connection pool when app server exits.
 
 .. code-block:: python
 
-   # app.py
-   @app.middleware('request')
-   async def handle_request(request):
-       db.connect()
+   from sanic import Sanic
+   from peewee import *
+   from playhouse.pwasyncio import *
 
-   @app.middleware('response')
-   async def handle_response(request, response):
-       if not db.is_closed():
-           db.close()
 
-FastAPI
-^^^^^^^
+   app = Sanic('PeeweeApp')
 
-FastAPI is an asyncio-compatible framework. See the :ref:`asyncio`
-documentation for details on how to use Peewee in an asyncio setting.
+   db = AsyncPostgresqlDatabase('peewee_test', host='10.8.0.1', user='postgres')
+
+   @app.on_request
+   async def open_connection(request):
+       await db.aconnect()  # Obtain connection from connection pool.
+
+   @app.on_response
+   async def close_connection(request, response):
+       await db.aclose()  # Return connection to pool.
+
+   @app.before_server_start
+   async def setup_db(app):
+       async with db:
+           await db.acreate_tables([Model1, Model2, Model3, ...])
+
+   @app.before_server_stop
+   async def shutdown_db(app):
+       await db.close_pool()
+
+Example demonstrating executing an async query:
+
+.. code-block:: python
+
+   from sanic import json
+
+   @app.get('/message/')
+   async def message(request):
+       # Get the latest message from the database.
+       message = await db.get(Message.select().order_by(Message.id.desc()))
+       return json({'content': message.content, 'id': message.id})
+
+.. seealso:: :ref:`asyncio`
 
 Other frameworks
 ^^^^^^^^^^^^^^^^
 
-Don't see your framework here? Please `open a GitHub ticket
-<https://github.com/coleifer/peewee/issues/new>`_ and I'll see about adding a
-section, or better yet, submit a documentation pull-request.
+Don't see your framework here? Please `open a GitHub ticket <https://github.com/coleifer/peewee/issues/new>`_.
 
 Logging queries
 ---------------
