@@ -3,8 +3,8 @@
 Query Builder
 =============
 
-Peewee's high-level :py:class:`Model` and :py:class:`Field` APIs are built upon
-lower-level :py:class:`Table` and :py:class:`Column` counterparts. While these
+Peewee's high-level :class:`Model` and :class:`Field` APIs are built upon
+lower-level :class:`Table` and :class:`Column` counterparts. While these
 lower-level APIs are not documented in as much detail as their high-level
 counterparts, this document will present an overview with examples that should
 hopefully allow you to experiment.
@@ -34,7 +34,7 @@ We'll use the following schema:
 Declaring tables
 ----------------
 
-There are two ways we can declare :py:class:`Table` objects for working with
+There are two ways we can declare :class:`Table` objects for working with
 these tables:
 
 .. code-block:: python
@@ -47,7 +47,7 @@ these tables:
     # Do not declare columns, they will be accessed using magic ".c" attribute
     Reminder = Table('reminder')
 
-Typically we will want to :py:meth:`~Table.bind` our tables to a database. This
+Typically we will want to :meth:`~Table.bind` our tables to a database. This
 saves us having to pass the database explicitly every time we wish to execute a
 query on the table:
 
@@ -71,16 +71,16 @@ To select the first three notes and print their content, we can write:
 
 .. note::
     By default, rows will be returned as dictionaries. You can use the
-    :py:meth:`~BaseQuery.tuples`, :py:meth:`~BaseQuery.namedtuples` or
-    :py:meth:`~BaseQuery.objects` methods to specify a different container for
+    :meth:`~BaseQuery.tuples`, :meth:`~BaseQuery.namedtuples` or
+    :meth:`~BaseQuery.objects` methods to specify a different container for
     the row data, if you wish.
 
 Because we didn't specify any columns, all the columns we defined in the
-note's :py:class:`Table` constructor will be selected. This won't work for
+note's :class:`Table` constructor will be selected. This won't work for
 Reminder, as we didn't specify any columns at all.
 
 To select all notes published in 2018 along with the name of the creator, we
-will use :py:meth:`~BaseQuery.join`. We'll also request that rows be returned
+will use :meth:`~BaseQuery.join`. We'll also request that rows be returned
 as *namedtuple* objects:
 
 .. code-block:: python
@@ -115,7 +115,7 @@ There are a couple things to note in the above query:
 * We store an expression in a variable (``name``), then use it in the query.
 * We call SQL functions using ``fn.<function>(...)`` passing arguments as if
   it were a normal Python function.
-* The :py:meth:`~ColumnBase.alias` method is used to specify the name used for
+* The :meth:`~ColumnBase.alias` method is used to specify the name used for
   a column or calculation.
 
 As a more complex example, we'll generate a list of all people and the contents
@@ -172,11 +172,11 @@ associated note content:
     The ".c" attribute will not work on tables that explicitly define their
     columns, to prevent confusion.
 
-Insert queries
+Insert Queries
 --------------
 
 Inserting data is straightforward. We can specify data to
-:py:meth:`~Table.insert` in two different ways (in both cases, the ID of the
+:meth:`~Table.insert` in two different ways (in both cases, the ID of the
 new row is returned):
 
 .. code-block:: python
@@ -215,11 +215,11 @@ Examples:
         ('Nuggie', 'Bar')]
     Person.insert(people, columns=[Person.first, Person.last]).execute()
 
-Update queries
+Update Queries
 --------------
 
-:py:meth:`~Table.update` queries accept either keyword arguments or a
-dictionary mapping column to value, just like :py:meth:`~Table.insert`.
+:meth:`~Table.update` queries accept either keyword arguments or a
+dictionary mapping column to value, just like :meth:`~Table.insert`.
 
 Examples:
 
@@ -251,10 +251,10 @@ count for some URL:
      .where(PageView.url == some_url)
      .execute())
 
-Delete queries
+Delete Queries
 --------------
 
-:py:meth:`~Table.delete` queries are simplest of all, as they do not accept any
+:meth:`~Table.delete` queries are simplest of all, as they do not accept any
 arguments:
 
 .. code-block:: python
@@ -282,7 +282,7 @@ was the absence of a class that represented a structured query with no relation
 to a given model class.
 
 An example of this might be computing aggregate values over a subquery. For
-example, the :py:meth:`~SelectBase.count` method, which returns the count of
+example, the :meth:`~SelectBase.count` method, which returns the count of
 rows in an arbitrary query, is implemented by wrapping the query:
 
 .. code-block:: sql
@@ -300,7 +300,7 @@ To accomplish this with Peewee, the implementation is written in this way:
         return curs[0][0]  # Return first column from first row of result.
 
 We can actually express this more concisely using the
-:py:meth:`~SelectBase.scalar` method, which is suitable for returning values
+:meth:`~SelectBase.scalar` method, which is suitable for returning values
 from aggregate queries:
 
 .. code-block:: python
@@ -309,7 +309,7 @@ from aggregate queries:
         wrapped = Select(from_list=[query], columns=[fn.COUNT(SQL('1'))])
         return wrapped.scalar(db)
 
-The :ref:`query_examples` document has a more complex example, in which we
+The :ref:`query-library` document has a more complex example, in which we
 write a query for a facility with the highest number of available slots booked:
 
 The SQL we wish to express is:
@@ -324,7 +324,7 @@ The SQL we wish to express is:
     ) AS ranked
     WHERE rank = 1
 
-We can express this fairly elegantly by using a plain :py:class:`Select` for
+We can express this fairly elegantly by using a plain :class:`Select` for
 the outer query:
 
 .. code-block:: python

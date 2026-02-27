@@ -1,18 +1,24 @@
-.. _query_examples:
+.. _query-library:
 
-Query Examples
+Query Library
 ==============
 
-These query examples are taken from the site `PostgreSQL Exercises
+These query examples are taken from the site `Postgresql Exercises
 <https://pgexercises.com/>`_. A sample data-set can be found on the `getting
-started page <https://pgexercises.com/gettingstarted.html>`_.
+started page <https://pgexercises.com/gettingstarted.html>`__.
+
+Direct download: `clubdata.sql <https://raw.githubusercontent.com/coleifer/peewee/refs/heads/master/docs/clubdata.sql>`__
+
+.. contents:: On this page
+   :local:
+   :depth: 1
+
+Model Definitions
+-----------------
 
 Here is a visual representation of the schema used in these examples:
 
 .. image:: schema-horizontal.png
-
-Model Definitions
------------------
 
 To begin working with the data, we'll define the model classes that correspond
 to the tables in the diagram.
@@ -79,8 +85,8 @@ to the tables in the diagram.
 Schema Creation
 ---------------
 
-If you downloaded the SQL file from the PostgreSQL Exercises site, then you can
-load the data into a PostgreSQL database using the following commands::
+If you downloaded the SQL file from the Postgresql Exercises site, then you can
+load the data into a Postgresql database using the following commands::
 
     createdb peewee_test
     psql -U postgres -f clubdata.sql -d peewee_test -x -q
@@ -221,7 +227,7 @@ Return the name and monthly maintenance of the facilities in question.
     cost = Case(None, [(Facility.monthlymaintenance > 100, 'expensive')], 'cheap')
     query = Facility.select(Facility.name, cost.alias('cost'))
 
-.. note:: See documentation :py:class:`Case` for more examples.
+.. note:: See documentation :class:`Case` for more examples.
 
 
 Working with dates
@@ -643,7 +649,8 @@ initialoutlay: 5000, monthlymaintenance: 80.
 
 .. code-block:: sql
 
-    -- see above --
+    INSERT INTO "facilities" (...)
+    VALUES (9, ...), (10, ...);
 
 .. code-block:: python
 

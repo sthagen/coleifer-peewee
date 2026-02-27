@@ -15,7 +15,7 @@ it easy to learn and intuitive to use.
 * flexible query-builder that exposes full power of SQL
 * supports sqlite, mysql, mariadb, postgresql.
 * asyncio support
-* :ref:`tons of extensions <playhouse>`
+* tons of extensions
 * use with :ref:`flask <flask>`, :ref:`fastapi <fastapi>` and :ref:`more <framework-integration>`
 
 Peewee's source code hosted on `GitHub <https://github.com/coleifer/peewee>`_.
@@ -23,11 +23,12 @@ Peewee's source code hosted on `GitHub <https://github.com/coleifer/peewee>`_.
 New to peewee? These may help:
 
 * :ref:`Quickstart <quickstart>`
-* :ref:`Example twitter app <example-app>`
+* :ref:`Example twitter app <example>`
 * :ref:`Using peewee interactively <interactive>`
 * :ref:`Models and fields <models>`
 * :ref:`Querying <querying>`
 * :ref:`Relationships and joins <relationships>`
+* :ref:`Extensive library of SQL / Peewee examples <query-library>`
 * :ref:`Flask setup <flask>` or :ref:`FastAPI setup <fastapi>`
 
 Contents:
@@ -35,26 +36,30 @@ Contents:
 
 .. toctree::
    :maxdepth: 2
-   :glob:
 
    peewee/installation
    peewee/quickstart
    peewee/example
    peewee/database
-   peewee/transactions
    peewee/models
-   peewee/querying
-   peewee/query_operators
    peewee/relationships
-   peewee/api
-   peewee/sqlite_ext
-   peewee/cysqlite_ext
+   peewee/querying
+   peewee/writing
+   peewee/query_operators
+   peewee/transactions
+   peewee/schema
    peewee/asyncio
-   peewee/playhouse
-   peewee/query_examples
-   peewee/query_builder
-   peewee/hacks
+   peewee/framework_integration
    peewee/interactive
+   peewee/query_builder
+   peewee/query_library
+   peewee/api
+   peewee/sqlite
+   peewee/postgres
+   peewee/mysql
+   peewee/db_tools
+   peewee/orm_utils
+   peewee/recipes
    peewee/contributing
 
 Note
