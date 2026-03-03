@@ -4118,7 +4118,6 @@ class PostgresqlDatabase(Database):
     for_update = True
     nulls_ordering = True
     returning_clause = True
-    safe_create_index = False
     sequences = True
 
     psycopg2_adapter = Psycopg2Adapter
@@ -4157,8 +4156,6 @@ class PostgresqlDatabase(Database):
 
     def _set_server_version(self, conn):
         self.server_version = self._adapter.get_server_version(conn)
-        if self.server_version >= 90600:
-            self.safe_create_index = True
 
     def is_connection_usable(self):
         if self._state.closed:
