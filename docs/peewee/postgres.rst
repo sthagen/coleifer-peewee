@@ -72,11 +72,19 @@ JSON Support
 
 Peewee provides two JSON field types for Postgresql:
 
-- :class:`JSONField` - stores JSON as text, supports key access and comparison.
 - :class:`BinaryJSONField` - stores JSON in the efficient binary ``jsonb``
-  format and adds containment operators.
+  format. Supports key/item access, containment operations.
+- :class:`JSONField` - stores JSON as text, supports key/item access.
 
-In general always use :class:`BinaryJSONField`.
+Most applications will wish to use :class:`BinaryJSONField` (``JSONB``):
+
+* Faster Queries: direct access to data elements without parsing the entire
+  JSON document each time.
+* Index Support: supports indexing via GiST or GIN.
+* Faster updates without requiring rewriting the entire document.
+
+The only time :class:`JSONField` is preferable is when you must store
+the exact JSON data verbatim (whitespace, object key ordering).
 
 .. code-block:: python
 
@@ -120,37 +128,8 @@ In general always use :class:`BinaryJSONField`.
    Refer to the `Postgresql JSON documentation <https://www.postgresql.org/docs/current/functions-json.html>`__
    for in-depth discussion and examples of using JSON and JSONB.
 
-JSONField and BinaryJSONField
+BinaryJSONField and JSONField
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. class:: JSONField(dumps=None, *args, **kwargs)
-
-   :param dumps: custom implementation of ``json.dumps``
-
-   Field that stores and retrieves JSON data. Supports ``__getitem__`` key
-   access for filtering and sub-object retrieval.
-
-   Consider using the :class:`BinaryJSONField` instead as it
-   offers better performance and more powerful querying options.
-
-   .. method:: as_json()
-
-      Deserialize and return the JSON value at the given path.
-
-   .. method:: concat(data)
-
-      Concatenate the field value with ``data``. Note this is a shallow
-      operation and does not deep-merge nested objects.
-
-      Example:
-
-      .. code-block:: python
-
-         # Add object - if "result" key existed before it is overwritten.
-         (Event
-          .update(data=Event.data.concat({'result': {'success': True}}))
-          .execute())
-
 
 .. class:: BinaryJSONField(dumps=None, *args, **kwargs)
 
@@ -179,26 +158,55 @@ JSONField and BinaryJSONField
           .update(data=Event.data.concat({'result': {'success': True}}))
           .execute())
 
+      Nested data can also use ``concat()``:
+
+      .. code-block:: python
+
+         # Select the result subkey and merge with additional data:
+         # {'ip': '1.2.3.4'} --> {'ip': '1.2.3.4', 'status': 'ok'}
+
+         Event.select(Event.data['result'].concat({'status': 'ok'}))
+
    .. method:: contains(other)
 
       Test whether this field's value contains ``other`` (as a subset).
-      ``other`` may be a partial dict, list, or scalar value.
+      ``other`` may be a partial dict, list, or scalar value. Useful for
+      matching against a partial JSON object or checking if an item is in an
+      array.
 
       .. code-block:: python
 
          Event.create(data={
              'type': 'rename',
              'name': 'new name',
+             'metadata': {'old_name': 'the old name'},
              'tags': ['t1', 't2', 't3']})
+
+         # These queries match the above row:
 
          # Search by partial object:
          Event.select().where(Event.data.contains({'type': 'rename'}))
 
-         # Search arrays by one or more items:
+         # Partial object and partial array:
+         Event.select().where(Event.data.contains({
+             'type': 'rename',
+             'tags': ['t2', 't1'],
+         }))
+
+         # Partial array, irrespective of ordering:
          Event.select().where(Event.data['tags'].contains(['t2', 't1']))
 
-         # Search arrays by individual item:
+         # Search array by individual item:
          Event.select().where(Event.data['tags'].contains('t1'))
+
+      To test whether a **key** simply exists, use :meth:`~BinaryJSONField.has_key`:
+
+      .. code-block:: python
+
+         Event.select().where(Event.data.has_key('name'))
+
+         # Or search a sub-key.
+         Event.select().where(Event.data['metadata'].has_key('old_name'))
 
    .. method:: contains_any(*keys)
 
@@ -209,11 +217,19 @@ JSONField and BinaryJSONField
          Event.create(data={
              'type': 'rename',
              'name': 'new name',
+             'metadata': {'old_name': 'the old name'},
              'tags': ['t1', 't2', 't3']})
 
-         (Event
-          .select()
-          .where(Event.data.contains_any('name', 'other')))
+         # These queries match the above row:
+
+         Event.select().where(Event.data.contains_any('name', 'other'))
+
+         # Search a nested object:
+         Event.select().where(
+             Event.data['metadata'].contains_any('old_name', 'old_status'))
+
+         # Search nested object for items in an array:
+         Event.select().where(Event.data['tags'].contains_any('t3', 'tx'))
 
    .. method:: contains_all(*keys)
 
@@ -224,11 +240,15 @@ JSONField and BinaryJSONField
          Event.create(data={
              'type': 'rename',
              'name': 'new name',
+             'metadata': {'old_name': 'the old name'},
              'tags': ['t1', 't2', 't3']})
 
-         (Event
-          .select()
-          .where(Event.data.contains_all('name', 'tags')))
+         # These queries match the above row:
+
+         Event.select().where(Event.data.contains_all('name', 'tags'))
+
+         # Search nested object for items in an array:
+         Event.select().where(Event.data['tags'].contains_all('t3', 't2'))
 
    .. method:: contained_by(other)
 
@@ -240,11 +260,28 @@ JSONField and BinaryJSONField
              'type': 'login',
              'result': {'success': True}})
 
+         Event.create(data={
+             'type': 'rename',
+             'name': 'new name',
+             'metadata': {'old_name': 'the old name'},
+             'tags': ['t1', 't2', 't3']})
+
+         # Matches the login row.
          (Event
           .select()
           .where(Event.data.contained_by({
               'type': 'login',
               'result': {'success': True, 'message': 'OK'}})))
+
+         # Match events that have a result w/success=True and/or
+         # error=False:
+         Event.select().where(Event.data['result'].contained_by({
+             'success': True,
+             'error': False})
+
+         # Check that tags are subset of the popular tags (matches rename row).
+         popular_tags = ['t3', 't2', 't1', 'tx', 'ty']
+         Event.select().where(Event.data['tags'].contained_by(popular_tags))
 
    .. method:: has_key(key)
 
@@ -264,6 +301,67 @@ JSONField and BinaryJSONField
 
          # Atomically remove key:
          Event.update(data=Event.data.remove('result')).execute()
+
+         # Equivalent to above:
+         Event.update(data=Event.data['result'].remove()).execute()
+
+         # Remove deeply-nested item:
+         Event.update(data=Event.data['metadata']['prior'].remove())
+
+   .. method:: length()
+
+      Return the length of the JSON array at the given path.
+
+      .. code-block:: python
+
+         Event.select().where(Event.data['tags'].length() > 3)
+
+   .. method:: extract(*path)
+
+      Extract the JSON data at the given path.
+
+      .. code-block:: python
+
+         Event.select().where(Event.data.extract('tags', 0) == 'first_tag')
+
+         Event.select().where(Event.data.extract('result', 'success') == True)
+
+         # Equivalent to above.
+         Event.select().where(Event.data['result'].extract('success') == True)
+
+
+.. class:: JSONField(dumps=None, *args, **kwargs)
+
+   :param dumps: custom implementation of ``json.dumps``
+
+   Field that stores and retrieves JSON data. Supports ``__getitem__`` key
+   access for filtering and sub-object retrieval.
+
+   Consider using the :class:`BinaryJSONField` instead as it
+   offers better performance and more powerful querying options.
+
+   .. method:: as_json()
+
+      Deserialize and return the JSON value at the given path.
+
+   .. method:: concat(data)
+
+      Concatenate the field value with ``data``. Note this is a shallow
+      operation and does not deep-merge nested objects.
+
+      See :ref:`BinaryJSONField.concat` for example usage.
+
+   .. method:: length()
+
+      Return the length of the JSON array at the given path.
+
+      See :ref:`BinaryJSONField.length` for example usage.
+
+   .. method:: extract(*path)
+
+      Extract the JSON data at the given path.
+
+      See :ref:`BinaryJSONField.extract` for example usage.
 
 
 .. _postgres-hstore:

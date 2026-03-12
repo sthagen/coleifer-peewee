@@ -79,7 +79,14 @@ connection from the pool and releases it on exit:
            charlie = await db.get(User.select().where(User.name == 'Charlie'))
            assert charlie.name == user.name
 
+           # Async query execution.
            for user in await db.list(User.select().order_by(User.name)):
+               print(user.name)
+
+           # Async lazy query result fetching (uses server-side cursors
+           # where available).
+           query = User.select().order_by(User.name)
+           async for user in db.iterator(query):
                print(user.name)
 
        await db.close_pool()
@@ -138,6 +145,9 @@ For single-query operations, the async helpers are more direct:
    # SELECT and return a scalar value.
    count = await db.scalar(User.select(fn.COUNT(User.id)))
 
+   # Or user shortcut.
+   count = await db.count(User.select())
+
    # CREATE TABLE / DROP TABLE:
    await db.acreate_tables([User, Tweet])
    await db.adrop_tables([User, Tweet])
@@ -156,7 +166,13 @@ Use ``async with db.atomic()`` for async-aware transactions:
    async with db.atomic():
        await db.run(User.create, name='Alice')
        await db.run(User.create, name='Bob')
-   # Both committed when the block exits.
+
+       # Nesting and explicit commit/rollback work.
+       async with db.atomic() as nested:
+           await db.aexecute(User.delete().where(User.name == 'Bob'))
+           await nested.arollback()  # Un-delete Bob.
+
+   # Both Alice and Bob are in the database.
 
 Or wrap transactional code in ``db.run()``:
 
@@ -167,11 +183,16 @@ Or wrap transactional code in ``db.run()``:
            User.create(name='Alice')
            User.create(name='Bob')
 
+           with db.atomic() as nested:
+               User.delete().where(User.name == 'Bob').execute()
+               nested.rollback()  # Un-delete Bob.
+
    await db.run(create_users)
+
+   # Both Alice and Bob are in the database.
 
 Both approaches produce the same result. The ``db.run()`` form is often simpler
 when the transactional logic involves many inter-dependent queries.
-
 
 Connection Management
 ---------------------
@@ -195,25 +216,15 @@ Explicit control is also available:
    await db.aclose()      # Release connection back to pool.
 
 Each asyncio task gets its own connection from the pool. **Connections are not
-shared between tasks**.
+shared between tasks**. Each async task will have it's own connection and
+transaction state - this prevents bugs that may occur when connections are
+shared and transactions end up interleaved across several running tasks.
 
 To shut down completely (e.g. during application teardown):
 
 .. code-block:: python
 
    await db.close_pool()
-
-SQLite
-^^^^^^
-
-SQLite uses a single shared connection, as the underlying database does not
-support concurrent writers.
-
-Generally SQLite is a poor fit for asynchronous workflows where writes may be
-coming in at any time, and transactions may be interleaved across multiple
-writers. Furthermore, SQLite does not do any network I/O.
-
-The SQLite implementation is provided mostly for testing and local development.
 
 MySQL and Postgresql
 ^^^^^^^^^^^^^^^^^^^^
@@ -222,19 +233,51 @@ MySQL and Postgresql use the driver's native connection pool.
 
 Pool configuration options include:
 
-* ``pool_size`` - Maximum number of connections
-* ``pool_min_size`` - Minimum pool size
-* ``acquire_timeout`` - Timeout when acquiring a connection
+* ``pool_size``: Maximum number of connections
+* ``pool_min_size``: Minimum pool size
+* ``acquire_timeout``: Timeout when acquiring a connection
 
 .. code-block:: python
 
-    db = AsyncPostgresqlDatabase(
-        'peewee_test',
-        host='localhost',
-        user='postgres',
-        pool_size=10,
-        pool_min_size=1,
-        acquire_timeout=10)
+   db = AsyncPostgresqlDatabase(
+       'peewee_test',
+       host='localhost',
+       user='postgres',
+       pool_size=10,
+       pool_min_size=1,
+       acquire_timeout=10)
+
+SQLite
+^^^^^^
+
+Peewee provides a simple connection-pooling implementation for SQLite
+connections.
+
+Pool configuration options include:
+
+* ``pool_size``: Maximum number of connections
+* ``acquire_timeout``: Timeout when acquiring a connection
+
+SQLite operates on local disk storage, so queries typically execute extremely
+quickly (microseconds / few milliseconds). The cost of dispatching to a
+background thread and wrapping in coroutines increases the latency per query.
+For every query executed, a closure must be created, a future allocated, a
+queue written-to, a loop ``call_soon_threadsafe()`` issued, and two context
+switches made. This is the case with `aiosqlite <https://github.com/omnilib/aiosqlite/blob/main/aiosqlite/core.py>`__.
+
+If your SQLite workload is heavy enough that avoiding blocking the event-loop
+is an issue, SQLite may not be a good fit. SQLite only allows one writer at a
+time, so while using an async wrapper may keep things responsive while waiting
+to obtain the write lock, writes will not occur "faster", the bottleneck has
+merely been moved. Conversely, if you don’t have that much load, the async
+wrapper adds complexity and overhead for no measurable benefit.
+
+To use SQLite in an async environment anyways, it is strongly recommended to
+use WAL-mode, which allows multiple readers to co-exist with a single writer:
+
+.. code-block:: python
+
+   db = AsyncSqliteDatabase('app.db', pragmas={'journal_mode': 'wal'})
 
 
 Sharp Corners
@@ -403,12 +446,54 @@ API Reference
       Execute a SELECT (or INSERT/UPDATE/DELETE with RETURNING) and return
       a list of results.
 
+   .. method:: iterate(query)
+      :async:
+
+      :param Query query: a Select query to stream results from using an async
+         generator.
+
+      :meth:`~AsyncDatabaseMixin.iterate` method uses server-side cursors
+      (MySQL and Postgres) to efficiently stream large result-sets.
+
+      Example:
+
+      .. code-block:: python
+
+         query = User.select().order_by(User.username)
+         async for user in db.iterator(query):
+             print(user.username)
+
    .. method:: scalar(query)
       :async:
 
       :param Query query: a Select query.
 
       Execute a SELECT and return the first column of the first row.
+
+   .. method:: count(query)
+      :async:
+
+      :param Query query: a Select query.
+
+      Wrap the query in a SELECT COUNT(...) and return the count of rows.
+
+   .. method:: exists(query)
+      :async:
+
+      :param Query query: a Select query.
+
+      Return boolean whether the query contains any results.
+
+   .. method:: aprefetch(query, *subqueries)
+      :async:
+
+      :param Query query: Query to use as starting-point.
+      :param subqueries: One or more models or :class:`ModelSelect` queries
+          to eagerly fetch.
+      :return: a list of models with selected relations prefetched.
+
+      Eagerly fetch related objects, allowing efficient querying of multiple
+      tables when a 1-to-many relationship exists.
 
    .. method:: atomic()
 
@@ -433,7 +518,8 @@ API Reference
       :returns: A :class:`CursorAdapter` instance.
 
       Execute raw SQL asynchronously. Returns a cursor-like object whose
-      rows are already fetched (call ``.fetchall()`` synchronously).
+      rows are already fetched (call ``.fetchall()`` synchronously). For result
+      streaming, see :meth:`~AsyncDatabaseMixin.iterator`.
 
 
 .. class:: AsyncSqliteDatabase(database, **kwargs)
