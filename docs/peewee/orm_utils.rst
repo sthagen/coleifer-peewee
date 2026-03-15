@@ -146,19 +146,171 @@ Pydantic Integration
 
 .. module:: playhouse.pydantic_utils
 
-``playhouse.pydantic_utils`` provides a helper for generating a Pydantic model
-from an existing Peewee :class:`Model` class.
+``playhouse.pydantic_utils`` generates `Pydantic v2 <https://docs.pydantic.dev/latest/>`_
+models from Peewee :class:`Model` classes using the :func:`~playhouse.pydantic_utils.to_pydantic`
+function.
 
-.. function:: to_pydantic(model_cls, exclude=None, include=None, exclude_autofield=True, model_name=None)
+Example
+^^^^^^^
 
-   :param Model model_cls: Peewee Model to generate.
-   :param exclude: field names to exclude from Pydantic model.
-   :type exclude: list, set, tuple
-   :param include: field names to include when generating Pydantic model.
-   :type include: list, set, tuple
-   :param bool exclude_autofield: Exclude auto-incrementing ID field when
-      generating Pydantic model.
-   :param str model_name: Name for Pydantic model. Default to ``<model_cls>Schema``.
+.. code-block:: python
+
+   import datetime
+   from peewee import *
+   from playhouse.pydantic_utils import to_pydantic
+
+   db = SqliteDatabase(':memory:')
+
+   class User(db.Model):
+       name = CharField(verbose_name='Full Name', help_text='Display name')
+       age = IntegerField()
+       active = BooleanField(default=True)
+       bio = TextField(null=True)
+       status = CharField(
+           verbose_name='Status',
+           help_text='Record status',
+           choices=[
+               ('active', 'Active'),
+               ('archived', 'Archived'),
+               ('deleted', 'Deleted'),
+           ])
+       created = DateTimeField(default=datetime.datetime.now)
+
+   # Generate a Pydantic model in one call:
+   UserSchema = to_pydantic(User)
+
+``UserSchema`` is a standard Pydantic ``BaseModel``. You can validate data,
+serialize instances, or populate instances from user data:
+
+.. code-block:: python
+
+   # Validate a dict (e.g. from an HTTP request body).
+   data = UserSchema.model_validate({'name': 'Huey', 'age': 14, 'status': 'active'})
+   print(data.model_dump())
+   # {'name': 'Huey', 'age': 14, 'active': True, 'bio': None, 'score': None,
+   #  'status': 'active', 'created': datetime.datetime(...)}
+
+   # Populate an instance from the validated data.
+   user = User(**validated.dict())
+
+   # Validate directly from a Peewee model instance:
+   huey = User.create(name='Huey', age=14, status='active')
+   data = UserSchema.model_validate(huey)
+
+
+How field metadata is mapped
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:func:`to_pydantic` reads the metadata you already set on your Peewee fields and
+translates it into the Pydantic equivalents:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Peewee attribute
+     - Pydantic effect
+   * - ``choices``
+     - The generated field uses a ``Literal`` type restricted to the choice
+       values, and the available choices are appended to the field description.
+   * - ``default`` / ``default=callable``
+     - Sets ``default`` or ``default_factory`` on the Pydantic field so it is
+       not required in input data.
+   * - ``null=True``
+     - Wraps the type in ``Optional[...]`` and defaults to ``None`` when no
+       other default is provided.
+   * - ``verbose_name``
+     - Becomes the ``title`` in the JSON schema.
+   * - ``help_text``
+     - Becomes the ``description`` in the JSON schema.
+
+Fields with no default and ``null=False`` (default) are **required** in the
+generated Pydantic model.
+
+
+Field type mapping
+^^^^^^^^^^^^^^^^^^
+
+Peewee field types are mapped to a Python type that Pydantic uses for
+validation.
+
++-------------------------------------------+------------------------+
+| Peewee field                              | Python type            |
++===========================================+========================+
+| ``CharField``, ``FixedCharField``,        | ``str``                |
+| ``TextField``                             |                        |
++-------------------------------------------+------------------------+
+| ``IntegerField``, ``SmallIntegerField``,  | ``int``                |
+| ``BigIntegerField``                       |                        |
++-------------------------------------------+------------------------+
+| ``AutoField``, ``BigAutoField``           | ``int``                |
++-------------------------------------------+------------------------+
+| ``FloatField``, ``DoubleField``           | ``float``              |
++-------------------------------------------+------------------------+
+| ``DecimalField``                          | ``Decimal``            |
++-------------------------------------------+------------------------+
+| ``BooleanField``                          | ``bool``               |
++-------------------------------------------+------------------------+
+| ``DateTimeField``                         | ``datetime.datetime``  |
++-------------------------------------------+------------------------+
+| ``DateField``                             | ``datetime.date``      |
++-------------------------------------------+------------------------+
+| ``TimeField``                             | ``datetime.time``      |
++-------------------------------------------+------------------------+
+| ``BlobField``                             | ``bytes``              |
++-------------------------------------------+------------------------+
+| ``UUIDField``                             | ``uuid.UUID``          |
++-------------------------------------------+------------------------+
+| ``JSONField``, ``BinaryJSONField``        | ``dict``               |
+| (SQLite or Postgres extensions)           |                        |
++-------------------------------------------+------------------------+
+| ``IntervalField`` (Postgres)              | ``datetime.timedelta`` |
++-------------------------------------------+------------------------+
+| ``ForeignKeyField``                       | *type of related PK*   |
++-------------------------------------------+------------------------+
+
+``AutoField`` and ``BigAutoField`` are excluded from the generated schema by
+default (``exclude_autofield=True``) - they can be included by passing
+``exclude_autofield=False``.
+
+``ForeignKeyField`` resolves through the related model's primary-key field, so
+a foreign key to a model with an ``AutoField`` PK becomes ``int``. This is
+overridden when you provide a nested schema via the ``relationships``
+parameter.
+
+Any field whose ``field_type`` is not present in the map falls back to
+``Any``, which means Pydantic will accept any value without validation. If you
+use custom field type and want strict validation, ensure they set a
+recognized ``field_type`` or handle the conversion yourself.
+
+When a field has ``choices`` defined, the mapped Python type above is
+**replaced** by a ``Literal`` constrained to the choice values, regardless of
+the underlying field type.
+
+
+API reference
+^^^^^^^^^^^^^^
+
+.. function:: to_pydantic(model_cls, exclude=None, include=None, exclude_autofield=True, model_name=None, relationships=None)
+
+   Generate a Pydantic ``BaseModel`` class from a Peewee model.
+
+   :param Model model_cls: Peewee model class.
+   :param exclude: Field names to exclude from the generated schema.
+   :type exclude: set or list
+   :param include: If provided, *only* these field names will appear in the
+       generated schema. All other fields are excluded.
+   :type include: set or list
+   :param bool exclude_autofield: When ``True`` (the default), the
+       auto-incrementing primary-key field is omitted from the schema. Set to
+       ``False`` when you need the ``id`` field in responses.
+   :param str model_name: Name for the generated Pydantic class. Defaults to
+       ``<ModelName>Schema``.
+   :param dict relationships: A mapping that tells ``to_pydantic`` how to
+       handle foreign-key or back-reference fields as nested Pydantic models
+       instead of flat scalar values. See :ref:`pydantic-relationships` below.
+   :returns: A Pydantic ``BaseModel`` subclass configured with
+       ``from_attributes=True``.
 
    Generate a Pydantic ``Model`` for the given Peewee ``model_cls``. The
    generated model will preserve Peewee field metadata:
@@ -170,75 +322,184 @@ from an existing Peewee :class:`Model` class.
    * ``null`` - control whether field is optional or required.
 
    Foreign-key fields are exposed using the underlying column name, and
-   accept a scalar value.
+   accept a scalar value **unless** you specify the schema for the relation
+   using the ``relationships`` parameter. See below for example.
 
-   Example:
+
+Foreign-key handling
+^^^^^^^^^^^^^^^^^^^^
+
+By default, foreign-key fields are exposed using their **underlying column name**
+(e.g. ``user_id`` rather than ``user``) and accept a plain scalar value, typically
+an integer primary key. This keeps the schema flat and is a good fit when you
+are accepting input data:
+
+.. code-block:: python
+
+   class Tweet(db.Model):
+       user = ForeignKeyField(User, backref='tweets')
+       content = TextField()
+       timestamp = DateTimeField(default=datetime.datetime.now)
+       is_published = BooleanField(default=True)
+
+   TweetSchema = to_pydantic(Tweet)
+
+   # The schema exposes the column name "user_id", not "user":
+   data = TweetSchema.model_validate({'user_id': 1, 'content': 'hello'})
+   print(data.model_dump())
+   # {'user_id': 1,
+   #  'content': 'hello',
+   #  'timestamp': datetime.datetime(...),
+   #  'is_published: True}
+
+   # Works when validating from a model instance too:
+   tweet = Tweet.create(user=huey, content='hello')
+   data = TweetSchema.model_validate(tweet)
+   print(data.model_dump())
+   # {'user_id': 1,
+   #  'content': 'hello',
+   #  'timestamp': datetime.datetime(...),
+   #  'is_published: True}
+
+.. _pydantic-relationships:
+
+Nested relationships
+^^^^^^^^^^^^^^^^^^^^
+
+When you wish to embed the related object rather than just its ID, pass a
+``relationships`` dict that maps a Peewee :class:`ForeignKeyField`
+(or backref) to the Pydantic schema that should be used for the nested object.
+
+**Nested foreign key**
+
+.. code-block:: python
+
+   # Include the id field so it appears in the response.
+   UserSchema = to_pydantic(User, exclude_autofield=False)
+
+   TweetResponse = to_pydantic(
+       Tweet,
+       exclude_autofield=False,
+       relationships={Tweet.user: UserSchema})
+
+   tweet = Tweet.create(user=huey, content='hello')
+
+   data = TweetResponse.model_validate(tweet)
+   print(data.model_dump())
+   # {'id': 1,
+   #  'content': 'hello',
+   #  'user': {'id': 1, 'name': 'Huey', 'age': 14, ...},
+   #  'timestamp': datetime.datetime(...),
+   #  'is_published': True}
+
+.. note::
+   Validating from a model instance will access ``tweet.user``, which triggers
+   a SELECT query if the relation is not already loaded. To avoid the extra
+   query, use a join:
 
    .. code-block:: python
 
-      class Person(TestModel):
-          name = CharField(verbose_name='Full Name', help_text='Display name')
-          age = IntegerField()
-          active = BooleanField(default=True)
-          bio = TextField(null=True)
-          score = FloatField(null=True, default=0.0)
-          status = CharField(
-              verbose_name='Status',
-              help_text='Record status',
-              choices=[
-                  ('active', 'Active'),
-                  ('archived', 'Archived'),
-                  ('deleted', 'Deleted'),
-              ])
-          created = DateTimeField(default=datetime.datetime.now)
+      tweet = (Tweet
+               .select(Tweet, User)
+               .join(User)
+               .get())
+      data = TweetResponse.model_validate(tweet)  # No additional query.
 
-      PersonSchema = to_pydantic(Person)
+**Nested back-references**
 
-   The above model will have the following JSON schema:
+Back-references work the same way, but the schema must be wrapped in
+``List[...]`` since back-references may contain 0..n records.
 
-   .. code-block:: python
+.. code-block:: python
 
-      {'properties': {'name': {'description': 'Display name',
-                               'title': 'Full Name',
-                               'type': 'string'},
-                      'age': {'title': 'Age', 'type': 'integer'},
-                      'active': {'default': True,
-                                 'title': 'Active',
-                                 'type': 'boolean'},
-                      'bio': {'anyOf': [{'type': 'string'}, {'type': 'null'}],
-                              'default': None,
-                              'title': 'Bio'},
-                      'score': {'anyOf': [{'type': 'number'}, {'type': 'null'}],
-                                'default': 0.0,
-                                'title': 'Score'},
-                      'status': {'description': "Record status | Choices: 'active' = "
-                                                "Active, 'archived' = Archived, "
-                                                "'deleted' = Deleted",
-                                 'enum': ['active', 'archived', 'deleted'],
-                                 'title': 'Status',
-                                 'type': 'string'},
-                      'created': {'format': 'date-time',
-                                  'title': 'Created',
-                                  'type': 'string'}},
-       'required': ['name', 'age', 'status'],
-       'title': 'PersonSchema',
-       'type': 'object'}
+   from typing import List
 
-   Usage:
+   # Exclude the "user" FK from the tweet schema to avoid circular nesting.
+   TweetResponse = to_pydantic(Tweet, exclude={'user'}, exclude_autofield=False)
+
+   UserDetail = to_pydantic(
+       User,
+       exclude_autofield=False,
+       relationships={User.tweets: List[TweetResponse]})
+
+   user = User.create(name='Huey', age=14, status='active')
+   Tweet.create(user=user, content='tweet 0')
+   Tweet.create(user=user, content='tweet 1')
+
+   data = UserDetail.model_validate(user)
+   print(data.model_dump())
+   # {'id': 1, 'name': 'Huey', ...,
+   #  'tweets': [{'id': 1, 'content': 'tweet 0', ...},
+   #             {'id': 2, 'content': 'tweet 1', ...}]}
+
+.. note::
+   As with foreign keys, accessing a back-reference triggers a query. Use
+   :py:meth:`~ModelSelect.prefetch` to load the collection up front:
 
    .. code-block:: python
 
-      # Validate a model instance.
-      huey = Person.create(name='Huey', age=14, status='active')
+      users = (User
+               .select()
+               .where(User.id == 123)
+               .prefetch(Tweet))
 
-      validated = PersonSchema.model_validate(huey)
-      print(validated.dict())  # {'name': 'Huey', ...}
+      data = UserDetail.model_validate(users[0])  # No additional query.
 
-      # Validate data from HTTP request.
-      validated = PersonSchema.model_validate(request.POST)
 
-      # Construct model instance from validated request data.
-      person = Person(**validated.dict())
+JSON schema output
+^^^^^^^^^^^^^^^^^^
+
+Because the generated class is a regular Pydantic model, you can call
+``model_json_schema()`` to get a JSON-schema dict suitable for OpenAPI docs:
+
+.. code-block:: python
+
+   import json
+   print(json.dumps(UserSchema.model_json_schema(), indent=2))
+
+.. code-block:: json
+
+   {
+     "properties": {
+       "name": {
+         "description": "Display name",
+         "title": "Full Name",
+         "type": "string"
+       },
+       "age": {
+         "title": "Age",
+         "type": "integer"
+       },
+       "active": {
+         "default": true,
+         "title": "Active",
+         "type": "boolean"
+       },
+       "bio": {
+         "anyOf": [{"type": "string"}, {"type": "null"}],
+         "default": null,
+         "title": "Bio"
+       },
+       "status": {
+         "description": "Record status | Choices: 'active' = Active, 'archived' = Archived, 'deleted' = Deleted",
+         "enum": ["active", "archived", "deleted"],
+         "title": "Status",
+         "type": "string"
+       },
+       "created": {
+         "format": "date-time",
+         "title": "Created",
+         "type": "string"
+       }
+     },
+     "required": ["name", "age", "status"],
+     "title": "UserSchema",
+     "type": "object"
+   }
+
+Note that ``name``, ``age``, and ``status`` are the only required fields. All
+other fields have defaults (``active`` defaults to ``True``, ``bio`` defaults
+to ``None``, and ``created`` uses a ``default_factory``).
 
 
 .. _hybrid:
