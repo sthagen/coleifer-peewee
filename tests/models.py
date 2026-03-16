@@ -874,6 +874,32 @@ class TestModelAPIs(ModelTestCase):
             ('zaizee', 'huey'),
             ('mickey', 'huey')])
 
+    @requires_models(User, Tweet)
+    def test_join_to_dict(self):
+        huey = self.add_user('huey')
+        mickey = self.add_user('mickey')
+        self.add_tweets(huey, 'meow', 'hiss', 'purr')
+        self.add_tweets(mickey, 'woof')
+
+        with self.assertQueryCount(1):
+            q = Select((User,), (User.id, User.username,))
+            query = (Tweet
+                     .select(Tweet.content, q.c.username)
+                     .join(q, on=(Tweet.user == q.c.id), attr='u')
+                     .order_by(q.c.username, Tweet.content))
+            self.assertSQL(query, (
+                'SELECT "t1"."content", "t2"."username" FROM "tweet" AS "t1" '
+                'INNER JOIN (SELECT "t3"."id", "t3"."username" FROM "users" '
+                'AS "t3") AS "t2" ON ("t1"."user_id" = "t2"."id") '
+                'ORDER BY "t2"."username", "t1"."content"'), [])
+
+            tweets = list(query)
+            self.assertEqual([(t.content, t.u) for t in tweets], [
+                ('hiss', {'username': 'huey'}),
+                ('meow', {'username': 'huey'}),
+                ('purr', {'username': 'huey'}),
+                ('woof', {'username': 'mickey'})])
+
     @requires_models(User)
     def test_peek(self):
         for username in ('huey', 'mickey', 'zaizee'):
@@ -884,6 +910,17 @@ class TestModelAPIs(ModelTestCase):
             self.assertEqual(query.peek(n=1), {'username': 'huey'})
             self.assertEqual(query.peek(n=2), [{'username': 'huey'},
                                                {'username': 'mickey'}])
+
+    @requires_models(User)
+    def test_first(self):
+        for u in 'abc':
+            self.add_user(u)
+
+        # Multiple calls to first() do not result in multiple executions.
+        with self.assertQueryCount(1):
+            q = User.select().order_by(User.username)
+            self.assertEqual(q.first().username, 'a')
+            self.assertEqual(q.first().username, 'a')
 
     @requires_models(User, Tweet, Favorite)
     def test_multi_join(self):
@@ -1196,8 +1233,8 @@ class TestModelAPIs(ModelTestCase):
             'WHERE ("t1"."value" < ?) UNION '
             'SELECT "t2"."id", "t2"."value" FROM "register" AS "t2" '
             'WHERE ("t2"."value" > ?) UNION '
-            'SELECT "t2"."id", "t2"."value" FROM "register" AS "t2" '
-            'WHERE ("t2"."value" = ?) ORDER BY 2'), [2, 7, 5])
+            'SELECT "t3"."id", "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?) ORDER BY 2'), [2, 7, 5])
 
         self.assertEqual([row.value for row in c2], [0, 1, 5, 8, 9])
         self.assertEqual(c2.count(), 5)
@@ -4462,7 +4499,6 @@ class Product(TestModel):
 class TestModelConstraints(ModelTestCase):
     requires = [Product]
 
-    @skip_if(IS_MYSQL)  # MySQL fails intermittently on Travis-CI (?).
     def test_model_constraints(self):
         p = Product.create(name='p1', price=1, status='a')
         self.assertTrue(p.flags is None)
@@ -4476,22 +4512,22 @@ class TestModelConstraints(ModelTestCase):
         # Cannot update price with invalid value, must be > 0.
         with self.database.atomic():
             p.price = -1
-            self.assertRaises(IntegrityError, p.save)
+            self.assertRaises(DatabaseError, p.save)
 
         # Nor can we create a new product with an invalid price.
         with self.database.atomic():
-            self.assertRaises(IntegrityError, Product.create, name='p2',
+            self.assertRaises(DatabaseError, Product.create, name='p2',
                               price=0, status='a')
 
         # Cannot set status to a value other than 1, 2 or 3.
         with self.database.atomic():
             p.price = 1
             p.status = 'd'
-            self.assertRaises(IntegrityError, p.save)
+            self.assertRaises(DatabaseError, p.save)
 
         # Cannot create a new product with invalid status.
         with self.database.atomic():
-            self.assertRaises(IntegrityError, Product.create, name='p3',
+            self.assertRaises(DatabaseError, Product.create, name='p3',
                               price=1, status='x')
 
 

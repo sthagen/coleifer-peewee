@@ -70,7 +70,7 @@ except ImportError:
         mysql = None
 
 
-__version__ = '4.0.1'
+__version__ = '4.0.2'
 __all__ = [
     'AnyField',
     'AsIs',
@@ -186,7 +186,7 @@ if sqlite3:
         def datetime_adapter(d): return d.isoformat(' ')
         def convert_date(d): return datetime.date(*map(int, d.split(b'-')))
         def convert_timestamp(t):
-            date, time = t.split(b' ')
+            date, time = t.split(b'T') if b'T' in t else t.split(b' ')
             y, m, d = map(int, date.split(b'-'))
             t_full = time.split(b'.')
             hour, minute, second = map(int, t_full[0].split(b':'))
@@ -243,6 +243,8 @@ def _sqlite_date_trunc(lookup_type, datetime_string):
     return dt.strftime(__sqlite_date_trunc__[lookup_type])
 
 def _sqlite_regexp(regex, value):
+    if value is None:
+        return False
     return re.search(regex, value) is not None
 
 
@@ -411,8 +413,8 @@ def chunked(it, n):
     marker = object()
     groups = itertools.zip_longest(*[iter(it)] * n, fillvalue=marker)
     for group in (list(g) for g in groups):
-        if group[-1] is marker:
-            del group[group.index(marker):]
+        while group and group[-1] is marker:
+            group.pop()
         yield group
 
 
@@ -537,6 +539,7 @@ class AliasManager(object):
     def pop(self):
         if self._current_index == 1:
             raise ValueError('Cannot pop() from empty alias manager.')
+        self._mapping[self._current_index - 1].clear()
         self._current_index -= 1
 
 
@@ -702,13 +705,13 @@ def _query_val_transform(v):
     # Interpolate parameters.
     if isinstance(v, (str, datetime.datetime, datetime.date,
                       datetime.time)):
-        v = "'%s'" % v
+        v = "'%s'" % str(v).replace("'", "''")
     elif isinstance(v, bytes):
         try:
             v = v.decode('utf8')
         except UnicodeDecodeError:
             v = v.decode('raw_unicode_escape')
-        v = "'%s'" % v
+        v = "'%s'" % v.replace("'", "''")
     elif isinstance(v, int):
         v = '%s' % int(v)  # Also handles booleans -> 1 or 0.
     elif v is None:
@@ -1417,6 +1420,8 @@ class BitwiseMixin(object):
 
 
 class BitwiseNegated(BitwiseMixin, WrappedNode):
+    op = OP.BITWISE_NEGATION
+
     def __invert__(self):
         return self.node
 
@@ -1546,9 +1551,11 @@ class Expression(ColumnBase):
             # Postgresql reports an error for IN/NOT IN (), so convert to
             # the equivalent boolean expression.
             op_in = self.op == OP.IN or self.op == OP.NOT_IN
-            if op_in and ctx.as_new().parse(self.rhs)[0] == '()':
-                return ctx.literal('0 = 1' if self.op == OP.IN else '1 = 1')
             rhs = self.rhs
+            if op_in:
+                #
+                if self._is_rhs_empty(rhs, ctx):
+                    return ctx.literal('0 = 1' if self.op == OP.IN else '1 = 1')
             if rhs is None and (self.op == OP.IS or self.op == OP.IS_NOT):
                 rhs = SQL('NULL')
 
@@ -1556,6 +1563,14 @@ class Expression(ColumnBase):
                     .sql(self.lhs)
                     .literal(' %s ' % op_sql)
                     .sql(rhs))
+
+    def _is_rhs_empty(self, rhs, ctx):
+        if isinstance(rhs, multi_types):
+            return not bool(rhs)
+        elif isinstance(rhs, Value):
+            return (rhs.multi and not rhs.values)
+        else:
+            return ctx.as_new().parse(rhs)[0] == '()'
 
 
 class StringExpression(Expression):
@@ -1567,7 +1582,7 @@ class StringExpression(Expression):
 
 class Entity(ColumnBase):
     def __init__(self, *path):
-        self._path = [part.replace('"', '""') for part in path if part]
+        self._path = [p for p in path if p]
 
     def __getattr__(self, attr):
         return Entity(*self._path + [attr])
@@ -1579,7 +1594,10 @@ class Entity(ColumnBase):
         return hash((self.__class__.__name__, tuple(self._path)))
 
     def __sql__(self, ctx):
-        return ctx.literal(quote(self._path, ctx.state.quote or '""'))
+        quote_chars = ctx.state.quote or '""'
+        q = quote_chars[0]
+        escaped = [p.replace(q, quote_chars) for p in self._path]
+        return ctx.literal(quote(escaped, quote_chars))
 
 
 class SQL(ColumnBase):
@@ -2180,8 +2198,7 @@ class Query(BaseQuery):
 
     @Node.copy
     def paginate(self, page, paginate_by=20):
-        if page > 0:
-            page -= 1
+        page = page - 1 if page > 0 else 0
         self._limit = paginate_by
         self._offset = page * paginate_by
 
@@ -3593,7 +3610,7 @@ class SqliteDatabase(Database):
                                isolation_level=None, **self.connect_params)
         try:
             self._add_conn_hooks(conn)
-        except:
+        except Exception:
             conn.close()
             raise
         return conn
@@ -4002,9 +4019,6 @@ class Psycopg2Adapter(_BasePsycopgAdapter):
             conn.rollback()
         return False
 
-    def extract_date(self, date_part, date_field):
-        return fn.EXTRACT(NodeList((date_part, SQL('FROM'), date_field)))
-
 
 class Psycopg3Adapter(_BasePsycopgAdapter):
     isolation_levels = {
@@ -4060,9 +4074,6 @@ class Psycopg3Adapter(_BasePsycopgAdapter):
         elif txn_status != TransactionStatus.IDLE:
             conn.rollback()
         return False
-
-    def extract_date(self, date_part, date_field):
-        return fn.EXTRACT(NodeList((SQL(date_part), SQL('FROM'), date_field)))
 
 
 class PostgresqlDatabase(Database):
@@ -4275,7 +4286,7 @@ class PostgresqlDatabase(Database):
         return self._build_on_conflict_update(oc, query)
 
     def extract_date(self, date_part, date_field):
-        return self._adapter.extract_date(date_part, date_field)
+        return fn.EXTRACT(NodeList((SQL(date_part), SQL('FROM'), date_field)))
 
     def truncate_date(self, date_part, date_field):
         return fn.DATE_TRUNC(date_part, date_field)
@@ -4294,7 +4305,7 @@ class PostgresqlDatabase(Database):
         return ctx.sql(Select().columns(SQL('0')).where(SQL('false')))
 
     def set_time_zone(self, timezone):
-        self.execute_sql('set time zone "%s";' % timezone)
+        self.execute_sql('set time zone \'%s\';' % timezone.replace("'", "''"))
 
     def set_isolation_level(self, isolation_level):
         self._isolation_level = self._adapter.isolation_level_int(
@@ -4359,7 +4370,7 @@ class MySQLDatabase(Database):
         if 'maria' in version:
             match_obj = re.search(r'(1\d\.\d+\.\d+)', version)
         else:
-            match_obj = re.search(r'(\d\.\d+\.\d+)', version)
+            match_obj = re.search(r'(\d{1,2}\.\d+\.\d+)', version)
         if match_obj is not None:
             return tuple(int(num) for num in match_obj.groups()[0].split('.'))
 
@@ -4372,7 +4383,7 @@ class MySQLDatabase(Database):
 
         conn = self._state.conn
         if hasattr(conn, 'ping'):
-            if self.server_version[0] == 8:
+            if self.server_version[0] >= 8:
                 args = ()
             else:
                 args = (False,)
@@ -4477,7 +4488,7 @@ class MySQLDatabase(Database):
             # depending on the MySQL server version. MySQL and MariaDB prior to
             # 10.3.3 use "VALUES", while MariaDB 10.3.3+ use "VALUE".
             version = self.server_version or (0,)
-            if version[0] == 10 and version >= (10, 3, 3):
+            if version[0] >= 10 and version >= (10, 3, 3):
                 VALUE_FN = fn.VALUE
             else:
                 VALUE_FN = fn.VALUES
@@ -4623,7 +4634,7 @@ class _transaction(object):
         elif depth == 1:
             try:
                 self.commit(False)
-            except:
+            except Exception:
                 self.rollback(False)
                 raise
 
@@ -4662,7 +4673,7 @@ class _savepoint(object):
         else:
             try:
                 self.commit(begin=False)
-            except:
+            except Exception:
                 self.rollback(begin=False)
                 raise
 
@@ -5018,7 +5029,7 @@ class IntegerField(Field):
     def adapt(self, value):
         try:
             return int(value)
-        except ValueError:
+        except (ValueError, TypeError):
             return value
 
 
@@ -5068,7 +5079,7 @@ class FloatField(Field):
     def adapt(self, value):
         try:
             return float(value)
-        except ValueError:
+        except (ValueError, TypeError):
             return value
 
 
@@ -5310,12 +5321,9 @@ class BigBitFieldData(object):
 
     def __repr__(self):
         return repr(self._buffer)
-    if sys.version_info[0] < 3:
-        def __str__(self):
-            return bytes(self._buffer)
-    else:
-        def __bytes__(self):
-            return bytes(self._buffer)
+
+    def __bytes__(self):
+        return bytes(self._buffer)
 
 
 class BigBitFieldAccessor(FieldAccessor):
@@ -5363,7 +5371,7 @@ class UUIDField(Field):
             return value.hex
         try:
             return uuid.UUID(value).hex
-        except:
+        except Exception:
             return value
 
     def python_value(self, value):
@@ -5676,10 +5684,10 @@ class ForeignKeyField(Field):
 
     @property
     def field_type(self):
-        if not isinstance(self.rel_field, AutoField):
-            return self.rel_field.field_type
-        elif isinstance(self.rel_field, BigAutoField):
+        if isinstance(self.rel_field, BigAutoField):
             return BigIntegerField.field_type
+        elif not isinstance(self.rel_field, AutoField):
+            return self.rel_field.field_type
         return IntegerField.field_type
 
     def get_modifiers(self):
@@ -6952,7 +6960,8 @@ class Model(with_metaclass(ModelBase, Node)):
         sq = cls.select()
         if query:
             # Handle simple lookup using just the primary key.
-            if len(query) == 1 and isinstance(query[0], int):
+            if len(query) == 1 and isinstance(query[0], int) and \
+               cls._meta.auto_increment:
                 sq = sq.where(cls._meta.primary_key == query[0])
             else:
                 sq = sq.where(*query)
@@ -7354,6 +7363,10 @@ class _ModelQueryHelper(object):
         self._row_type = ROW.CONSTRUCTOR
         self._constructor = self.model if constructor is None else constructor
 
+    @Node.copy
+    def models(self):
+        self._row_type = ROW.MODEL
+
     def _get_cursor_wrapper(self, cursor):
         row_type = self._row_type or self.default_row_type
         if row_type == ROW.MODEL:
@@ -7708,7 +7721,7 @@ class ModelSelect(BaseModelSelect, Select):
                 for piece in key.split('__'):
                     for dest, attr, _, _ in self._joins.get(curr, ()):
                         try: model_attr = getattr(curr, piece, None)
-                        except: pass
+                        except Exception: pass
                         if attr == piece or (isinstance(dest, ModelAlias) and
                                              dest.alias == piece):
                             curr = dest
@@ -8070,7 +8083,7 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                             if field is not None])
         select, columns = self.select, self.columns
 
-        self.key_to_constructor = {self.model: self.model}
+        self.key_to_constructor = {self.model: (self.model, True)}
         self.src_is_dest = {}
         self.src_to_dest = []
         accum = collections.deque(self.from_list)
@@ -8089,7 +8102,8 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
             is_dict = isinstance(curr, dict)
             for key, attr, constructor, join_type in self.joins[curr]:
                 if key not in self.key_to_constructor:
-                    self.key_to_constructor[key] = constructor
+                    self.key_to_constructor[key] = (constructor,
+                                                    is_model(constructor))
 
                     # (src, attr, dest, is_dict, join_type).
                     self.src_to_dest.append((curr, attr, key, is_dict,
@@ -8101,9 +8115,9 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
         for src in selected_src:
             if src not in self.key_to_constructor:
                 if is_model(src):
-                    self.key_to_constructor[src] = src
+                    self.key_to_constructor[src] = (src, True)
                 elif isinstance(src, ModelAlias):
-                    self.key_to_constructor[src] = src.model
+                    self.key_to_constructor[src] = (src.model, True)
 
         # Indicate which sources are also dests.
         for src, _, dest, _, _ in self.src_to_dest:
@@ -8136,8 +8150,11 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
     def process_row(self, row):
         objects = {}
         object_list = []
-        for key, constructor in self.key_to_constructor.items():
-            objects[key] = constructor(__no_default__=True)
+        for key, (constructor, _is_model) in self.key_to_constructor.items():
+            if _is_model:
+                objects[key] = constructor(__no_default__=True)
+            else:
+                objects[key] = constructor()
             object_list.append(objects[key])
 
         default_instance = objects[self.model]

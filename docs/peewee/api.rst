@@ -76,10 +76,10 @@ Database
 
       String used as parameter placeholder in SQL queries.
 
-   .. attribute:: quote = '"'
+   .. attribute:: quote = '""'
 
-      Type of quotation-mark to use to denote entities such as tables or
-      columns.
+      Type of quotation-mark(s) to use to denote entities such as tables or
+      columns, specified as ``'<open quote><close quote>'``.
 
    .. method:: init(database, **kwargs)
 
@@ -192,11 +192,10 @@ Database
          def load_fixtures():
              db.create_tables([User, Tweet])
              import_data()
-                        database.create_tables(APP_MODELS)
 
    .. method:: cursor(named_cursor=None)
 
-      :param named_cursor: Reserved for internal use.
+      :param named_cursor: Reserved for internal use by Postgres extension.
 
       Return a DB-API ``cursor`` object on the current connection. If a
       connection is not open, one will be opened.
@@ -552,13 +551,15 @@ Database
               data_type='INTEGER',
               null=False,
               primary_key=True,
-              table='entry'),
+              table='entry',
+              default=None),
           ColumnMetadata(
               name='title',
               data_type='TEXT',
               null=False,
               primary_key=False,
-              table='entry'),
+              table='entry',
+              default=None),
           ...]
 
    .. method:: get_primary_keys(table, schema=None)
@@ -708,6 +709,17 @@ Database
 
       Provides a compatible interface for extracting a portion of a datetime.
 
+      Example:
+
+      .. code-block:: python
+
+         query = (Tweet.select()
+                  .where(db.extract_date('year', Tweet.timestamp) == 2026))
+
+         # If Tweet.timestamp is a DateField or DateTimeField we could
+         # also write:
+         query = Tweet.select().where(Tweet.timestamp.year == 2026)
+
    .. method:: truncate_date(date_part, date_field)
 
       :param str date_part: date part to truncate to, e.g. 'day'.
@@ -718,6 +730,19 @@ Database
 
       Provides a compatible interface for truncating a datetime to the given
       resolution.
+
+      Example:
+
+      .. code-block:: python
+
+         # Report on how many tweets made in each month.
+         query = (Tweet
+                  .select(
+                      db.truncate_date('month', Tweet.timestamp).alias('month'),
+                      fn.COUNT(Tweet.id).alias('count'))
+                  .group_by(db.truncate_date('month', Tweet.timestamp)))
+         for row in query:
+             print(row.month, '->', row.count)
 
    .. method:: random()
 
@@ -1117,7 +1142,7 @@ Database
       .. code-block:: python
 
          # psycopg2 or psycopg3
-         db = db.set_isolation_level('SERIALIZABLE')
+         db.set_isolation_level('SERIALIZABLE')
 
          # psycopg2
          from psycopg2.extensions import ISOLATION_LEVEL_SERIALIZABLE
@@ -2077,8 +2102,8 @@ Model
 
          Setting.insert_many([
              {'key': 'host', 'value': '192.168.1.2'},
-             {'key': 'port': 'value': '1337'},
-             {'key': 'user': 'value': 'nuggie'}]).execute()
+             {'key': 'port', 'value': '1337'},
+             {'key': 'user', 'value': 'nuggie'}]).execute()
 
          # Load settings from db into dict.
          settings = {setting.key: setting.value for setting in Setting}
@@ -2246,28 +2271,155 @@ Model
 
    Model-specific implementation of SELECT query.
 
-   .. method:: switch(ctx=None)
+   .. method:: get()
 
-      :param ctx: A :class:`Model`, :class:`ModelAlias`, subquery, or
-          other object that was joined-on.
+      :param Database database: database to execute query against.
+      :return: A single row from the database.
+      :raises: ``DoesNotExist`` if row not found.
 
-      Switch the *join context* - the source which subsequent calls to
-      :meth:`~ModelSelect.join` will be joined against. Used for
-      specifying multiple joins against a single table.
+      Execute the query and return the first row, if it exists. Multiple
+      calls will result in multiple queries being executed.
 
-      See :ref:`relationships` for additional discussion.
+      If no matching row is found, raise ``DoesNotExist``.
 
-      If the ``ctx`` is not given, then the query's model will be used.
+   .. method:: peek(n=1)
 
-      The following example selects from tweet and joins on both user and
-      tweet-flag:
+      :param int n: Number of rows to return.
+      :return: A single row if n = 1, else a list of rows.
+
+      Execute the query and return the given number of rows from the start
+      of the cursor. This function may be called multiple times safely, and
+      will always return the first N rows of results.
+
+   .. method:: first(n=1)
+
+      :param int n: Number of rows to return.
+      :return: A single row if n = 1, else a list of rows.
+
+      Like the :meth:`~ModelSelect.peek` method, except a ``LIMIT`` is
+      applied to the query to ensure that only ``n`` rows are returned.
+      Multiple calls for the same value of ``n`` will not result in multiple
+      executions.
+
+      The query is altered in-place so it is **not** possible to call
+      :meth:`~ModelSelect.first` and then later iterate over the full
+      result-set using the same query object. Again, this is done to ensure
+      that multiple calls to ``first()`` will not result in multiple query
+      executions.
+
+   .. method:: scalar(as_tuple=False, as_dict=False)
+
+      :param bool as_tuple: Return the result as a tuple?
+      :param bool as_dict: Return the result as a dict?
+      :return: Single scalar value. If ``as_tuple = True``, a row tuple is
+          returned. If ``as_dict = True``, a row dict is returned.
+
+      Return a scalar value from the first row of results. If multiple
+      scalar values are anticipated (e.g. multiple aggregations in a single
+      query) then you may specify ``as_tuple=True`` to get the row tuple.
+
+      Example:
 
       .. code-block:: python
 
-          sq = Tweet.select().join(User).switch(Tweet).join(TweetFlag)
+         query = Note.select(fn.MAX(Note.timestamp))
+         max_ts = query.scalar()
 
-          # Equivalent (since Tweet is the query's model)
-          sq = Tweet.select().join(User).switch().join(TweetFlag)
+         query = Note.select(fn.MAX(Note.timestamp), fn.COUNT(Note.id))
+         max_ts, n_notes = query.scalar(as_tuple=True)
+
+         query = Note.select(fn.COUNT(Note.id).alias('count'))
+         assert query.scalar(as_dict=True) == {'count': 123}
+
+   .. method:: count(clear_limit=False)
+
+      :param bool clear_limit: Clear any LIMIT clause when counting.
+      :return: Number of rows in the query result-set.
+
+      Return number of rows in the query result-set.
+
+      Implemented by running SELECT COUNT(1) FROM (<current query>).
+
+      Example:
+
+      .. code-block:: python
+
+         n = Tweet.select().where(Tweet.is_published == True).count()
+         print('%d published tweets' % n)
+
+   .. method:: exists()
+
+      :return: Whether any results exist for the current query.
+
+      Return a boolean indicating whether the current query has any results.
+
+      Example:
+
+      .. code-block:: python
+
+         if User.select().where(User.username == 'Alice').exists():
+             print('User found')
+
+   .. method:: dicts(as_dict=True)
+
+      :param bool as_dict: Specify whether to return rows as dictionaries.
+
+      Return rows as dictionaries.
+
+      Example:
+
+      .. code-block:: python
+         :emphasize-lines: 5, 8
+
+         query = (User
+                  .select(User.username, fn.COUNT(Tweet.id).alias('tweet_count'))
+                  .join(Tweet, JOIN.LEFT_OUTER)
+                  .group_by(User.username)
+                  .dicts())
+
+         for row in query:
+             print(row)  # {'username': 'Alice', 'tweet_count': 12}
+
+   .. method:: tuples(as_tuples=True)
+
+      :param bool as_tuples: Specify whether to return rows as tuples.
+
+      Return rows as tuples.
+
+      Example:
+
+      .. code-block:: python
+         :emphasize-lines: 5, 8
+
+         query = (User
+                  .select(User.username, fn.COUNT(Tweet.id).alias('tweet_count'))
+                  .join(Tweet, JOIN.LEFT_OUTER)
+                  .group_by(User.username)
+                  .tuples())
+
+         for row in query:
+             print(row)  # ('Alice', 12)
+
+   .. method:: namedtuples(as_namedtuple=True)
+
+      :param bool as_namedtuple: Specify whether to return rows as named
+          tuples.
+
+      Return rows as named tuples.
+
+      Example:
+
+      .. code-block:: python
+         :emphasize-lines: 5, 8
+
+         query = (User
+                  .select(User.username, fn.COUNT(Tweet.id).alias('tweet_count'))
+                  .join(Tweet, JOIN.LEFT_OUTER)
+                  .group_by(User.username)
+                  .namedtuples())
+
+         for row in query:
+             print(row)  # Row(username='Alice', tweet_count=12)
 
    .. method:: objects(constructor=None)
 
@@ -2282,9 +2434,42 @@ Model
       model instances). For very complex queries this can have a positive
       performance impact, especially iterating large result sets.
 
-      Similarly, you can use :meth:`~BaseQuery.dicts`,
-      :meth:`~BaseQuery.tuples` or :meth:`~BaseQuery.namedtuples`
+      Example:
+
+      .. code-block:: python
+
+         query = (Tweet
+                  .select(Tweet.id, Tweet.content, User.username)
+                  .join(User)
+                  .objects())  # Apply all selections to Tweet instance.
+
+         # NOTE: the username is applied directly to the tweet object
+         # and accessed via `tweet.username`:
+         for tweet in query:
+             print(tweet.id, tweet.content, tweet.username)
+
+      Similarly, you can use :meth:`~ModelSelect.dicts`,
+      :meth:`~ModelSelect.tuples` or :meth:`~ModelSelect.namedtuples`
       to achieve even more performance.
+
+   .. method:: models()
+
+      Return result rows as :class:`Model` instances, rebuilding the model
+      graph from explicitly selected and joined data. **This is the default**.
+
+      .. code-block:: python
+
+         query = (Tweet
+                  .select(Tweet, User)
+                  .join(User))
+
+         # Note that `tweet.user` is populated already since we SELECTed
+         # columns from the joined User model.
+         for tweet in query:
+             print(tweet.user.username, '->', tweet.content)
+
+      For an in-depth discussion of foreign-keys, joins and relationships
+      between models, refer to :ref:`relationships`.
 
    .. method:: join(dest, join_type='INNER', on=None, src=None, attr=None)
 
@@ -2333,6 +2518,29 @@ Model
       Use same parameter order as the non-model-specific
       :meth:`~ModelSelect.join`. Bypasses the *join context* by requiring
       the join source to be specified.
+
+   .. method:: switch(ctx=None)
+
+      :param ctx: A :class:`Model`, :class:`ModelAlias`, subquery, or
+          other object that was joined-on.
+
+      Switch the *join context* - the source which subsequent calls to
+      :meth:`~ModelSelect.join` will be joined against. Used for
+      specifying multiple joins against a single table.
+
+      See :ref:`relationships` for additional discussion.
+
+      If the ``ctx`` is not given, then the query's model will be used.
+
+      The following example selects from tweet and joins on both user and
+      tweet-flag:
+
+      .. code-block:: python
+
+          sq = Tweet.select().join(User).switch(Tweet).join(TweetFlag)
+
+          # Equivalent (since Tweet is the query's model)
+          sq = Tweet.select().join(User).switch().join(TweetFlag)
 
    .. method:: filter(*args, **kwargs)
 
@@ -2482,11 +2690,43 @@ Fields
       database. Sub-classes operating on special data-types will most likely
       want to override this method.
 
+      Example:
+
+      .. code-block:: python
+         :emphasize-lines: 3
+
+         class PickleField(BlobField):
+             # Values going from Python -> Database should be pickled.
+             def db_value(self, value):
+                 if value is not None:
+                     return pickle.dumps(value, pickle.HIGHEST_PROTOCOL)
+
+             # Values coming from the Database -> Python should be unpickled.
+             def python_value(self, value):
+                 if value is not None:
+                     return pickle.loads(value)
+
    .. method:: python_value(value)
 
       Coerce a value from the database into a Python object. Sub-classes
       operating on special data-types will most likely want to override this
       method.
+
+      Example:
+
+      .. code-block:: python
+         :emphasize-lines: 8
+
+         class PickleField(BlobField):
+             # Values going from Python -> Database should be pickled.
+             def db_value(self, value):
+                 if value is not None:
+                     return pickle.dumps(value, pickle.HIGHEST_PROTOCOL)
+
+             # Values coming from the Database -> Python should be unpickled.
+             def python_value(self, value):
+                 if value is not None:
+                     return pickle.loads(value)
 
    .. method:: coerce(value)
 
@@ -3108,17 +3348,19 @@ Fields
       # Tweet.user will be resolved into a ForeignKeyField:
       DeferredForeignKey.resolve(User)
 
-.. class:: ManyToManyField(model, backref=None, through_model=None, on_delete=None, on_update=None)
+.. class:: ManyToManyField(model, backref=None, through_model=None, on_delete=None, on_update=None, prevent_unsaved=True)
 
    :param Model model: Model to create relationship with.
    :param str backref: Accessor name for back-reference
    :param Model through_model: :class:`Model` to use for the intermediary
-       table. If not provided, a simple through table will be automatically
-       created.
+      table. If not provided, a simple through table will be automatically
+      created.
    :param str on_delete: ON DELETE action, e.g. ``'CASCADE'``. Will be used
-       for foreign-keys in through model.
+      for foreign-keys in through model.
    :param str on_update: ON UPDATE action. Will be used for foreign-keys in
-       through model.
+      through model.
+   :param bool prevent_unsaved: Raise ``ValueError`` if accessing relation from
+      an unsaved model instance (default True).
 
    The :class:`ManyToManyField` provides a simple interface for working
    with many-to-many relationships, inspired by Django. A many-to-many
@@ -3262,7 +3504,7 @@ Fields
       The :class:`Model` representing the many-to-many junction table.
       Will be auto-generated if not explicitly declared.
 
-   .. method:: add(value, clear_existing=True)
+   .. method:: add(value, clear_existing=False)
 
       :param value: Either a :class:`Model` instance, a list of model
           instances, or a :class:`SelectQuery`.
@@ -3973,6 +4215,15 @@ Query-builder
       :return: a :class:`Cast` object.
 
       Create a ``CAST`` expression.
+
+      Example:
+
+      .. code-block:: python
+
+         # Cast a text column to integer for comparison.
+         query = (Entry
+                  .select()
+                  .where(Entry.legacy_code.cast('INTEGER') > 100))
 
    .. method:: asc(collation=None, nulls=None)
 
@@ -4743,6 +4994,15 @@ Queries
       the expressions will be OR-ed together with any previously-specified
       WHERE expressions.
 
+      Example:
+
+      .. code-block:: python
+
+         query = (User
+                  .select()
+                  .where(User.is_admin == True)
+                  .orwhere(User.is_moderator == True))
+
    .. method:: order_by(*values)
 
       :param values: zero or more Column-like objects to order by.
@@ -4774,6 +5034,23 @@ Queries
 
       This feature is designed with web-site pagination in mind, so the first
       page starts with ``page=1``.
+
+      Example:
+
+      .. code-block:: python
+
+         @app.route('/users/')
+         def users():
+             query = User.select().order_by(User.username)
+             page = request.args.get('page')
+             if page and page.isdigit():
+                 page = max(1, int(page))
+             else:
+                 page = 1
+
+             # Render the requested page of results, displaying up to
+             # 20 users per page.
+             return render('users.html', users=query.paginate(page, 20))
 
 
 .. class:: SelectQuery()
@@ -4946,6 +5223,10 @@ Queries
       Execute the query and return the first row, if it exists. Multiple
       calls will result in multiple queries being executed.
 
+      If no matching row is found this method returns ``None`` - this differs
+      from the behavior of :meth:`ModelSelect.get` and :meth:`Model.get`, which
+      raise ``DoesNotExist`` when no row is found.
+
 
 .. class:: CompoundSelectQuery(lhs, op, rhs)
 
@@ -5109,6 +5390,17 @@ Queries
       Include the given expressions in the HAVING clause of the query. The
       expressions will be AND-ed together with any previously-specified
       HAVING expressions.
+
+      Example:
+
+      .. code-block:: python
+
+         # Find users with 100 or more Tweets.
+         query = (User
+                  .select(User, fn.Count(Tweet.id).alias('count'))
+                  .join(Tweet)
+                  .group_by(User)
+                  .having(fn.Count(Tweet.id) >= 100))
 
    .. method:: distinct(*columns)
 
@@ -5606,7 +5898,7 @@ Constants and Helpers
 
 .. class:: DatabaseProxy()
 
-   Proxy subclass that is suitable to use as a placeholder for a
+   :class:`Proxy` subclass that is suitable to use as a placeholder for a
    :class:`Database` instance.
 
    See :ref:`initializing-database` for details.
