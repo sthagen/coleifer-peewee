@@ -378,6 +378,9 @@ CSQ_PARENTHESES_UNNESTED = 2
 SNAKE_CASE_STEP1 = re.compile('(.)_*([A-Z][a-z]+)')
 SNAKE_CASE_STEP2 = re.compile('([a-z0-9])_*([A-Z])')
 
+# Used for making valid Python identifiers.
+IDENTIFIER_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
 # Helper functions that are used in various parts of the codebase.
 MODEL_BASE = '_metaclass_helper_'
 
@@ -408,6 +411,12 @@ def ensure_entity(value):
 def make_snake_case(s):
     first = SNAKE_CASE_STEP1.sub(r'\1_\2', s)
     return SNAKE_CASE_STEP2.sub(r'\1_\2', first).lower()
+
+def make_identifier(s):
+    match_obj = IDENTIFIER_RE.search(s.rsplit('.', 1)[-1])
+    if match_obj is not None:
+        return match_obj.group()
+    return s
 
 def chunked(it, n):
     marker = object()
@@ -1445,6 +1454,8 @@ class Value(ColumnBase):
                     self.values.append(item)
                 else:
                     self.values.append(Value(item, self.converter))
+        else:
+            self.values = None
 
     def __sql__(self, ctx):
         if self.multi:
@@ -1850,17 +1861,25 @@ class Case(ColumnBase):
 
 
 class ForUpdate(Node):
-    def __init__(self, expr, of=None, nowait=None):
+    def __init__(self, expr, of=None, nowait=None, skip_locked=None):
         expr = 'FOR UPDATE' if expr is True else expr
         if expr.lower().endswith('nowait'):
             expr = expr[:-7]  # Strip off the "nowait" bit.
             nowait = True
+        elif expr.lower().endswith('skip locked'):
+            expr = expr[:-12]
+            skip_locked = True
+
+        if nowait and skip_locked:
+            raise ValueError('Only one of nowait and skip_locked may be used '
+                             'in a FOR UPDATE clause.')
 
         self._expr = expr
         if of is not None and not isinstance(of, (list, set, tuple)):
             of = (of,)
         self._of = of
         self._nowait = nowait
+        self._skip_locked = skip_locked
 
     def __sql__(self, ctx):
         ctx.literal(self._expr)
@@ -1868,6 +1887,8 @@ class ForUpdate(Node):
             ctx.literal(' OF ').sql(CommaNodeList(self._of))
         if self._nowait:
             ctx.literal(' NOWAIT')
+        elif self._skip_locked:
+            ctx.literal(' SKIP LOCKED')
         return ctx
 
 
@@ -1876,22 +1897,25 @@ class NodeList(ColumnBase):
         self.nodes = nodes
         self.glue = glue
         self.parens = parens
-        if parens and len(self.nodes) == 1 and \
-           isinstance(self.nodes[0], Expression) and \
-           not self.nodes[0].flat:
-            # Hack to avoid double-parentheses.
-            self.nodes = (self.nodes[0].clone(),)
-            self.nodes[0].flat = True
 
     def __sql__(self, ctx):
         n_nodes = len(self.nodes)
         if n_nodes == 0:
             return ctx.literal('()') if self.parens else ctx
+        elif self.parens and n_nodes == 1 and \
+           isinstance(self.nodes[0], Expression) and \
+           not self.nodes[0].flat:
+            # Hack to avoid double-parentheses.
+            nodes = (self.nodes[0].clone(),)
+            nodes[0].flat = True
+        else:
+            nodes = self.nodes
+
         with ctx(parentheses=self.parens):
             for i in range(n_nodes - 1):
-                ctx.sql(self.nodes[i])
+                ctx.sql(nodes[i])
                 ctx.literal(self.glue)
-            ctx.sql(self.nodes[n_nodes - 1])
+            ctx.sql(nodes[n_nodes - 1])
         return ctx
 
 
@@ -2400,7 +2424,7 @@ class CompoundSelectQuery(SelectBase):
 class Select(SelectBase):
     def __init__(self, from_list=None, columns=None, group_by=None,
                  having=None, distinct=None, windows=None, for_update=None,
-                 for_update_of=None, nowait=None, lateral=None, **kwargs):
+                 lateral=None, **kwargs):
         super(Select, self).__init__(**kwargs)
         self._from_list = (list(from_list) if isinstance(from_list, tuple)
                            else from_list) or []
@@ -2408,9 +2432,7 @@ class Select(SelectBase):
         self._group_by = group_by
         self._having = having
         self._windows = None
-        self._for_update = for_update  # XXX: consider reorganizing.
-        self._for_update_of = for_update_of
-        self._for_update_nowait = nowait
+        self._for_update = for_update
         self._lateral = lateral
 
         self._distinct = self._simple_distinct = None
@@ -2453,6 +2475,8 @@ class Select(SelectBase):
         if not self._from_list:
             raise ValueError('No sources to join on.')
         item = self._from_list.pop()
+        if join_type == JOIN.LATERAL or join_type == JOIN.LEFT_LATERAL:
+            on = True
         self._from_list.append(Join(item, dest, join_type, on))
 
     def left_outer_join(self, dest, on=None):
@@ -2497,12 +2521,15 @@ class Select(SelectBase):
         self._windows = windows if windows else None
 
     @Node.copy
-    def for_update(self, for_update=True, of=None, nowait=None):
-        if not for_update and (of is not None or nowait):
+    def for_update(self, for_update=True, of=None, nowait=None,
+                   skip_locked=None):
+        if not for_update and (of is not None or nowait or skip_locked):
             for_update = True
-        self._for_update = for_update
-        self._for_update_of = of
-        self._for_update_nowait = nowait
+
+        if not for_update:
+            self._for_update = None
+        else:
+            self._for_update = ForUpdate(for_update, of, nowait, skip_locked)
 
     @Node.copy
     def lateral(self, lateral=True):
@@ -2569,13 +2596,12 @@ class Select(SelectBase):
             # Apply ORDER BY, LIMIT, OFFSET.
             self._apply_ordering(ctx)
 
-            if self._for_update:
+            if self._for_update is not None:
                 if not ctx.state.for_update:
                     raise ValueError('FOR UPDATE specified but not supported '
                                      'by database.')
                 ctx.literal(' ')
-                ctx.sql(ForUpdate(self._for_update, self._for_update_of,
-                                  self._for_update_nowait))
+                ctx.sql(self._for_update)
 
         # If the subquery is inside a function -or- we are evaluating a
         # subquery on either side of an expression w/o an explicit alias, do
@@ -3313,7 +3339,8 @@ class Database(_callable_context_manager):
         return self._state.conn.cursor()
 
     def execute_sql(self, sql, params=None):
-        logger.debug((sql, params))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug((sql, params))
         with __exception_wrapper__:
             cursor = self.cursor()
             cursor.execute(sql, params or ())
@@ -4747,6 +4774,9 @@ class CursorWrapper(object):
         n = n or float('Inf')
         if n < 0:
             raise ValueError('Negative values are not supported.')
+        if self.populated or n <= self.count:
+            # We've already filled the requested rows.
+            return
 
         iterator = ResultIterator(self)
         iterator.index = self.count
@@ -4756,15 +4786,32 @@ class CursorWrapper(object):
             except StopIteration:
                 break
 
+    def dedupe_columns(self, columns, valid_identifiers=True):
+        # Try to clean-up messy column descriptions when people do not
+        # provide an alias. The idea is that we take something like:
+        # SUM("t1"."price") -> "price") -> price. Similarly, duplicated column
+        # names will get an integer suffix, e.g. val, val_2, val_3.
+        identifiers = []
+        duplicates = {}
+        for column in columns:
+            if valid_identifiers:
+                column = make_identifier(column)
+
+            if column in duplicates:
+                duplicates[column] += 1
+                column = '%s_%s' % (column, duplicates[column])
+            else:
+                duplicates[column] = 1
+            identifiers.append(column)
+        return identifiers
+
 
 class DictCursorWrapper(CursorWrapper):
-    def _initialize_columns(self):
-        description = self.cursor.description
-        self.columns = [t[0][t[0].rfind('.') + 1:].strip('()"`')
-                        for t in description]
-        self.ncols = len(description)
-
-    initialize = _initialize_columns
+    def initialize(self):
+        self.columns = self.dedupe_columns(
+            [col_spec[0] for col_spec in self.cursor.description],
+            valid_identifiers=False)
+        self.ncols = len(self.columns)
 
     def _row_to_dict(self, row):
         result = {}
@@ -4774,12 +4821,11 @@ class DictCursorWrapper(CursorWrapper):
 
     process_row = _row_to_dict
 
-
 class NamedTupleCursorWrapper(CursorWrapper):
     def initialize(self):
-        description = self.cursor.description
-        self.tuple_class = collections.namedtuple('Row', [
-            t[0][t[0].rfind('.') + 1:].strip('()"`') for t in description])
+        identifiers = self.dedupe_columns(
+            [col_spec[0] for col_spec in self.cursor.description])
+        self.tuple_class = collections.namedtuple('Row', identifiers)
 
     def process_row(self, row):
         return self.tuple_class(*row)
@@ -4789,6 +4835,12 @@ class ObjectCursorWrapper(DictCursorWrapper):
     def __init__(self, cursor, constructor):
         super(ObjectCursorWrapper, self).__init__(cursor)
         self.constructor = constructor
+
+    def initialize(self):
+        self.columns = self.dedupe_columns(
+            [col_spec[0] for col_spec in self.cursor.description],
+            valid_identifiers=True)
+        self.ncols = len(self.columns)
 
     def process_row(self, row):
         row_dict = self._row_to_dict(row)
@@ -4826,7 +4878,10 @@ class FieldAccessor(object):
 
     def __get__(self, instance, instance_type=None):
         if instance is not None:
-            return instance.__data__.get(self.name)
+            try:
+                return instance.__data__[self.name]
+            except KeyError:
+                return
         return self.field
 
     def __set__(self, instance, value):
@@ -6782,9 +6837,10 @@ class Model(with_metaclass(ModelBase, Node)):
     def __init__(self, *args, **kwargs):
         if kwargs.pop('__no_default__', None):
             self.__data__ = {}
+            self._dirty = set()
         else:
             self.__data__ = self._meta.get_default_dict()
-        self._dirty = set(self.__data__)
+            self._dirty = set(self.__data__)
         self.__rel__ = {}
 
         for k in kwargs:
@@ -7938,7 +7994,7 @@ class BaseModelCursorWrapper(DictCursorWrapper):
         self.model = model
         self.select = columns or []
 
-    def _initialize_columns(self):
+    def initialize(self):
         combined = self.model._meta.combined
         table = self.model._meta.table
         description = self.cursor.description
@@ -8011,34 +8067,36 @@ class BaseModelCursorWrapper(DictCursorWrapper):
                 if isinstance(node, Column) and node.source == table:
                     fields[idx] = combined[column]
 
-    initialize = _initialize_columns
-
     def process_row(self, row):
         raise NotImplementedError
 
 
 class ModelDictCursorWrapper(BaseModelCursorWrapper):
+    def initialize(self):
+        super(ModelDictCursorWrapper, self).initialize()
+        self.unique_columns = self.dedupe_columns(
+            self.columns,
+            valid_identifiers=False)
+
     def process_row(self, row):
         result = {}
-        columns, converters = self.columns, self.converters
-        fields = self.fields
+        columns, converters = self.unique_columns, self.converters
 
-        for i in range(self.ncols):
+        for i, value in enumerate(row):
             attr = columns[i]
-            if attr in result: continue  # Don't overwrite if we have dupes.
             if converters[i] is not None:
-                result[attr] = converters[i](row[i])
+                result[attr] = converters[i](value)
             else:
-                result[attr] = row[i]
+                result[attr] = value
 
         return result
 
 
-class ModelTupleCursorWrapper(ModelDictCursorWrapper):
+class ModelTupleCursorWrapper(BaseModelCursorWrapper):
     constructor = tuple
 
     def process_row(self, row):
-        columns, converters = self.columns, self.converters
+        converters = self.converters
         return self.constructor([
             (converters[i](row[i]) if converters[i] is not None else row[i])
             for i in range(self.ncols)])
@@ -8046,12 +8104,10 @@ class ModelTupleCursorWrapper(ModelDictCursorWrapper):
 
 class ModelNamedTupleCursorWrapper(ModelTupleCursorWrapper):
     def initialize(self):
-        self._initialize_columns()
-        attributes = []
-        for i in range(self.ncols):
-            attributes.append(self.columns[i])
-        self.tuple_class = collections.namedtuple('Row', attributes)
-        self.constructor = lambda row: self.tuple_class(*row)
+        super(ModelNamedTupleCursorWrapper, self).initialize()
+        identifiers = self.dedupe_columns(self.columns)
+        self.impl = collections.namedtuple('Row', identifiers)
+        self.constructor = lambda row: self.impl(*row)
 
 
 class ModelObjectCursorWrapper(ModelDictCursorWrapper):
@@ -8060,8 +8116,21 @@ class ModelObjectCursorWrapper(ModelDictCursorWrapper):
         self.is_model = is_model(constructor)
         super(ModelObjectCursorWrapper, self).__init__(cursor, model, select)
 
+    def initialize(self):
+        super(ModelObjectCursorWrapper, self).initialize()
+        self.identifiers = self.dedupe_columns(self.columns)
+
     def process_row(self, row):
-        data = super(ModelObjectCursorWrapper, self).process_row(row)
+        data = {}
+        columns, converters = self.identifiers, self.converters
+
+        for i, value in enumerate(row):
+            attr = columns[i]
+            if converters[i] is not None:
+                data[attr] = converters[i](value)
+            else:
+                data[attr] = value
+
         if self.is_model:
             # Clear out any dirty fields before returning to the user.
             obj = self.constructor(__no_default__=1, **data)
@@ -8078,10 +8147,11 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
         self.joins = joins
 
     def initialize(self):
-        self._initialize_columns()
+        super(ModelCursorWrapper, self).initialize()
         selected_src = set([field.model for field in self.fields
                             if field is not None])
-        select, columns = self.select, self.columns
+        select = self.select
+        columns = [make_identifier(c) for c in self.columns]
 
         self.key_to_constructor = {self.model: (self.model, True)}
         self.src_is_dest = {}
@@ -8105,9 +8175,15 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                     self.key_to_constructor[key] = (constructor,
                                                     is_model(constructor))
 
-                    # (src, attr, dest, is_dict, join_type).
-                    self.src_to_dest.append((curr, attr, key, is_dict,
-                                             join_type))
+                    # (src, attr, dest, is_dict, join_type, is outer?).
+                    self.src_to_dest.append((
+                        curr,
+                        attr,
+                        key,
+                        is_dict,
+                        join_type,
+                        join_type.endswith('OUTER')))
+
                     dests.add(key)
                     accum.append(key)
 
@@ -8120,7 +8196,7 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                     self.key_to_constructor[src] = (src.model, True)
 
         # Indicate which sources are also dests.
-        for src, _, dest, _, _ in self.src_to_dest:
+        for src, _, dest, _, _, _ in self.src_to_dest:
             self.src_is_dest[src] = src in dests and (dest in selected_src
                                                       or src in selected_src)
 
@@ -8147,20 +8223,46 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
 
             self.column_keys.append(key)
 
+        # Pre-compute flat list of key/col/converter for each column index.
+        self._row_spec = tuple(
+            (self.column_keys[i], columns[i], self.converters[i])
+            for i in range(self.ncols))
+
+        # Flatten list of key / constructor / is model? flag.
+        self._constructor_list = [
+            (key, construct, _is_model)
+            for key, (construct, _is_model) in self.key_to_constructor.items()]
+
+        # Pre-compute join-graph reachability.
+        self._dest_reachable = {}
+        for (src, attr, dest, is_dict, join_type, _) in self.src_to_dest:
+            if dest not in self.joins:
+                continue
+            reachable = set()
+            q = collections.deque([dest])
+            while q:
+                curr = q.popleft()
+                if curr in self.joins:
+                    for _key, _, _, _ in self.joins[curr]:
+                        reachable.add(_key)
+                        q.append(_key)
+
+            self._dest_reachable[dest] = frozenset(reachable)
+
     def process_row(self, row):
         objects = {}
-        object_list = []
-        for key, (constructor, _is_model) in self.key_to_constructor.items():
+        model_list = []
+        for key, constructor, _is_model in self._constructor_list:
             if _is_model:
                 objects[key] = constructor(__no_default__=True)
+                model_list.append(objects[key])
             else:
                 objects[key] = constructor()
-            object_list.append(objects[key])
 
         default_instance = objects[self.model]
 
         set_keys = set()
-        for idx, key in enumerate(self.column_keys):
+        for idx, (key, column, converter) in enumerate(self._row_spec):
             # Get the instance corresponding to the selected column/value,
             # falling back to the "root" model instance.
             instance = objects.get(key, default_instance)
@@ -8168,8 +8270,8 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
             value = row[idx]
             if value is not None:
                 set_keys.add(key)
-            if self.converters[idx]:
-                value = self.converters[idx](value)
+            if converter is not None:
+                value = converter(value)
 
             if isinstance(instance, dict):
                 instance[column] = value
@@ -8177,23 +8279,28 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                 setattr(instance, column, value)
 
         # Need to do some analysis on the joins before this.
-        for (src, attr, dest, is_dict, join_type) in self.src_to_dest:
-            instance = objects[src]
-            try:
-                joined_instance = objects[dest]
-            except KeyError:
+        for (src, attr, dest, is_dict, _, is_outer) in self.src_to_dest:
+            instance = objects.get(src)
+            joined_instance = objects.get(dest)
+            if joined_instance is None and dest not in objects:
                 continue
+
+            # Determine if anything further along in the graph is set.
+            assign = False
+            if dest not in set_keys and dest in self._dest_reachable:
+                assign = bool(self._dest_reachable[dest] & set_keys)
 
             # If no fields were set on the destination instance then do not
             # assign an "empty" instance.
-            if instance is None or dest is None or \
-               (dest not in set_keys and not self.src_is_dest.get(dest)):
-                continue
+            if dest not in set_keys and not assign:
+                if is_outer:
+                    joined_instance = None
+                else:
+                    continue
 
             # If no fields were set on either the source or the destination,
             # then we have nothing to do here.
-            if instance not in set_keys and dest not in set_keys \
-               and join_type.endswith('OUTER JOIN'):
+            if src not in set_keys and dest not in set_keys and is_outer:
                 continue
 
             if is_dict:
@@ -8202,9 +8309,8 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                 setattr(instance, attr, joined_instance)
 
         # When instantiating models from a cursor, we clear the dirty fields.
-        for instance in object_list:
-            if isinstance(instance, Model):
-                instance._dirty.clear()
+        for instance in model_list:
+            instance._dirty.clear()
 
         return objects[self.model]
 

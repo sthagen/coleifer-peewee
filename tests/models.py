@@ -818,7 +818,7 @@ class TestModelAPIs(ModelTestCase):
             # It did this since we are selecting from Venue/City and Venue is
             # an intermediary model. It is more correct for Event.venue to be
             # None in this case. This is now patched / fixed.
-            r = [(e.name, e.venue and e.venue.city.name or None)
+            r = [(e.name, e.venue is not None and e.venue.city.name or None)
                  for e in query]
             self.assertEqual(r, [
                 ('House Party', 'Topeka'),
@@ -1287,11 +1287,13 @@ class TestModelAPIs(ModelTestCase):
 
         with self.assertQueryCount(1):
             union_flat = (q1 | q2).objects()
-            results = [(t.id, t.content, t.username) for t in union_flat]
+            results = list(results)
+            results = [(t.id, t.content, t.username, t.id_2)
+                       for t in union_flat]
             self.assertEqual(sorted(results), [
-                (1, 'u1-t1', 'u1'),
-                (2, 'u1-t2', 'u1'),
-                (3, 'u2-t1', 'u2')])
+                (1, 'u1-t1', 'u1', 1),
+                (2, 'u1-t2', 'u1', 1),
+                (3, 'u2-t1', 'u2', 2)])
 
     @requires_models(User, Tweet)
     def test_compound_select_as_subquery(self):

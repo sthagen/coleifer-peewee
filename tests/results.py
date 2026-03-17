@@ -136,11 +136,135 @@ class TestCursorWrapper(ModelTestCase):
             assertCache(cursor, 10)
 
 
-class TestModelObjectCursorWrapper(ModelTestCase):
+class TestRowTypes(ModelTestCase):
     database = get_in_memory_db()
     requires = [User, Tweet]
 
+    def make_query(self, *exprs):
+        count = 0
+        accum = []
+        for expr in exprs:
+            if isinstance(expr, str):
+                accum.append(Value('v%d' % count).alias(expr))
+                count += 1
+            else:
+                accum.append(expr)
+        return User.select(*accum).order_by(User.username)
+
+    def test_namedtuples(self):
+        User.create(username='u1')
+
+        query = self.make_query(User.username).namedtuples()
+        self.assertEqual([u.username for u in query], ['u1'])
+
+        row = query[0]
+        self.assertEqual(repr(row), 'Row(username=\'u1\')')
+
+        query = (self
+                 .make_query(User.username, 'username', 'username')
+                 .namedtuples())
+        row, = list(query)
+        self.assertEqual(row, ('u1', 'v0', 'v1'))
+        self.assertEqual(row.username, 'u1')
+        self.assertEqual(row.username_2, 'v0')
+        self.assertEqual(row.username_3, 'v1')
+
+        query = (self
+                 .make_query('username', User.username)
+                 .namedtuples())
+        row, = list(query)
+        self.assertEqual(row, ('v0', 'u1'))
+        self.assertEqual(row.username, 'v0')
+        self.assertEqual(row.username_2, 'u1')
+
+        query = (self
+                 .make_query('"foo"', '"t1"."foo"()', 'foo ')
+                 .namedtuples())
+        row, = list(query)
+        self.assertEqual(row, ('v0', 'v1', 'v2'))
+        self.assertEqual(row.foo, 'v0')
+        self.assertEqual(row.foo_2, 'v1')
+        self.assertEqual(row.foo_3, 'v2')
+
+    def test_dicts(self):
+        User.create(username='u1')
+
+        query = self.make_query(User.username).dicts()
+        self.assertEqual(list(query), [{'username': 'u1'}])
+
+        query = (self
+                 .make_query(User.username, 'username', 'username')
+                 .dicts())
+        row, = list(query)
+        self.assertEqual(row, {
+            'username': 'u1',
+            'username_2': 'v0',
+            'username_3': 'v1'})
+
+        query = (self
+                 .make_query('username', User.username)
+                 .dicts())
+        row, = list(query)
+        self.assertEqual(row, {
+            'username': 'v0',
+            'username_2': 'u1'})
+
+        query = (self
+                 .make_query('"foo"', '"t1"."foo"()', 'foo ')
+                 .dicts())
+        row, = list(query)
+        self.assertEqual(row, {
+            '"foo"': 'v0',
+            '"t1"."foo"()': 'v1',
+            'foo ': 'v2'})
+
+    def test_dicts_flat(self):
+        u = User.create(username='u1')
+        for i in range(3):
+            Tweet.create(user=u, content='t%d' % (i + 1))
+
+        query = (Tweet
+                 .select(Tweet, User.username)
+                 .join(User)
+                 .order_by(Tweet.id)
+                 .dicts())
+        with self.assertQueryCount(1):
+            results = [(r['id'], r['content'], r['username']) for r in query]
+            self.assertEqual(results, [
+                (1, 't1', 'u1'),
+                (2, 't2', 'u1'),
+                (3, 't3', 'u1')])
+
     def test_model_objects(self):
+        User.create(username='u1')
+
+        query = self.make_query(User.username).objects()
+        self.assertEqual([u.username for u in query], ['u1'])
+
+        query = (self
+                 .make_query(User.username, 'username', 'username')
+                 .objects())
+        row, = list(query)
+        self.assertEqual(row.username, 'u1')
+        self.assertEqual(row.username_2, 'v0')
+        self.assertEqual(row.username_3, 'v1')
+
+        query = (self
+                 .make_query('username', User.username)
+                 .objects())
+        row, = list(query)
+        self.assertEqual(row.username, 'v0')
+        self.assertEqual(row.username_2, 'u1')
+
+        query = (self
+                 .make_query('"foo"', '"t1"."foo"()', 'foo ')
+                 .objects())
+        row, = list(query)
+        self.assertEqual(row.foo, 'v0')
+        self.assertEqual(row.foo_2, 'v1')
+        self.assertEqual(row.foo_3, 'v2')
+
+    def test_model_objects_flat(self):
         huey = User.create(username='huey')
         mickey = User.create(username='mickey')
         for user, tweet in ((huey, 'meow'), (huey, 'purr'), (mickey, 'woof')):
@@ -157,22 +281,24 @@ class TestModelObjectCursorWrapper(ModelTestCase):
                 ('huey', 'purr'),
                 ('mickey', 'woof')])
 
-    def test_dict_flattening(self):
-        u = User.create(username='u1')
-        for i in range(3):
-            Tweet.create(user=u, content='t%d' % (i + 1))
+    def test_models(self):
+        huey = User.create(username='huey')
+        mickey = User.create(username='mickey')
+        tids = []
+        for user, tweet in ((huey, 'meow'), (huey, 'purr'), (mickey, 'woof')):
+            tids.append(Tweet.create(user=user, content=tweet).id)
 
         query = (Tweet
                  .select(Tweet, User)
                  .join(User)
-                 .order_by(Tweet.id)
-                 .dicts())
+                 .order_by(Tweet.id))
         with self.assertQueryCount(1):
-            results = [(r['id'], r['content'], r['username']) for r in query]
-            self.assertEqual(results, [
-                (1, 't1', 'u1'),
-                (2, 't2', 'u1'),
-                (3, 't3', 'u1')])
+            accum = [(t.user.id, t.user.username, t.id, t.content)
+                     for t in query]
+            self.assertEqual(accum, [
+                (huey.id, 'huey', tids[0], 'meow'),
+                (huey.id, 'huey', tids[1], 'purr'),
+                (mickey.id, 'mickey', tids[2], 'woof')])
 
 
 class Reg(TestModel):
