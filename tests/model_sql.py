@@ -7,7 +7,9 @@ from peewee import ModelIndex
 
 from .base import get_in_memory_db
 from .base import requires_pglike
+from .base import skip_if
 from .base import BaseTestCase
+from .base import IS_CRDB
 from .base import ModelDatabaseTestCase
 from .base import TestModel
 from .base import __sql__
@@ -191,6 +193,17 @@ class TestModelSQL(ModelDatabaseTestCase):
         self.assertEqual(sql, expected[0])
         self.assertTrue(params in (['foo', 'bar'], ['bar', 'foo']))
 
+    def test_model_select_from(self):
+        inner = (User
+                 .select(User.id, User.username)
+                 .where(User.username == 'x'))
+        query = inner.select_from(inner.c.username)
+        self.assertSQL(query, (
+            'SELECT "t1"."username" FROM ('
+            'SELECT "t2"."id", "t2"."username" '
+            'FROM "users" AS "t2" '
+            'WHERE ("t2"."username" = ?)) AS "t1"'), ['x'])
+
     def test_join_ctx(self):
         query = Tweet.select(Tweet.id).join(Favorite).switch(Tweet).join(User)
         self.assertSQL(query, (
@@ -236,10 +249,31 @@ class TestModelSQL(ModelDatabaseTestCase):
             class Meta:
                 schema = 'notes'
 
-        query = Note.alias().select()
+        query = Note.select()
         self.assertSQL(query, (
             'SELECT "t1"."id", "t1"."content" '
             'FROM "notes"."note" AS "t1"'), [])
+
+        query = Note.alias('na').select()
+        self.assertSQL(query, (
+            'SELECT "na"."id", "na"."content" '
+            'FROM "notes"."note" AS "na"'), [])
+
+    def test_model_alias_join_with_schema(self):
+        class Note(TestModel):
+            content = TextField()
+            class Meta:
+                schema = 'notes'
+
+        NA = Note.alias('na')
+        query = (Note
+                 .select(Note.content, NA.content)
+                 .join(NA, on=(NA.id == Note.id)))
+        self.assertSQL(query, (
+            'SELECT "t1"."content", "na"."content" '
+            'FROM "notes"."note" AS "t1" '
+            'INNER JOIN "notes"."note" AS "na" '
+            'ON ("na"."id" = "t1"."id")'), [])
 
     def test_filter_simple(self):
         query = User.filter(username='huey')
@@ -292,6 +326,19 @@ class TestModelSQL(ModelDatabaseTestCase):
             'SELECT "t1"."content" FROM "tweet" AS "t1" '
             'INNER JOIN "users" AS "ua" ON ("t1"."user_id" = "ua"."id") '
             'WHERE ("ua"."username" = ?)'), ['huey'])
+
+    def test_filter_with_or_across_joins(self):
+        query = (Tweet
+                 .select(Tweet.content)
+                 .filter(
+                     DQ(user__username='huey') |
+                     DQ(content__like='%hello%')))
+        self.assertSQL(query, (
+            'SELECT "t1"."content" FROM "tweet" AS "t1" '
+            'INNER JOIN "users" AS "t2" '
+            'ON ("t1"."user_id" = "t2"."id") '
+            'WHERE (("t2"."username" = ?) OR '
+            '("t1"."content" LIKE ?))'), ['huey', '%hello%'])
 
     def test_filter_join_combine_models(self):
         query = (Tweet
@@ -961,6 +1008,49 @@ class TestOnConflictSQL(ModelDatabaseTestCase):
             'DO UPDATE SET "extra" = EXCLUDED."extra" '
             'WHERE ("ukvp"."key" != ?) RETURNING "ukvp"."id"'),
             ['k1', 1, 2, 'k2', 2, 3, 1, 'kx'])
+
+    def test_preserve_and_update(self):
+        query = (UKVP
+                 .insert(key='k1', value=1, extra=10)
+                 .on_conflict(
+                     conflict_target=(UKVP.key,),
+                     preserve=(UKVP.value,),
+                     update={UKVP.extra: UKVP.extra + 1}))
+        self.assertSQL(query, (
+            'INSERT INTO "ukvp" ("key", "value", "extra") '
+            'VALUES (?, ?, ?) '
+            'ON CONFLICT ("key") DO UPDATE SET '
+            '"value" = EXCLUDED."value", '
+            '"extra" = ("ukvp"."extra" + ?) '
+            'RETURNING "ukvp"."id"'), ['k1', 1, 10, 1])
+
+    def test_preserve_with_where(self):
+        query = (UKVP
+                 .insert(key='k1', value=1, extra=10)
+                 .on_conflict(
+                     conflict_target=(UKVP.key,),
+                     preserve=(UKVP.value,),
+                     where=(UKVP.extra < 100)))
+        self.assertSQL(query, (
+            'INSERT INTO "ukvp" ("key", "value", "extra") '
+            'VALUES (?, ?, ?) '
+            'ON CONFLICT ("key") DO UPDATE SET '
+            '"value" = EXCLUDED."value" '
+            'WHERE ("ukvp"."extra" < ?) '
+            'RETURNING "ukvp"."id"'), ['k1', 1, 10, 100])
+
+    @skip_if(IS_CRDB, 'crdb lol')
+    def test_on_conflict_named_constraint(self):
+        query = (UKVP
+                 .insert(key='k1', value=1)
+                 .on_conflict(
+                     conflict_constraint='ukvp_key',
+                     update={UKVP.value: UKVP.value + 1}))
+        self.assertSQL(query, (
+            'INSERT INTO "ukvp" ("key", "value") VALUES (?, ?) '
+            'ON CONFLICT ON CONSTRAINT "ukvp_key" '
+            'DO UPDATE SET "value" = ("ukvp"."value" + ?) '
+            'RETURNING "ukvp"."id"'), ['k1', 1, 1])
 
 
 class TestStringsForFieldsa(ModelDatabaseTestCase):

@@ -417,6 +417,66 @@ class TestSelectQuery(BaseTestCase):
             'WHERE ("t2"."is_staff" = ?)) '
             'SELECT "c1"."username", "c2"."username" FROM "c1", "c2"'), [1, 1])
 
+    def test_cte_select_from_2(self):
+        cte = (User
+               .select(User.c.username)
+               .where(User.c.username != 'x')
+               .cte('filtered'))
+        query = cte.select_from(cte.c.username)
+        self.assertSQL(query, (
+            'WITH "filtered" AS ('
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'WHERE ("t1"."username" != ?)) '
+            'SELECT "filtered"."username" FROM "filtered"'), ['x'])
+
+    def test_cte_select_from_with_aggregate(self):
+        cte = (User
+               .select(User.c.username,
+                       fn.COUNT(Tweet.c.id).alias('tweet_ct'))
+               .join(Tweet, JOIN.LEFT_OUTER, (Tweet.c.user_id == User.c.id))
+               .group_by(User.c.username)
+               .cte('user_stats'))
+        query = (cte
+                 .select_from(cte.c.username, cte.c.tweet_ct)
+                 .where(cte.c.tweet_ct > 0))
+        self.assertSQL(query, (
+            'WITH "user_stats" AS ('
+            'SELECT "t1"."username", COUNT("t2"."id") AS "tweet_ct" '
+            'FROM "users" AS "t1" '
+            'LEFT OUTER JOIN "tweets" AS "t2" '
+            'ON ("t2"."user_id" = "t1"."id") '
+            'GROUP BY "t1"."username") '
+            'SELECT "user_stats"."username", "user_stats"."tweet_ct" '
+            'FROM "user_stats" '
+            'WHERE ("user_stats"."tweet_ct" > ?)'), [0])
+
+    def test_two_ctes_with_join(self):
+        cte_a = (User
+                 .select(User.c.id, User.c.username)
+                 .cte('active_users'))
+        cte_b = (Tweet
+                 .select(Tweet.c.user_id, fn.COUNT(Tweet.c.id).alias('ct'))
+                 .group_by(Tweet.c.user_id)
+                 .cte('tweet_counts'))
+        query = (cte_a
+                 .select_from(cte_a.c.username, cte_b.c.ct)
+                 .join(cte_b, on=(cte_a.c.id == cte_b.c.user_id))
+                 .with_cte(cte_a, cte_b)
+                 .order_by(cte_b.c.ct.desc()))
+        self.assertSQL(query, (
+            'WITH "active_users" AS ('
+            'SELECT "t1"."id", "t1"."username" '
+            'FROM "users" AS "t1"), '
+            '"tweet_counts" AS ('
+            'SELECT "t2"."user_id", COUNT("t2"."id") AS "ct" '
+            'FROM "tweets" AS "t2" '
+            'GROUP BY "t2"."user_id") '
+            'SELECT "active_users"."username", "tweet_counts"."ct" '
+            'FROM "active_users" '
+            'INNER JOIN "tweet_counts" '
+            'ON ("active_users"."id" = "tweet_counts"."user_id") '
+            'ORDER BY "tweet_counts"."ct" DESC'), [])
+
     def test_materialize_cte(self):
         cases = (
             (True, 'MATERIALIZED '),
@@ -626,6 +686,24 @@ class TestSelectQuery(BaseTestCase):
             ' INSERT INTO "archive" ("id", "name", "price")'
             ' SELECT "t"."id", "t"."name", "t"."price" FROM "t"'), ['p1', 10])
 
+    def test_select_from_subquery(self):
+        subq = (User
+                .select(User.c.username,
+                        fn.LENGTH(User.c.username).alias('name_len'))
+                .alias('sub'))
+        query = (User
+                 .select(subq.c.username, subq.c.name_len)
+                 .from_(subq)
+                 .where(subq.c.name_len > 3)
+                 .order_by(subq.c.name_len))
+        self.assertSQL(query, (
+            'SELECT "sub"."username", "sub"."name_len" '
+            'FROM ('
+            'SELECT "t1"."username", LENGTH("t1"."username") AS "name_len" '
+            'FROM "users" AS "t1") AS "sub" '
+            'WHERE ("sub"."name_len" > ?) '
+            'ORDER BY "sub"."name_len"'), [3])
+
     def test_complex_select(self):
         Order = Table('orders', columns=(
             'region',
@@ -830,6 +908,57 @@ class TestSelectQuery(BaseTestCase):
             'SELECT "t3"."col_b" AS "foo" FROM "b" AS "t3") AS "t1" '
             'GROUP BY "t1"."foo"'), [])
 
+    def test_union_with_order_and_limit(self):
+        q1 = User.select(User.c.username).where(User.c.id < 5)
+        q2 = User.select(User.c.username).where(User.c.id > 95)
+        combined = (q1 | q2).order_by(SQL('1')).limit(10)
+        self.assertSQL(combined, (
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'WHERE ("t1"."id" < ?) '
+            'UNION '
+            'SELECT "t2"."username" FROM "users" AS "t2" '
+            'WHERE ("t2"."id" > ?) '
+            'ORDER BY 1 LIMIT ?'), [5, 95, 10])
+
+    def test_intersect(self):
+        q1 = User.select(User.c.username).where(User.c.id < 10)
+        q2 = User.select(User.c.username).where(User.c.id > 5)
+        combined = q1 & q2
+        self.assertSQL(combined, (
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'WHERE ("t1"."id" < ?) '
+            'INTERSECT '
+            'SELECT "t2"."username" FROM "users" AS "t2" '
+            'WHERE ("t2"."id" > ?)'), [10, 5])
+
+    def test_except(self):
+        q1 = User.select(User.c.username)
+        q2 = User.select(User.c.username).where(User.c.id > 5)
+        combined = q1 - q2
+        self.assertSQL(combined, (
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'EXCEPT '
+            'SELECT "t2"."username" FROM "users" AS "t2" '
+            'WHERE ("t2"."id" > ?)'), [5])
+
+    def test_coalesce(self):
+        Sample = Table('sample', ('counter', 'value'))
+        query = (Sample
+                 .select(fn.COALESCE(Sample.value, 0).alias('val'))
+                 .where(Sample.counter == 1))
+        self.assertSQL(query, (
+            'SELECT COALESCE("t1"."value", ?) AS "val" '
+            'FROM "sample" AS "t1" '
+            'WHERE ("t1"."counter" = ?)'), [0, 1])
+
+    def test_nullif(self):
+        Sample = Table('sample', ('counter', 'value'))
+        query = (Sample
+                 .select(fn.NULLIF(Sample.value, 0).alias('val')))
+        self.assertSQL(query, (
+            'SELECT NULLIF("t1"."value", ?) AS "val" '
+            'FROM "sample" AS "t1"'), [0])
+
     def test_join_on_query(self):
         inner = User.select(User.c.id).alias('j1')
         query = (Tweet
@@ -847,6 +976,24 @@ class TestSelectQuery(BaseTestCase):
             'SELECT "t1"."id" FROM "person" AS "t1" '
             'INNER JOIN "note" AS "t2" '
             'ON Magic("t1"."id", "t2"."id") AS "magic"'), [])
+
+    def test_lateral_subquery_model(self):
+        inner = (Tweet
+                 .select(Tweet.c.content)
+                 .where(Tweet.c.user_id == User.c.id)
+                 .order_by(Tweet.c.timestamp.desc())
+                 .limit(1))
+        query = (User
+                 .select(User.c.username, inner.c.content)
+                 .join(inner, JOIN.LEFT_LATERAL, on=True))
+        self.assertSQL(query, (
+            'SELECT "t1"."username", "t2"."content" '
+            'FROM "users" AS "t1" '
+            'LEFT JOIN LATERAL ('
+            'SELECT "t3"."content" FROM "tweets" AS "t3" '
+            'WHERE ("t3"."user_id" = "t1"."id") '
+            'ORDER BY "t3"."timestamp" DESC LIMIT ?) AS "t2" ON ?'),
+            [1, True])
 
     def test_all_clauses(self):
         count = fn.COUNT(Tweet.c.id).alias('ct')
@@ -936,6 +1083,21 @@ class TestSelectQuery(BaseTestCase):
             'WHERE (("t1"."name", "t1"."id") IN ('
             'SELECT "pa"."name", "pa"."id" FROM "person" AS "pa" '
             'WHERE ("pa"."name" != ?)))'), ['huey'])
+
+    def test_tuple_in_subquery(self):
+        subq = (Tweet
+                .select(Tweet.c.user_id, Tweet.c.content)
+                .where(Tweet.c.content == 'special'))
+        query = (User
+                 .select(User.c.id, User.c.username)
+                 .where(Tuple(User.c.id, User.c.username).in_(subq)))
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."username" '
+            'FROM "users" AS "t1" '
+            'WHERE (("t1"."id", "t1"."username") IN ('
+            'SELECT "t2"."user_id", "t2"."content" '
+            'FROM "tweets" AS "t2" '
+            'WHERE ("t2"."content" = ?)))'), ['special'])
 
     def test_empty_in(self):
         query = User.select(User.c.id).where(User.c.username.in_([]))
@@ -1164,6 +1326,17 @@ class TestInsertQuery(BaseTestCase):
             'RETURNING "person"."id", "person"."name" AS "new_name"'),
             [datetime.date(2000, 1, 2), 'zaizee'])
 
+    def test_insert_returning_expression(self):
+        query = (Person
+                 .insert(name='huey')
+                 .returning(Person.id, Person.name,
+                            fn.LENGTH(Person.name).alias('ulen')))
+        self.assertSQL(query, (
+            'INSERT INTO "person" ("name") VALUES (?) '
+            'RETURNING "person"."id", '
+            '"person"."name", '
+            'LENGTH("person"."name") AS "ulen"'), ['huey'])
+
     def test_empty(self):
         class Empty(TestModel): pass
         query = Empty.insert()
@@ -1250,6 +1423,27 @@ class TestUpdateQuery(BaseTestCase):
             'SELECT "tmp"."id", "tmp"."username" '
             'FROM (VALUES (?, ?), (?, ?)) AS "tmp"("id", "username")) AS "t1" '
             'WHERE ("users"."id" = "t1"."id")'), [1, 'u1-x', 2, 'u2-x'])
+
+    def test_update_from_subquery(self):
+        subq = (Tweet
+                .select(Tweet.c.user_id,
+                        fn.COUNT(Tweet.c.id).alias('ct'))
+                .group_by(Tweet.c.user_id)
+                .alias('tweet_ct'))
+        query = (User
+                 .update({User.c.username: fn.CONCAT(
+                     User.c.username, ' (', subq.c.ct, ')')})
+                 .from_(subq)
+                 .where(User.c.id == subq.c.user_id))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "username" = CONCAT('
+            '"users"."username", ?, "tweet_ct"."ct", ?) '
+            'FROM ('
+            'SELECT "t1"."user_id", COUNT("t1"."id") AS "ct" '
+            'FROM "tweets" AS "t1" '
+            'GROUP BY "t1"."user_id") AS "tweet_ct" '
+            'WHERE ("users"."id" = "tweet_ct"."user_id")'),
+            [' (', ')'])
 
     def test_update_returning(self):
         query = (User
@@ -1512,9 +1706,9 @@ class TestWindowFunctions(BaseTestCase):
 
         self.assertSQL(query, (
             'SELECT "t1"."category", "t1"."value", AVG("t1"."value") '
-            'OVER w '
+            'OVER "w" '
             'FROM "register" AS "t1" '
-            'WINDOW w AS (PARTITION BY "t1"."category")'), [])
+            'WINDOW "w" AS (PARTITION BY "t1"."category")'), [])
 
         window = Window(
             partition_by=[Register.category],
@@ -1525,9 +1719,9 @@ class TestWindowFunctions(BaseTestCase):
                      fn.RANK().over(window))
                  .window(window))
         self.assertSQL(query, (
-            'SELECT "t1"."value", RANK() OVER w '
+            'SELECT "t1"."value", RANK() OVER "w" '
             'FROM "register" AS "t1" '
-            'WINDOW w AS ('
+            'WINDOW "w" AS ('
             'PARTITION BY "t1"."category" '
             'ORDER BY "t1"."value" DESC)'), [])
 
@@ -1541,10 +1735,11 @@ class TestWindowFunctions(BaseTestCase):
                      fn.RANK().over(w2))
                  .window(w1, w2))
         self.assertSQL(query, (
-            'SELECT "t1"."value", AVG("t1"."value") OVER w1, RANK() OVER w2 '
+            'SELECT "t1"."value", AVG("t1"."value") OVER "w1", '
+            'RANK() OVER "w2" '
             'FROM "register" AS "t1" '
-            'WINDOW w1 AS (PARTITION BY "t1"."category"), '
-            'w2 AS (ORDER BY "t1"."value")'), [])
+            'WINDOW "w1" AS (PARTITION BY "t1"."category"), '
+            '"w2" AS (ORDER BY "t1"."value")'), [])
 
     def test_alias_window(self):
         w = Window(order_by=Register.value).alias('wx')
@@ -1554,9 +1749,9 @@ class TestWindowFunctions(BaseTestCase):
         # correctly in the final query.
         w.alias('wz')
         self.assertSQL(query, (
-            'SELECT "t1"."value", RANK() OVER wz '
+            'SELECT "t1"."value", RANK() OVER "wz" '
             'FROM "register" AS "t1" '
-            'WINDOW wz AS (ORDER BY "t1"."value")'), [])
+            'WINDOW "wz" AS (ORDER BY "t1"."value")'), [])
 
     def test_reuse_window(self):
         EventLog = Table('evt', ('id', 'timestamp', 'key'))
@@ -1571,11 +1766,11 @@ class TestWindowFunctions(BaseTestCase):
                  .window(window))
         self.assertSQL(query, (
             'SELECT "t1"."timestamp", "t1"."key", '
-            'NTILE(?) OVER w AS "quartile", '
-            'NTILE(?) OVER w AS "quintile", '
-            'NTILE(?) OVER w AS "percentile" '
+            'NTILE(?) OVER "w" AS "quartile", '
+            'NTILE(?) OVER "w" AS "quintile", '
+            'NTILE(?) OVER "w" AS "percentile" '
             'FROM "evt" AS "t1" '
-            'WINDOW w AS ('
+            'WINDOW "w" AS ('
             'PARTITION BY "t1"."key" ORDER BY "t1"."timestamp") '
             'ORDER BY "t1"."timestamp"'), [4, 5, 100])
 
@@ -1602,8 +1797,8 @@ class TestWindowFunctions(BaseTestCase):
                  .order_by(fn.FIRST_VALUE(Register.id).over(w)))
         self.assertSQL(query, (
             'SELECT "t1"."id", "t1"."value" FROM "register" AS "t1" '
-            'WINDOW w AS (PARTITION BY "t1"."value" ORDER BY "t1"."id") '
-            'ORDER BY FIRST_VALUE("t1"."id") OVER w'), [])
+            'WINDOW "w" AS (PARTITION BY "t1"."value" ORDER BY "t1"."id") '
+            'ORDER BY FIRST_VALUE("t1"."id") OVER "w"'), [])
 
         fv = fn.FIRST_VALUE(Register.id).over(
             partition_by=[Register.value],
@@ -1620,9 +1815,9 @@ class TestWindowFunctions(BaseTestCase):
         w2 = Window(extends=w1, order_by=[Tbl.c], alias='win2')
         query = Tbl.select(fn.GROUP_CONCAT(Tbl.c).over(w2)).window(w1, w2)
         self.assertSQL(query, (
-            'SELECT GROUP_CONCAT("t1"."c") OVER win2 FROM "tbl" AS "t1" '
-            'WINDOW win1 AS (PARTITION BY "t1"."b"), '
-            'win2 AS (win1 ORDER BY "t1"."c")'), [])
+            'SELECT GROUP_CONCAT("t1"."c") OVER "win2" FROM "tbl" AS "t1" '
+            'WINDOW "win1" AS (PARTITION BY "t1"."b"), '
+            '"win2" AS ("win1" ORDER BY "t1"."c")'), [])
 
         w1 = Window(partition_by=[Tbl.b], alias='w1')
         w2 = Window(extends=w1).alias('w2')
@@ -1632,9 +1827,10 @@ class TestWindowFunctions(BaseTestCase):
                  .select(fn.GROUP_CONCAT(Tbl.c).over(w4))
                  .window(w1, w2, w3, w4))
         self.assertSQL(query, (
-            'SELECT GROUP_CONCAT("t1"."c") OVER w4 FROM "tbl" AS "t1" '
-            'WINDOW w1 AS (PARTITION BY "t1"."b"), w2 AS (w1), w3 AS (w2), '
-            'w4 AS (w3 ORDER BY "t1"."c")'), [])
+            'SELECT GROUP_CONCAT("t1"."c") OVER "w4" FROM "tbl" AS "t1" '
+            'WINDOW "w1" AS (PARTITION BY "t1"."b"), "w2" AS ("w1"), '
+            '"w3" AS ("w2"), '
+            '"w4" AS ("w3" ORDER BY "t1"."c")'), [])
 
     def test_window_ranged(self):
         Tbl = Table('tbl', ('a', 'b'))
@@ -1681,8 +1877,8 @@ class TestWindowFunctions(BaseTestCase):
         for method, arg, sql in fts:
             w = getattr(Window(order_by=[Tbl.b + 1]), method)()
             self.assertSQL(Tbl.select(fn.SUM(Tbl.c).over(w)).window(w), (
-                'SELECT SUM("t1"."c") OVER w FROM "tbl" AS "t1" '
-                'WINDOW w AS (ORDER BY ("t1"."b" + ?) '
+                'SELECT SUM("t1"."c") OVER "w" FROM "tbl" AS "t1" '
+                'WINDOW "w" AS (ORDER BY ("t1"."b" + ?) '
                 '%s UNBOUNDED PRECEDING)') % sql, [1])
 
             query = Tbl.select(fn.SUM(Tbl.c)
@@ -1723,10 +1919,10 @@ class TestWindowFunctions(BaseTestCase):
                          fn.DENSE_RANK().over(win))
                  .window(win))
         self.assertSQL(query, (
-            'SELECT SUM("t1"."c") FILTER (WHERE ("t1"."c" < ?)) OVER w, '
-            'RANK() OVER w, DENSE_RANK() OVER w '
+            'SELECT SUM("t1"."c") FILTER (WHERE ("t1"."c" < ?)) OVER "w", '
+            'RANK() OVER "w", DENSE_RANK() OVER "w" '
             'FROM "tbl" AS "t1" '
-            'WINDOW w AS (PARTITION BY COALESCE("t1"."a", ?) '
+            'WINDOW "w" AS (PARTITION BY COALESCE("t1"."a", ?) '
             'RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING '
             'EXCLUDE NO OTHERS)'), [5, ''])
 
@@ -1819,6 +2015,26 @@ class TestCaseFunction(BaseTestCase):
             'WHEN ("t1"."number" = ?) THEN ? '
             'ELSE ? END '
             'FROM "nn" AS "t1"'), [1, 'one', 2, 'two', '?'])
+
+    def test_multiple_case_expressions(self):
+        Sample = Table('sample', ('id', 'counter', 'value'))
+        case1 = Case(None, [
+            (Sample.counter < 5, 'low'),
+            (Sample.counter < 10, 'mid')],
+            'high').alias('tier')
+        case2 = Case(None, [
+            (Sample.value > 100, True)],
+            False).alias('is_large')
+        query = Sample.select(Sample.counter, case1, case2)
+        self.assertSQL(query, (
+            'SELECT "t1"."counter", '
+            'CASE WHEN ("t1"."counter" < ?) THEN ? '
+            'WHEN ("t1"."counter" < ?) THEN ? '
+            'ELSE ? END AS "tier", '
+            'CASE WHEN ("t1"."value" > ?) THEN ? '
+            'ELSE ? END AS "is_large" '
+            'FROM "sample" AS "t1"'),
+            [5, 'low', 10, 'mid', 'high', 100, True, False])
 
     def test_case_subquery(self):
         Name = Table('n', ('id', 'name',))
