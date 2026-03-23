@@ -70,6 +70,32 @@ class TestPydanticConversion(BasePydanticTestCase):
         self.assertEqual(set(Schema.model_fields), {
             'name', 'age', 'active', 'bio', 'score', 'status', 'created'})
 
+    def test_base_model(self):
+        class TestBase(BaseModel):
+            x: int = 123
+
+        Schema = to_pydantic(User, base_model=TestBase)
+        self.assertEqual(set(Schema.model_fields), {
+            'name', 'age', 'active', 'bio', 'score', 'status', 'created',
+            'x'})
+
+        obj = Schema(name='Huey', age=14, status='active')
+        ts = obj.created
+        self.assertEqual(obj.dict(), {
+            'name': 'Huey',
+            'age': 14,
+            'active': True,
+            'bio': None,
+            'score': 0.0,
+            'status': 'active',
+            'created': ts,
+            'x': 123})
+
+        huey = User(name='Huey', age=14, status='active', x=12)
+        validated = Schema.model_validate(huey)
+        self.assertEqual(validated.name, 'Huey')
+        self.assertEqual(validated.x, 12)
+
     def test_application(self):
         Schema = to_pydantic(User)
         obj = Schema(name='Huey', age=14, status='active')
