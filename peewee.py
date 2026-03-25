@@ -106,6 +106,7 @@ __all__ = [
     'DoesNotExist',
     'DoubleField',
     'DQ',
+    'Entity',
     'EXCLUDED',
     'Field',
     'FixedCharField',
@@ -1014,7 +1015,7 @@ class Table(_HashableSource, BaseTable):
     @__bind_database__
     def replace(self, insert=None, columns=None, **kwargs):
         return (self
-                .insert(insert=insert, columns=columns)
+                .insert(insert=insert, columns=columns, **kwargs)
                 .on_conflict('REPLACE'))
 
     @__bind_database__
@@ -3557,7 +3558,7 @@ class Database(_callable_context_manager):
         return _BoundModelsContext(models, self, bind_refs, bind_backrefs)
 
     def get_noop_select(self, ctx):
-        return ctx.sql(Select().columns(SQL('0')).where(SQL('0')))
+        return ctx.literal('SELECT 0 WHERE 0')
 
     @property
     def Model(self):
@@ -4330,7 +4331,7 @@ class PostgresqlDatabase(Database):
         return fn.to_timestamp(date_field)
 
     def get_noop_select(self, ctx):
-        return ctx.sql(Select().columns(SQL('0')).where(SQL('false')))
+        return ctx.literal('SELECT 0 WHERE false')
 
     def set_time_zone(self, timezone):
         self.execute_sql('set time zone \'%s\';' % timezone.replace("'", "''"))
@@ -4563,7 +4564,7 @@ class MySQLDatabase(Database):
         return fn.rand()
 
     def get_noop_select(self, ctx):
-        return ctx.literal('DO 0')
+        return ctx.literal('SELECT 0 WHERE 0=1')
 
 
 # TRANSACTION CONTROL.

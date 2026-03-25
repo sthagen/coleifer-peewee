@@ -1,3 +1,15 @@
+"""
+Prefetch / N+1 query optimization tests.
+
+All models in this module are local (not from base_models), because prefetch
+tests need specific relational graph shapes that differ from the shared models.
+
+Test case ordering:
+
+* Core prefetch (Person > Note > NoteItem/Like/Flag, plus Category, Package)
+* Multi-reference prefetch (X > Z, A > B > C > C1/C2)
+* Multiple FK prefetch with join type control (State/Transition)
+"""
 from peewee import *
 
 from .base import get_in_memory_db
@@ -5,6 +17,13 @@ from .base import requires_models
 from .base import ModelTestCase
 from .base import TestModel
 
+
+# ---------------------------------------------------------------------------
+# Module-local models for core prefetch tests.
+# NOTE: Person, Note, Category, etc. here are intentionally different from
+# base_models - they have different fields and FK structures tailored for
+# prefetch testing.
+# ---------------------------------------------------------------------------
 
 class Person(TestModel):
     name = TextField()
@@ -48,6 +67,10 @@ class PackageItem(TestModel):
     name = TextField()
     package = ForeignKeyField(Package, backref='items', field=Package.barcode)
 
+
+# ===========================================================================
+# Core prefetch tests
+# ===========================================================================
 
 class TestPrefetch(ModelTestCase):
     database = get_in_memory_db()
@@ -527,6 +550,9 @@ class TestPrefetch(ModelTestCase):
                         self.assertEqual(item.dirty_fields, [])
 
 
+# ===========================================================================
+# Multi-reference prefetch (complex FK graphs)
+# ===========================================================================
 
 class X(TestModel):
     name = TextField()
@@ -658,3 +684,64 @@ class TestPrefetchMultiRefs(ModelTestCase):
                 accum.append((a.name, a.x.name, azs, bs))
 
         self.assertEqual(data, accum)
+
+
+# ===========================================================================
+# Multiple FK prefetch with join type control (regression)
+# ===========================================================================
+
+class State(TestModel):
+    name = TextField()
+class Transition(TestModel):
+    src = ForeignKeyField(State, backref='sources')
+    dest = ForeignKeyField(State, backref='dests')
+
+class TestJoinTypePrefetchMultipleFKs(ModelTestCase):
+    requires = [State, Transition]
+
+    def test_join_prefetch_multiple_fks(self):
+        s1, s2a, s2b, s3 = [State.create(name=s)
+                            for s in ('s1', 's2a', 's2b', 's3')]
+        t1 = Transition.create(src=s1, dest=s2a)
+        t2 = Transition.create(src=s1, dest=s2b)
+        t3 = Transition.create(src=s2a, dest=s3)
+        t4 = Transition.create(src=s2b, dest=s3)
+
+        query = State.select().where(State.name != 's3').order_by(State.name)
+        transitions = (Transition
+                       .select(Transition, State)
+                       .join(State, on=Transition.dest)
+                       .order_by(Transition.id))
+        with self.assertQueryCount(2):
+            p = prefetch(query, transitions, prefetch_type=PREFETCH_TYPE.JOIN)
+            accum = []
+            for row in p:
+                accum.append((row.name, row.sources, row.dests,
+                              [d.dest.name for d in row.sources],
+                              [d.src.name for d in row.dests]))
+
+        self.assertEqual(accum, [
+            ('s1', [t1, t2], [], ['s2a', 's2b'], []),
+            ('s2a', [t3], [t1], ['s3'], ['s1']),
+            ('s2b', [t4], [t2], ['s3'], ['s1'])])
+
+
+class TestPrefetchErrorPaths(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [Person]
+
+    def test_prefetch_unrelated_model_error(self):
+        class Unrelated(TestModel):
+            data = TextField()
+            class Meta:
+                database = self.database
+
+        with self.assertRaises(AttributeError):
+            prefetch(Person.select(), Unrelated.select())
+
+    def test_prefetch_empty_subqueries_passthrough(self):
+        Person.create(name='huey')
+        query = Person.select()
+        result = prefetch(query)
+        # Should return the query itself (not wrapped).
+        self.assertIs(result, query)

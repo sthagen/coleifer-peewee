@@ -1,3 +1,17 @@
+"""
+Transaction semantics, savepoints, session management, and isolation level
+tests.
+
+All test cases use the Register model (a single IntegerField) from
+base_models, via BaseTransactionTestCase.
+
+Test case ordering:
+
+* Transaction commit/rollback, nesting, savepoints
+* Session (context manager) behavior
+* Lock type
+* Isolation level
+"""
 import threading
 
 from peewee import *
@@ -32,6 +46,10 @@ def requires_nested(fn):
                    'nested transaction support is required')(fn)
 
 
+# ===========================================================================
+# Transaction commit/rollback, nesting, and savepoints
+# ===========================================================================
+
 class TestTransaction(BaseTransactionTestCase):
     def test_simple(self):
         self.assertFalse(db.in_transaction())
@@ -60,6 +78,68 @@ class TestTransaction(BaseTransactionTestCase):
             txn.rollback()
 
         self.assertRegister([1, 3])
+
+        # Explicit commit, implicit rollback.
+        try:
+            with db.atomic() as txn:
+                self._save(6)
+                txn.commit()
+                self.assertTrue(db.in_transaction())  # New txn begun.
+                self._save(7)
+                raise ValueError('oops')
+        except ValueError:
+            pass
+
+        self.assertRegister([1, 3, 6])
+        self.assertFalse(db.in_transaction())
+
+    @requires_nested
+    def test_simple_nested(self):
+        self.assertFalse(db.in_transaction())
+        with db.atomic():
+            with db.atomic():
+                self._save(1)
+                self.assertTrue(db.in_transaction())
+            self.assertTrue(db.in_transaction())
+
+        self.assertFalse(db.in_transaction())
+        self.assertRegister([1])
+
+        # Explicit rollback, implicit commit.
+        with db.atomic() as txn:
+            with db.atomic() as sp:
+                self._save(2)
+                sp.rollback()
+                self.assertTrue(db.in_transaction())
+                self._save(3)
+
+        self.assertFalse(db.in_transaction())
+        self.assertRegister([1, 3])
+
+        # Explicit rollbacks.
+        with db.atomic() as txn:
+            with db.atomic() as sp:
+                self._save(4)
+                sp.rollback()
+                self._save(5)
+                sp.rollback()
+
+        self.assertRegister([1, 3])
+
+        # Explicit commit, implicit rollback.
+        with db.atomic() as txn:
+            try:
+                with db.atomic() as sp:
+                    self._save(6)
+                    sp.commit()
+                    self.assertTrue(db.in_transaction())  # New txn begun.
+                    self._save(7)
+                    raise ValueError('oops')
+            except ValueError:
+                pass
+
+        self.assertRegister([1, 3, 6])
+        self.assertFalse(db.in_transaction())
 
     @requires_nested
     def test_transactions(self):
@@ -113,6 +193,7 @@ class TestTransaction(BaseTransactionTestCase):
     def test_commit_rollback_nested(self):
         with db.atomic() as txn:
             self.test_commit_rollback()
+            self.assertRegister([1, 4])
             txn.rollback()
         self.assertRegister([])
 
@@ -218,6 +299,19 @@ class TestTransaction(BaseTransactionTestCase):
 
         self.assertRegister([2, 4])
 
+    def test_manual_commit_as_decorator(self):
+        @db.manual_commit()
+        def do_work():
+            db.begin()
+            self._save(100)
+            db.rollback()
+            db.begin()
+            self._save(200)
+            db.commit()
+
+        do_work()
+        self.assertRegister([200])
+
     def test_mixing_manual_atomic(self):
         @db.manual_commit()
         def will_fail():
@@ -306,6 +400,10 @@ class TestTransaction(BaseTransactionTestCase):
 
         self.assertEqual(accum, [True, True, True, True])
 
+
+# ===========================================================================
+# Session (context manager) behavior
+# ===========================================================================
 
 @requires_nested
 class TestSession(BaseTransactionTestCase):
@@ -406,6 +504,10 @@ class TestSession(BaseTransactionTestCase):
         self.assertRegister([1, 2, 3])
 
 
+# ===========================================================================
+# Lock type and isolation level
+# ===========================================================================
+
 @skip_unless(IS_SQLITE, 'requires sqlite for transaction lock type')
 class TestTransactionLockType(BaseTransactionTestCase):
     def test_lock_type(self):
@@ -501,3 +603,18 @@ class TestTransactionIsolationLevel(BaseTransactionTestCase):
         with Register.bind_ctx(db2):
             q = Register.select().order_by(Register.value)
             self.assertEqual([r.value for r in q], vals)
+
+
+class TestConnectionContextDecorator(BaseTransactionTestCase):
+    def test_connection_context_as_decorator(self):
+        db2 = new_connection()
+
+        @db2.connection_context()
+        def do_work():
+            self.assertFalse(db2.is_closed())
+            return db2.execute_sql('SELECT 1').fetchone()
+
+        self.assertTrue(db2.is_closed())
+        result = do_work()
+        self.assertEqual(result, (1,))
+        self.assertTrue(db2.is_closed())

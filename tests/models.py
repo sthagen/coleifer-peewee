@@ -2,12 +2,14 @@ import datetime
 import threading
 import time
 import unittest
+import uuid
 from unittest import mock
 
 from peewee import *
 from peewee import Entity
 from peewee import NodeList
 from peewee import SubclassAwareMetadata
+from peewee import __sqlite_version__
 from peewee import sort_models
 
 from .base import db
@@ -31,27 +33,29 @@ from .base import IS_SQLITE_15  # Row-values.
 from .base import IS_SQLITE_24  # Upsert.
 from .base import IS_SQLITE_25  # Window functions.
 from .base import IS_SQLITE_30  # FILTER clause functions.
+from .base import IS_SQLITE_35  # RETURNING.
 from .base import IS_SQLITE_9
 from .base import ModelTestCase
 from .base import TestModel
 from .base_models import *
 
 
+# ===========================================================================
+# Core Model CRUD operations
+# ===========================================================================
+
 class Color(TestModel):
     name = CharField(primary_key=True)
     is_neutral = BooleanField(default=False)
-
 
 class Post(TestModel):
     content = TextField(column_name='Content')
     timestamp = DateTimeField(column_name='TimeStamp',
                               default=datetime.datetime.now)
 
-
 class PostNote(TestModel):
     post = ForeignKeyField(Post, backref='notes', primary_key=True)
     note = TextField()
-
 
 class Point(TestModel):
     x = IntegerField()
@@ -59,14 +63,12 @@ class Point(TestModel):
     class Meta:
         primary_key = False
 
-
 class CPK(TestModel):
     key = CharField()
     value = IntegerField()
     extra = IntegerField()
     class Meta:
         primary_key = CompositeKey('key', 'value')
-
 
 class City(TestModel):
     name = CharField()
@@ -120,23 +122,13 @@ class TestModelAPIs(ModelTestCase):
                   .get())
             self.assertEqual(pn.post.content, 'p2')
 
-        if not IS_SQLITE:
-            exc_class = (ProgrammingError, IntegrityError)
-            with self.database.atomic() as txn:
-                self.assertRaises(exc_class, PostNote.create, note='pxn')
-                txn.rollback()
+        if IS_SQLITE:
+            self.database.foreign_keys = True
 
-    @requires_models(User, Tweet)
-    def test_assertQueryCount(self):
-        self.add_tweets(self.add_user('charlie'), 'foo', 'bar', 'baz')
-        def do_test(n):
-            with self.assertQueryCount(n):
-                authors = [tweet.user.username for tweet in Tweet.select()]
-
-        self.assertRaises(AssertionError, do_test, 1)
-        self.assertRaises(AssertionError, do_test, 3)
-        do_test(4)
-        self.assertRaises(AssertionError, do_test, 5)
+        exc_class = (ProgrammingError, IntegrityError)
+        with self.database.atomic() as txn:
+            self.assertRaises(exc_class, PostNote.create, note='pxn')
+            txn.rollback()
 
     @requires_models(Post)
     def test_column_field_translation(self):
@@ -154,6 +146,38 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(pd1['timestamp'], ts)
         self.assertEqual(pd2['content'], 'p2')
         self.assertEqual(pd2['timestamp'], ts2)
+
+    def test_table_schema(self):
+        class Schema(TestModel):
+            pass
+
+        self.assertTrue(Schema._meta.schema is None)
+        self.assertSQL(Schema.select(), (
+            'SELECT "t1"."id" FROM "schema" AS "t1"'), [])
+
+        Schema._meta.schema = 'test'
+        self.assertSQL(Schema.select(), (
+            'SELECT "t1"."id" FROM "test"."schema" AS "t1"'), [])
+
+        Schema._meta.schema = 'another'
+        self.assertSQL(Schema.select(), (
+            'SELECT "t1"."id" FROM "another"."schema" AS "t1"'), [])
+
+    @requires_models(User, Tweet)
+    def test_create(self):
+        with self.assertQueryCount(1):
+            huey = self.add_user('huey')
+            self.assertEqual(huey.username, 'huey')
+            self.assertTrue(isinstance(huey.id, int))
+            self.assertTrue(huey.id > 0)
+
+        with self.assertQueryCount(1):
+            tweet = Tweet.create(user=huey, content='meow')
+            self.assertEqual(tweet.user.id, huey.id)
+            self.assertEqual(tweet.user.username, 'huey')
+            self.assertEqual(tweet.content, 'meow')
+            self.assertTrue(isinstance(tweet.id, int))
+            self.assertTrue(tweet.id > 0)
 
     @requires_models(User)
     def test_insert_many(self):
@@ -186,20 +210,58 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(actual, expected)
 
     @requires_models(User, Tweet)
-    def test_create(self):
-        with self.assertQueryCount(1):
-            huey = self.add_user('huey')
-            self.assertEqual(huey.username, 'huey')
-            self.assertTrue(isinstance(huey.id, int))
-            self.assertTrue(huey.id > 0)
+    def test_insert_query_value(self):
+        huey = self.add_user('huey')
+        query = User.select(User.id).where(User.username == 'huey')
+        tid = Tweet.insert(content='meow', user=query).execute()
+        tweet = Tweet[tid]
+        self.assertEqual(tweet.user.id, huey.id)
+        self.assertEqual(tweet.user.username, 'huey')
 
-        with self.assertQueryCount(1):
-            tweet = Tweet.create(user=huey, content='meow')
-            self.assertEqual(tweet.user.id, huey.id)
-            self.assertEqual(tweet.user.username, 'huey')
-            self.assertEqual(tweet.content, 'meow')
-            self.assertTrue(isinstance(tweet.id, int))
-            self.assertTrue(tweet.id > 0)
+    @requires_models(User)
+    def test_insert_rowcount(self):
+        User.create(username='u0')  # Ensure that last insert ID != rowcount.
+
+        iq = User.insert_many([(u,) for u in ('u1', 'u2', 'u3')])
+        self.assertEqual(iq.as_rowcount().execute(), 3)
+
+        # Now explicitly specify empty returning() for all DBs.
+        iq = User.insert_many([(u,) for u in ('u4', 'u5')]).returning()
+        self.assertEqual(iq.as_rowcount().execute(), 2)
+
+        query = (User
+                 .select(User.username.concat('-x'))
+                 .where(User.username.in_(['u1', 'u2'])))
+        iq = User.insert_from(query, ['username'])
+        self.assertEqual(iq.as_rowcount().execute(), 2)
+
+        query = (User
+                 .select(User.username.concat('-y'))
+                 .where(User.username.in_(['u3', 'u4'])))
+        iq = User.insert_from(query, ['username']).returning()
+        self.assertEqual(iq.as_rowcount().execute(), 2)
+
+        query = User.insert({'username': 'u5'})
+        self.assertEqual(query.as_rowcount().execute(), 1)
+
+    @skip_if(IS_POSTGRESQL or IS_CRDB, 'requires sqlite or mysql')
+    @requires_models(Emp)
+    def test_replace_rowcount(self):
+        Emp.create(first='beanie', last='cat', empno='998')
+
+        data = [
+            ('beanie', 'cat', '999'),
+            ('mickey', 'dog', '123')]
+        fields = (Emp.first, Emp.last, Emp.empno)
+
+        # MySQL returns 3, Sqlite 2. However, older stdlib sqlite3 does not
+        # work properly, so we don't assert a result count here.
+        Emp.replace_many(data, fields=fields).execute()
+
+        query = Emp.select(Emp.first, Emp.last, Emp.empno).order_by(Emp.last)
+        self.assertEqual(list(query.tuples()), [
+            ('beanie', 'cat', '999'),
+            ('mickey', 'dog', '123')])
 
     @requires_models(User)
     def test_bulk_create(self):
@@ -257,6 +319,100 @@ class TestModelAPIs(ModelTestCase):
 
         query = CPK.select().order_by(CPK.key).tuples()
         self.assertEqual(list(query), [('k1', 1, 1), ('k2', 2, 2)])
+
+    @requires_models(Person)
+    def test_save(self):
+        huey = Person(first='huey', last='cat', dob=datetime.date(2010, 7, 1))
+        self.assertTrue(huey.save() > 0)
+        self.assertTrue(huey.id is not None)  # Ensure PK is set.
+        orig_id = huey.id
+
+        # Test initial save (INSERT) worked and data is all present.
+        huey_db = Person.get(first='huey', last='cat')
+        self.assertEqual(huey_db.id, huey.id)
+        self.assertEqual(huey_db.first, 'huey')
+        self.assertEqual(huey_db.last, 'cat')
+        self.assertEqual(huey_db.dob, datetime.date(2010, 7, 1))
+
+        # Make a change and do a second save (UPDATE).
+        huey.dob = datetime.date(2010, 7, 2)
+        self.assertTrue(huey.save() > 0)
+        self.assertEqual(huey.id, orig_id)
+
+        # Test UPDATE worked correctly.
+        huey_db = Person.get(first='huey', last='cat')
+        self.assertEqual(huey_db.id, huey.id)
+        self.assertEqual(huey_db.first, 'huey')
+        self.assertEqual(huey_db.last, 'cat')
+        self.assertEqual(huey_db.dob, datetime.date(2010, 7, 2))
+
+        self.assertEqual(Person.select().count(), 1)
+
+    @requires_models(Person)
+    def test_save_only(self):
+        huey = Person(first='huey', last='cat', dob=datetime.date(2010, 7, 1))
+        huey.save()
+
+        huey.first = 'huker'
+        huey.last = 'kitten'
+        self.assertTrue(huey.save(only=('first',)) > 0)
+
+        huey_db = Person.get_by_id(huey.id)
+        self.assertEqual(huey_db.first, 'huker')
+        self.assertEqual(huey_db.last, 'cat')
+        self.assertEqual(huey_db.dob, datetime.date(2010, 7, 1))
+
+        huey.first = 'hubie'
+        self.assertTrue(huey.save(only=[Person.last]) > 0)
+
+        huey_db = Person.get_by_id(huey.id)
+        self.assertEqual(huey_db.first, 'huker')
+        self.assertEqual(huey_db.last, 'kitten')
+        self.assertEqual(huey_db.dob, datetime.date(2010, 7, 1))
+
+        self.assertEqual(Person.select().count(), 1)
+
+    @requires_models(Color, User)
+    def test_save_force(self):
+        huey = User(username='huey')
+        self.assertTrue(huey.save() > 0)
+        huey_id = huey.id
+
+        huey.username = 'zaizee'
+        self.assertTrue(huey.save(force_insert=True, only=('username',)) > 0)
+        zaizee_id = huey.id
+        self.assertTrue(huey_id != zaizee_id)
+
+        query = User.select().order_by(User.username)
+        self.assertEqual([user.username for user in query], ['huey', 'zaizee'])
+
+        color = Color(name='red')
+        self.assertFalse(bool(color.save()))
+        self.assertEqual(Color.select().count(), 0)
+
+        color = Color(name='blue')
+        color.save(force_insert=True)
+        self.assertEqual(Color.select().count(), 1)
+
+        with self.database.atomic():
+            self.assertRaises(IntegrityError,
+                              color.save,
+                              force_insert=True)
+
+    @requires_models(User, Tweet)
+    def test_populate_unsaved_relations(self):
+        user = User(username='charlie')
+        tweet = Tweet(user=user, content='foo')
+
+        self.assertTrue(user.save())
+        self.assertTrue(user.id is not None)
+        with self.assertQueryCount(1):
+            self.assertEqual(tweet.user_id, user.id)
+            self.assertTrue(tweet.save())
+            self.assertEqual(tweet.user_id, user.id)
+
+        tweet_db = Tweet.get(Tweet.content == 'foo')
+        self.assertEqual(tweet_db.user.username, 'charlie')
 
     @requires_models(Person)
     def test_bulk_update(self):
@@ -411,50 +567,26 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(list(sorted(CPK.select().tuples())), [
             ('k1', 1, 10), ('k2', 2, 2), ('k3', 3, 30)])
 
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB)
     @requires_models(User)
-    def test_insert_rowcount(self):
-        User.create(username='u0')  # Ensure that last insert ID != rowcount.
+    def test_multi_update(self):
+        data = [(i, 'u%s' % i) for i in range(1, 4)]
+        User.insert_many(data, fields=[User.id, User.username]).execute()
 
-        iq = User.insert_many([(u,) for u in ('u1', 'u2', 'u3')])
-        self.assertEqual(iq.as_rowcount().execute(), 3)
-
-        # Now explicitly specify empty returning() for all DBs.
-        iq = User.insert_many([(u,) for u in ('u4', 'u5')]).returning()
-        self.assertEqual(iq.as_rowcount().execute(), 2)
-
-        query = (User
-                 .select(User.username.concat('-x'))
-                 .where(User.username.in_(['u1', 'u2'])))
-        iq = User.insert_from(query, ['username'])
-        self.assertEqual(iq.as_rowcount().execute(), 2)
-
-        query = (User
-                 .select(User.username.concat('-y'))
-                 .where(User.username.in_(['u3', 'u4'])))
-        iq = User.insert_from(query, ['username']).returning()
-        self.assertEqual(iq.as_rowcount().execute(), 2)
-
-        query = User.insert({'username': 'u5'})
-        self.assertEqual(query.as_rowcount().execute(), 1)
-
-    @skip_if(IS_POSTGRESQL or IS_CRDB, 'requires sqlite or mysql')
-    @requires_models(Emp)
-    def test_replace_rowcount(self):
-        Emp.create(first='beanie', last='cat', empno='998')
-
-        data = [
-            ('beanie', 'cat', '999'),
-            ('mickey', 'dog', '123')]
-        fields = (Emp.first, Emp.last, Emp.empno)
-
-        # MySQL returns 3, Sqlite 2. However, older stdlib sqlite3 does not
-        # work properly, so we don't assert a result count here.
-        Emp.replace_many(data, fields=fields).execute()
-
-        query = Emp.select(Emp.first, Emp.last, Emp.empno).order_by(Emp.last)
-        self.assertEqual(list(query.tuples()), [
-            ('beanie', 'cat', '999'),
-            ('mickey', 'dog', '123')])
+        data = [(i, 'u%sx' % i) for i in range(1, 3)]
+        vl = ValuesList(data)
+        cte = vl.select().cte('uv', columns=('id', 'username'))
+        subq = cte.select(cte.c.username).where(cte.c.id == User.id)
+        res = (User
+               .update(username=subq)
+               .where(User.id.in_(cte.select(cte.c.id)))
+               .with_cte(cte)
+               .execute())
+        query = User.select().order_by(User.id)
+        self.assertEqual([(u.id, u.username) for u in query], [
+            (1, 'u1x'),
+            (2, 'u2x'),
+            (3, 'u3')])
 
     @requires_models(User, Tweet)
     def test_get_shortcut(self):
@@ -587,100 +719,6 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(p2.last, 'cat')
         self.assertEqual(p2.dob, datetime.date(2010, 7, 1))
 
-    @requires_models(Person)
-    def test_save(self):
-        huey = Person(first='huey', last='cat', dob=datetime.date(2010, 7, 1))
-        self.assertTrue(huey.save() > 0)
-        self.assertTrue(huey.id is not None)  # Ensure PK is set.
-        orig_id = huey.id
-
-        # Test initial save (INSERT) worked and data is all present.
-        huey_db = Person.get(first='huey', last='cat')
-        self.assertEqual(huey_db.id, huey.id)
-        self.assertEqual(huey_db.first, 'huey')
-        self.assertEqual(huey_db.last, 'cat')
-        self.assertEqual(huey_db.dob, datetime.date(2010, 7, 1))
-
-        # Make a change and do a second save (UPDATE).
-        huey.dob = datetime.date(2010, 7, 2)
-        self.assertTrue(huey.save() > 0)
-        self.assertEqual(huey.id, orig_id)
-
-        # Test UPDATE worked correctly.
-        huey_db = Person.get(first='huey', last='cat')
-        self.assertEqual(huey_db.id, huey.id)
-        self.assertEqual(huey_db.first, 'huey')
-        self.assertEqual(huey_db.last, 'cat')
-        self.assertEqual(huey_db.dob, datetime.date(2010, 7, 2))
-
-        self.assertEqual(Person.select().count(), 1)
-
-    @requires_models(Person)
-    def test_save_only(self):
-        huey = Person(first='huey', last='cat', dob=datetime.date(2010, 7, 1))
-        huey.save()
-
-        huey.first = 'huker'
-        huey.last = 'kitten'
-        self.assertTrue(huey.save(only=('first',)) > 0)
-
-        huey_db = Person.get_by_id(huey.id)
-        self.assertEqual(huey_db.first, 'huker')
-        self.assertEqual(huey_db.last, 'cat')
-        self.assertEqual(huey_db.dob, datetime.date(2010, 7, 1))
-
-        huey.first = 'hubie'
-        self.assertTrue(huey.save(only=[Person.last]) > 0)
-
-        huey_db = Person.get_by_id(huey.id)
-        self.assertEqual(huey_db.first, 'huker')
-        self.assertEqual(huey_db.last, 'kitten')
-        self.assertEqual(huey_db.dob, datetime.date(2010, 7, 1))
-
-        self.assertEqual(Person.select().count(), 1)
-
-    @requires_models(Color, User)
-    def test_save_force(self):
-        huey = User(username='huey')
-        self.assertTrue(huey.save() > 0)
-        huey_id = huey.id
-
-        huey.username = 'zaizee'
-        self.assertTrue(huey.save(force_insert=True, only=('username',)) > 0)
-        zaizee_id = huey.id
-        self.assertTrue(huey_id != zaizee_id)
-
-        query = User.select().order_by(User.username)
-        self.assertEqual([user.username for user in query], ['huey', 'zaizee'])
-
-        color = Color(name='red')
-        self.assertFalse(bool(color.save()))
-        self.assertEqual(Color.select().count(), 0)
-
-        color = Color(name='blue')
-        color.save(force_insert=True)
-        self.assertEqual(Color.select().count(), 1)
-
-        with self.database.atomic():
-            self.assertRaises(IntegrityError,
-                              color.save,
-                              force_insert=True)
-
-    @requires_models(User, Tweet)
-    def test_populate_unsaved_relations(self):
-        user = User(username='charlie')
-        tweet = Tweet(user=user, content='foo')
-
-        self.assertTrue(user.save())
-        self.assertTrue(user.id is not None)
-        with self.assertQueryCount(1):
-            self.assertEqual(tweet.user_id, user.id)
-            self.assertTrue(tweet.save())
-            self.assertEqual(tweet.user_id, user.id)
-
-        tweet_db = Tweet.get(Tweet.content == 'foo')
-        self.assertEqual(tweet_db.user.username, 'charlie')
-
     @requires_models(User, Tweet)
     def test_model_select(self):
         huey = self.add_user('huey')
@@ -724,6 +762,57 @@ class TestModelAPIs(ModelTestCase):
                  .order_by(Tweet.user, Tweet.timestamp))
         self.assertEqual([(t.user_id, t.content) for t in query],
                          [(u1.id, 'u1-t1'), (u2.id, 'u2-t1')])
+
+    @requires_models(User, Tweet)
+    def test_filtering(self):
+        with self.database.atomic():
+            huey = self.add_user('huey')
+            mickey = self.add_user('mickey')
+            self.add_tweets(huey, 'meow', 'hiss', 'purr')
+            self.add_tweets(mickey, 'woof', 'wheeze')
+
+        with self.assertQueryCount(1):
+            query = Tweet.filter(user__username='huey').order_by(Tweet.content)
+            self.assertEqual([row.content for row in query],
+                             ['hiss', 'meow', 'purr'])
+
+        with self.assertQueryCount(1):
+            query = User.filter(tweets__content__ilike='w%')
+            self.assertEqual([user.username for user in query],
+                             ['mickey', 'mickey'])
+
+    @requires_models(User)
+    def test_select_count(self):
+        users = [self.add_user(u) for u in ('huey', 'charlie', 'mickey')]
+        self.assertEqual(User.select().count(), 3)
+
+        qr = User.select().execute()
+        self.assertEqual(qr.count, 0)
+
+        list(qr)
+        self.assertEqual(qr.count, 3)
+
+    @requires_models(User)
+    def test_peek(self):
+        for username in ('huey', 'mickey', 'zaizee'):
+            self.add_user(username)
+
+        with self.assertQueryCount(1):
+            query = User.select(User.username).order_by(User.username).dicts()
+            self.assertEqual(query.peek(n=1), {'username': 'huey'})
+            self.assertEqual(query.peek(n=2), [{'username': 'huey'},
+                                               {'username': 'mickey'}])
+
+    @requires_models(User)
+    def test_first(self):
+        for u in 'abc':
+            self.add_user(u)
+
+        # Multiple calls to first() do not result in multiple executions.
+        with self.assertQueryCount(1):
+            q = User.select().order_by(User.username)
+            self.assertEqual(q.first().username, 'a')
+            self.assertEqual(q.first().username, 'a')
 
     @requires_models(User, Tweet, Favorite)
     def test_join_two_fks(self):
@@ -915,28 +1004,6 @@ class TestModelAPIs(ModelTestCase):
                 ('purr', {'username': 'huey'}),
                 ('woof', {'username': 'mickey'})])
 
-    @requires_models(User)
-    def test_peek(self):
-        for username in ('huey', 'mickey', 'zaizee'):
-            self.add_user(username)
-
-        with self.assertQueryCount(1):
-            query = User.select(User.username).order_by(User.username).dicts()
-            self.assertEqual(query.peek(n=1), {'username': 'huey'})
-            self.assertEqual(query.peek(n=2), [{'username': 'huey'},
-                                               {'username': 'mickey'}])
-
-    @requires_models(User)
-    def test_first(self):
-        for u in 'abc':
-            self.add_user(u)
-
-        # Multiple calls to first() do not result in multiple executions.
-        with self.assertQueryCount(1):
-            q = User.select().order_by(User.username)
-            self.assertEqual(q.first().username, 'a')
-            self.assertEqual(q.first().username, 'a')
-
     @requires_models(User, Tweet, Favorite)
     def test_multi_join(self):
         u1 = User.create(username='u1')
@@ -1001,6 +1068,19 @@ class TestModelAPIs(ModelTestCase):
                     Tweet.create(user=user, content=tweet, timestamp=ts)
                     ts += 1
 
+    @requires_pglike
+    @requires_models(User, Tweet)
+    def test_join_on_valueslist(self):
+        self._create_user_tweets()
+
+        vl = ValuesList([('huey',), ('zaizee',)], columns=['username'])
+        with self.assertQueryCount(1):
+            query = (User
+                     .select(vl.c.username)
+                     .join(vl, on=(User.username == vl.c.username))
+                     .order_by(vl.c.username.desc()))
+            self.assertEqual([u.username for u in query], ['zaizee', 'huey'])
+
     @requires_models(User, Tweet)
     def test_join_subquery(self):
         self._create_user_tweets()
@@ -1026,11 +1106,9 @@ class TestModelAPIs(ModelTestCase):
 
             data = [(user.username, user.tweet.content) for user in query]
 
-        # Failing on travis-ci...old SQLite?
-        if not IS_SQLITE_OLD:
-            self.assertEqual(data, [
-                ('huey', 'hiss'),
-                ('mickey', 'grr')])
+        self.assertEqual(data, [
+            ('huey', 'hiss'),
+            ('mickey', 'grr')])
 
         with self.assertQueryCount(1):
             query = (Tweet
@@ -1176,49 +1254,30 @@ class TestModelAPIs(ModelTestCase):
                 ('mickey', 2),
                 ('zaizee', 0)])
 
-    @requires_pglike
-    @requires_models(User)
-    def test_join_on_valueslist(self):
-        for username in ('huey', 'mickey', 'zaizee'):
-            User.create(username=username)
+    @requires_models(Point)
+    def test_subquery_in_select_expression(self):
+        for x, y in ((1, 1), (1, 2), (10, 10), (10, 20)):
+            Point.create(x=x, y=y)
 
-        vl = ValuesList([('huey',), ('zaizee',)], columns=['username'])
         with self.assertQueryCount(1):
-            query = (User
-                     .select(vl.c.username)
-                     .join(vl, on=(User.username == vl.c.username))
-                     .order_by(vl.c.username.desc()))
-            self.assertEqual([u.username for u in query], ['zaizee', 'huey'])
+            PA = Point.alias('pa')
+            subq = PA.select(fn.SUM(PA.y)).where(PA.x == Point.x)
+            query = (Point
+                     .select(Point.x, Point.y, subq.alias('sy'))
+                     .order_by(Point.x, Point.y))
+            self.assertEqual(list(query.tuples()), [
+                (1, 1, 3),
+                (1, 2, 3),
+                (10, 10, 30),
+                (10, 20, 30)])
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB)
-    @requires_models(User)
-    def test_multi_update(self):
-        data = [(i, 'u%s' % i) for i in range(1, 4)]
-        User.insert_many(data, fields=[User.id, User.username]).execute()
-
-        data = [(i, 'u%sx' % i) for i in range(1, 3)]
-        vl = ValuesList(data)
-        cte = vl.select().cte('uv', columns=('id', 'username'))
-        subq = cte.select(cte.c.username).where(cte.c.id == User.id)
-        res = (User
-               .update(username=subq)
-               .where(User.id.in_(cte.select(cte.c.id)))
-               .with_cte(cte)
-               .execute())
-        query = User.select().order_by(User.id)
-        self.assertEqual([(u.id, u.username) for u in query], [
-            (1, 'u1x'),
-            (2, 'u2x'),
-            (3, 'u3')])
-
-    @requires_models(User, Tweet)
-    def test_insert_query_value(self):
-        huey = self.add_user('huey')
-        query = User.select(User.id).where(User.username == 'huey')
-        tid = Tweet.insert(content='meow', user=query).execute()
-        tweet = Tweet[tid]
-        self.assertEqual(tweet.user.id, huey.id)
-        self.assertEqual(tweet.user.username, 'huey')
+        with self.assertQueryCount(1):
+            query = (Point
+                     .select(Point.x, (Point.y + subq).alias('sy'))
+                     .order_by(Point.x, Point.y))
+            self.assertEqual(list(query.tuples()), [
+                (1, 4), (1, 5),
+                (10, 40), (10, 50)])
 
     @skip_if(IS_SQLITE and not IS_SQLITE_9, 'requires sqlite >= 3.9')
     @requires_models(Register)
@@ -1412,6 +1471,28 @@ class TestModelAPIs(ModelTestCase):
             self.assertEqual(c2_db.name, 'child-2')
             self.assertEqual(c2_db.parent.name, 'root')
 
+    def test_deferred_fk(self):
+        class Note(TestModel):
+            foo = DeferredForeignKey('Foo', backref='notes')
+
+        class Foo(TestModel):
+            note = ForeignKeyField(Note)
+
+        self.assertTrue(Note.foo.rel_model is Foo)
+        self.assertTrue(Foo.note.rel_model is Note)
+        f = Foo(id=1337)
+        self.assertSQL(f.notes, (
+            'SELECT "t1"."id", "t1"."foo_id" FROM "note" AS "t1" '
+            'WHERE ("t1"."foo_id" = ?)'), [1337])
+
+    def test_deferred_fk_dependency_graph(self):
+        class AUser(TestModel):
+            foo = DeferredForeignKey('Tweet')
+        class ZTweet(TestModel):
+            user = ForeignKeyField(AUser, backref='ztweets')
+
+        self.assertEqual(sort_models([AUser, ZTweet]), [AUser, ZTweet])
+
     @requires_models(Category)
     def test_empty_joined_instance(self):
         root = Category.create(name='a')
@@ -1450,91 +1531,13 @@ class TestModelAPIs(ModelTestCase):
             self.assertEqual([t['username'] for t in query],
                              ['huey', 'huey', 'huey'])
 
-    @requires_models(Point)
-    def test_subquery_in_select_expression(self):
-        for x, y in ((1, 1), (1, 2), (10, 10), (10, 20)):
-            Point.create(x=x, y=y)
-
-        with self.assertQueryCount(1):
-            PA = Point.alias('pa')
-            subq = PA.select(fn.SUM(PA.y)).where(PA.x == Point.x)
-            query = (Point
-                     .select(Point.x, Point.y, subq.alias('sy'))
-                     .order_by(Point.x, Point.y))
-            self.assertEqual(list(query.tuples()), [
-                (1, 1, 3),
-                (1, 2, 3),
-                (10, 10, 30),
-                (10, 20, 30)])
-
-        with self.assertQueryCount(1):
-            query = (Point
-                     .select(Point.x, (Point.y + subq).alias('sy'))
-                     .order_by(Point.x, Point.y))
-            self.assertEqual(list(query.tuples()), [
-                (1, 4), (1, 5),
-                (10, 40), (10, 50)])
-
-    @requires_models(User, Tweet)
-    def test_filtering(self):
-        with self.database.atomic():
-            huey = self.add_user('huey')
-            mickey = self.add_user('mickey')
-            self.add_tweets(huey, 'meow', 'hiss', 'purr')
-            self.add_tweets(mickey, 'woof', 'wheeze')
-
-        with self.assertQueryCount(1):
-            query = Tweet.filter(user__username='huey').order_by(Tweet.content)
-            self.assertEqual([row.content for row in query],
-                             ['hiss', 'meow', 'purr'])
-
-        with self.assertQueryCount(1):
-            query = User.filter(tweets__content__ilike='w%')
-            self.assertEqual([user.username for user in query],
-                             ['mickey', 'mickey'])
-
-    def test_deferred_fk(self):
-        class Note(TestModel):
-            foo = DeferredForeignKey('Foo', backref='notes')
-
-        class Foo(TestModel):
-            note = ForeignKeyField(Note)
-
-        self.assertTrue(Note.foo.rel_model is Foo)
-        self.assertTrue(Foo.note.rel_model is Note)
-        f = Foo(id=1337)
-        self.assertSQL(f.notes, (
-            'SELECT "t1"."id", "t1"."foo_id" FROM "note" AS "t1" '
-            'WHERE ("t1"."foo_id" = ?)'), [1337])
-
-    def test_deferred_fk_dependency_graph(self):
-        class AUser(TestModel):
-            foo = DeferredForeignKey('Tweet')
-        class ZTweet(TestModel):
-            user = ForeignKeyField(AUser, backref='ztweets')
-
-        self.assertEqual(sort_models([AUser, ZTweet]), [AUser, ZTweet])
-
-    def test_table_schema(self):
-        class Schema(TestModel):
-            pass
-
-        self.assertTrue(Schema._meta.schema is None)
-        self.assertSQL(Schema.select(), (
-            'SELECT "t1"."id" FROM "schema" AS "t1"'), [])
-
-        Schema._meta.schema = 'test'
-        self.assertSQL(Schema.select(), (
-            'SELECT "t1"."id" FROM "test"."schema" AS "t1"'), [])
-
-        Schema._meta.schema = 'another'
-        self.assertSQL(Schema.select(), (
-            'SELECT "t1"."id" FROM "another"."schema" AS "t1"'), [])
-
     @requires_models(User)
     def test_noop(self):
         query = User.noop()
         self.assertEqual(list(query), [])
+
+        User.create(username='huey')
+        self.assertEqual(list(User.noop()), [])
 
     @requires_models(User)
     def test_iteration(self):
@@ -1547,29 +1550,36 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(len(User), 2)
         self.assertTrue(User)
 
-    @requires_models(User)
+    @requires_models(User, Tweet)
     def test_iterator(self):
         users = ['charlie', 'huey', 'zaizee']
         with self.database.atomic():
             for username in users:
-                User.create(username=username)
+                user = User.create(username=username)
+                for i in range(3):
+                    Tweet.create(content='%s-%s' % (username, i), user=user)
 
         with self.assertQueryCount(1):
             query = User.select().order_by(User.username).iterator()
             self.assertEqual([u.username for u in query], users)
-
             self.assertEqual(list(query), [])
 
-    @requires_models(User)
-    def test_select_count(self):
-        users = [self.add_user(u) for u in ('huey', 'charlie', 'mickey')]
-        self.assertEqual(User.select().count(), 3)
-
-        qr = User.select().execute()
-        self.assertEqual(qr.count, 0)
-
-        list(qr)
-        self.assertEqual(qr.count, 3)
+        with self.assertQueryCount(1):
+            query = (Tweet.select(Tweet, User)
+                     .join(User)
+                     .order_by(Tweet.content)
+                     .iterator())
+            self.assertEqual([(t.content, t.user.username) for t in query], [
+                ('charlie-0', 'charlie'),
+                ('charlie-1', 'charlie'),
+                ('charlie-2', 'charlie'),
+                ('huey-0', 'huey'),
+                ('huey-1', 'huey'),
+                ('huey-2', 'huey'),
+                ('zaizee-0', 'zaizee'),
+                ('zaizee-1', 'zaizee'),
+                ('zaizee-2', 'zaizee')])
+            self.assertEqual(list(query), [])
 
     @requires_models(User)
     def test_batch_commit(self):
@@ -1592,6 +1602,18 @@ class TestModelAPIs(ModelTestCase):
         assertBatch(6, 4, 2)
         assertBatch(6, 6, 1)
         assertBatch(6, 7, 1)
+
+    @requires_models(User, Tweet)
+    def test_assertQueryCount(self):
+        self.add_tweets(self.add_user('charlie'), 'foo', 'bar', 'baz')
+        def do_test(n):
+            with self.assertQueryCount(n):
+                authors = [tweet.user.username for tweet in Tweet.select()]
+
+        self.assertRaises(AssertionError, do_test, 1)
+        self.assertRaises(AssertionError, do_test, 3)
+        do_test(4)
+        self.assertRaises(AssertionError, do_test, 5)
 
 
 class TestRaw(ModelTestCase):
@@ -1625,90 +1647,67 @@ class TestRaw(ModelTestCase):
             self.assertEqual([u.username for u in query], [])
 
 
-class TestDeleteInstance(ModelTestCase):
+class TestDefaultValues(ModelTestCase):
     database = get_in_memory_db()
-    requires = [User, Account, Tweet, Favorite]
+    requires = [Sample, SampleMeta]
 
-    def setUp(self):
-        super(TestDeleteInstance, self).setUp()
-        with self.database.atomic():
-            huey = User.create(username='huey')
-            acct = Account.create(user=huey, email='huey@meow.com')
-            for content in ('meow', 'purr'):
-                Tweet.create(user=huey, content=content)
-            mickey = User.create(username='mickey')
-            woof = Tweet.create(user=mickey, content='woof')
-            Favorite.create(user=huey, tweet=woof)
-            Favorite.create(user=mickey, tweet=Tweet.create(user=huey,
-                                                            content='hiss'))
+    def test_default_present_on_insert(self):
+        # Although value is not specified, it has a default, which is included
+        # in the INSERT.
+        query = Sample.insert(counter=0)
+        self.assertSQL(query, (
+            'INSERT INTO "sample" ("counter", "value") '
+            'VALUES (?, ?)'), [0, 1.0])
 
-    def test_delete_instance_recursive(self):
-        huey = User.get(User.username == 'huey')
-        a = []
-        for d in huey.dependencies():
-            a.append(d)
-        with self.assertQueryCount(5):
-            huey.delete_instance(recursive=True)
+        # Default values are also included when doing bulk inserts.
+        query = Sample.insert_many([
+            {'counter': '0'},
+            {'counter': 1, 'value': 2},
+            {'counter': '2'}])
+        self.assertSQL(query, (
+            'INSERT INTO "sample" ("counter", "value") '
+            'VALUES (?, ?), (?, ?), (?, ?)'), [0, 1.0, 1, 2.0, 2, 1.0])
 
-        self.assertHistory(5, [
-            ('DELETE FROM "favorite" WHERE ("favorite"."user_id" = ?)',
-             [huey.id]),
-            ('DELETE FROM "favorite" WHERE ('
-             '"favorite"."tweet_id" IN ('
-             'SELECT "t1"."id" FROM "tweet" AS "t1" WHERE ('
-             '"t1"."user_id" = ?)))', [huey.id]),
-            ('DELETE FROM "tweet" WHERE ("tweet"."user_id" = ?)', [huey.id]),
-            ('UPDATE "account" SET "user_id" = ? '
-             'WHERE ("account"."user_id" = ?)',
-             [None, huey.id]),
-            ('DELETE FROM "users" WHERE ("users"."id" = ?)', [huey.id]),
-        ])
+        query = Sample.insert_many([(0,), (1, 2.)],
+                                   fields=[Sample.counter])
+        self.assertSQL(query, (
+            'INSERT INTO "sample" ("counter", "value") '
+            'VALUES (?, ?), (?, ?)'), [0, 1.0, 1, 2.0])
 
-        # Only one user left.
-        self.assertEqual(User.select().count(), 1)
+    def test_default_present_on_create(self):
+        s = Sample.create(counter=3)
+        s_db = Sample.get(Sample.counter == 3)
+        self.assertEqual(s_db.value, 1.)
 
-        # Huey's account has had the FK cleared out.
-        acct = Account.get(Account.email == 'huey@meow.com')
-        self.assertTrue(acct.user is None)
+    def test_defaults_from_cursor(self):
+        s = Sample.create(counter=1)
+        sm1 = SampleMeta.create(sample=s, value=1.)
+        sm2 = SampleMeta.create(sample=s, value=2.)
 
-        # Huey owned a favorite and one of huey's tweets was the other fav.
-        self.assertEqual(Favorite.select().count(), 0)
+        # Defaults are not present when doing a read query.
+        with self.assertQueryCount(1):
+            # Simple query.
+            query = (SampleMeta.select(SampleMeta.sample)
+                     .order_by(SampleMeta.value))
+            sm1_db, sm2_db = list(query)
+            self.assertIsNone(sm1_db.value)
+            self.assertIsNone(sm2_db.value)
 
-        # The only tweet left is mickey's.
-        self.assertEqual(Tweet.select().count(), 1)
-        tweet = Tweet.get()
-        self.assertEqual(tweet.content, 'woof')
+        with self.assertQueryCount(1):
+            # Join-graph query.
+            query = (SampleMeta
+                     .select(SampleMeta.sample,
+                             Sample.counter)
+                     .join(Sample)
+                     .order_by(SampleMeta.value))
 
-    def test_delete_nullable(self):
-        huey = User.get(User.username == 'huey')
-        # Favorite -> Tweet -> User (other users' favorites of huey's tweets)
-        # Favorite -> User (huey's favorite tweets)
-        # Account -> User (huey's account)
-        # User ... for a total of 5. Favorite x2, Tweet, Account, User.
-        with self.assertQueryCount(5):
-            huey.delete_instance(recursive=True, delete_nullable=True)
-
-        # Get the last 5 delete queries.
-        self.assertHistory(5, [
-            ('DELETE FROM "favorite" WHERE ("favorite"."user_id" = ?)',
-             [huey.id]),
-            ('DELETE FROM "favorite" WHERE ('
-             '"favorite"."tweet_id" IN ('
-             'SELECT "t1"."id" FROM "tweet" AS "t1" WHERE ('
-             '"t1"."user_id" = ?)))', [huey.id]),
-            ('DELETE FROM "tweet" WHERE ("tweet"."user_id" = ?)', [huey.id]),
-            ('DELETE FROM "account" WHERE ("account"."user_id" = ?)',
-             [huey.id]),
-            ('DELETE FROM "users" WHERE ("users"."id" = ?)', [huey.id]),
-        ])
-
-        self.assertEqual(User.select().count(), 1)
-        self.assertEqual(Account.select().count(), 0)
-        self.assertEqual(Favorite.select().count(), 0)
-
-        self.assertEqual(Tweet.select().count(), 1)
-        tweet = Tweet.get()
-        self.assertEqual(tweet.content, 'woof')
+            sm1_db, sm2_db = list(query)
+            self.assertIsNone(sm1_db.value)
+            self.assertIsNone(sm2_db.value)
+            self.assertIsNone(sm1_db.sample.value)
+            self.assertIsNone(sm2_db.sample.value)
+            self.assertEqual(sm1_db.sample.counter, 1)
+            self.assertEqual(sm2_db.sample.counter, 1)
 
 
 def incrementer():
@@ -1791,69 +1790,6 @@ class TestDefaultDirtyBehavior(ModelTestCase):
             Person._meta.only_save_dirty = False
 
 
-class TestDefaultValues(ModelTestCase):
-    database = get_in_memory_db()
-    requires = [Sample, SampleMeta]
-
-    def test_default_present_on_insert(self):
-        # Although value is not specified, it has a default, which is included
-        # in the INSERT.
-        query = Sample.insert(counter=0)
-        self.assertSQL(query, (
-            'INSERT INTO "sample" ("counter", "value") '
-            'VALUES (?, ?)'), [0, 1.0])
-
-        # Default values are also included when doing bulk inserts.
-        query = Sample.insert_many([
-            {'counter': '0'},
-            {'counter': 1, 'value': 2},
-            {'counter': '2'}])
-        self.assertSQL(query, (
-            'INSERT INTO "sample" ("counter", "value") '
-            'VALUES (?, ?), (?, ?), (?, ?)'), [0, 1.0, 1, 2.0, 2, 1.0])
-
-        query = Sample.insert_many([(0,), (1, 2.)],
-                                   fields=[Sample.counter])
-        self.assertSQL(query, (
-            'INSERT INTO "sample" ("counter", "value") '
-            'VALUES (?, ?), (?, ?)'), [0, 1.0, 1, 2.0])
-
-    def test_default_present_on_create(self):
-        s = Sample.create(counter=3)
-        s_db = Sample.get(Sample.counter == 3)
-        self.assertEqual(s_db.value, 1.)
-
-    def test_defaults_from_cursor(self):
-        s = Sample.create(counter=1)
-        sm1 = SampleMeta.create(sample=s, value=1.)
-        sm2 = SampleMeta.create(sample=s, value=2.)
-
-        # Defaults are not present when doing a read query.
-        with self.assertQueryCount(1):
-            # Simple query.
-            query = (SampleMeta.select(SampleMeta.sample)
-                     .order_by(SampleMeta.value))
-            sm1_db, sm2_db = list(query)
-            self.assertIsNone(sm1_db.value)
-            self.assertIsNone(sm2_db.value)
-
-        with self.assertQueryCount(1):
-            # Join-graph query.
-            query = (SampleMeta
-                     .select(SampleMeta.sample,
-                             Sample.counter)
-                     .join(Sample)
-                     .order_by(SampleMeta.value))
-
-            sm1_db, sm2_db = list(query)
-            self.assertIsNone(sm1_db.value)
-            self.assertIsNone(sm2_db.value)
-            self.assertIsNone(sm1_db.sample.value)
-            self.assertIsNone(sm2_db.sample.value)
-            self.assertEqual(sm1_db.sample.counter, 1)
-            self.assertEqual(sm2_db.sample.counter, 1)
-
-
 class TestFunctionCoerce(ModelTestCase):
     database = get_in_memory_db()
     requires = [Sample]
@@ -1931,6 +1867,295 @@ class TestFunctionCoerce(ModelTestCase):
         Sample.insert_many([(1, 0), (2, 0)]).execute()
         query = Sample.select(fn.AVG(Sample.counter).alias('a'))
         self.assertEqual(query.get().a, 1.5)
+
+
+class T1(TestModel):
+    pk = AutoField()
+    value = IntegerField()
+
+class T2(TestModel):
+    pk = IntegerField(constraints=[SQL('DEFAULT 3')], primary_key=True)
+    value = IntegerField()
+
+class T3(TestModel):
+    pk = IntegerField(primary_key=True)
+    value = IntegerField()
+
+class T4(TestModel):
+    pk1 = IntegerField()
+    pk2 = IntegerField()
+    value = IntegerField()
+    class Meta:
+        primary_key = CompositeKey('pk1', 'pk2')
+
+
+class TestPrimaryKeySaveHandling(ModelTestCase):
+    requires = [T1, T2, T3, T4]
+
+    def test_auto_field(self):
+        # AutoField will be inserted if the PK is not set, after which the new
+        # ID will be populated.
+        t11 = T1(value=1)
+        self.assertEqual(t11.save(), 1)
+        self.assertTrue(t11.pk is not None)
+
+        # Calling save() a second time will issue an update.
+        t11.value = 100
+        self.assertEqual(t11.save(), 1)
+
+        # Verify the record was updated.
+        t11_db = T1[t11.pk]
+        self.assertEqual(t11_db.value, 100)
+
+        # We can explicitly specify the value of an auto-incrementing
+        # primary-key, but we must be sure to call save(force_insert=True),
+        # otherwise peewee will attempt to do an update.
+        t12 = T1(pk=1337, value=2)
+        self.assertEqual(t12.save(), 0)
+        self.assertEqual(T1.select().count(), 1)
+        self.assertEqual(t12.save(force_insert=True), 1)
+
+        # Attempting to force-insert an already-existing PK will fail with an
+        # integrity error.
+        with self.database.atomic():
+            with self.assertRaises(IntegrityError):
+                t12.value = 3
+                t12.save(force_insert=True)
+
+        query = T1.select().order_by(T1.value).tuples()
+        self.assertEqual(list(query), [(1337, 2), (t11.pk, 100)])
+
+    @requires_pglike
+    def test_server_default_pk(self):
+        # The new value of the primary-key will be returned to us, since
+        # postgres supports RETURNING.
+        t2 = T2(value=1)
+        self.assertEqual(t2.save(), 1)
+        self.assertEqual(t2.pk, 3)
+
+        # Saving after the PK is set will issue an update.
+        t2.value = 100
+        self.assertEqual(t2.save(), 1)
+
+        t2_db = T2[3]
+        self.assertEqual(t2_db.value, 100)
+
+        # If we just set the pk and try to save, peewee issues an update which
+        # doesn't have any effect.
+        t22 = T2(pk=2, value=20)
+        self.assertEqual(t22.save(), 0)
+        self.assertEqual(T2.select().count(), 1)
+
+        # We can force-insert the value we specify explicitly.
+        self.assertEqual(t22.save(force_insert=True), 1)
+        self.assertEqual(T2[2].value, 20)
+
+    def test_integer_field_pk(self):
+        # For a non-auto-incrementing primary key, we have to use force_insert.
+        t3 = T3(pk=2, value=1)
+        self.assertEqual(t3.save(), 0)  # Oops, attempts to do an update.
+        self.assertEqual(T3.select().count(), 0)
+
+        # Force to be an insert.
+        self.assertEqual(t3.save(force_insert=True), 1)
+
+        # Now we can update the value and call save() to issue an update.
+        t3.value = 100
+        self.assertEqual(t3.save(), 1)
+
+        # Verify data is correct.
+        t3_db = T3[2]
+        self.assertEqual(t3_db.value, 100)
+
+    def test_composite_pk(self):
+        t4 = T4(pk1=1, pk2=2, value=10)
+
+        # Will attempt to do an update on non-existant rows.
+        self.assertEqual(t4.save(), 0)
+        self.assertEqual(t4.save(force_insert=True), 1)
+
+        # Modifying part of the composite PK and attempt an update will fail.
+        t4.pk2 = 3
+        t4.value = 30
+        self.assertEqual(t4.save(), 0)
+
+        t4.pk2 = 2
+        self.assertEqual(t4.save(), 1)
+
+        t4_db = T4[1, 2]
+        self.assertEqual(t4_db.value, 30)
+
+    @requires_pglike
+    def test_returning_object(self):
+        query = T2.insert(value=10).returning(T2).objects()
+        t2_db, = list(query)
+        self.assertEqual(t2_db.pk, 3)
+        self.assertEqual(t2_db.value, 10)
+
+
+class T5(TestModel):
+    val = IntegerField(null=True)
+
+
+class TestSaveNoData(ModelTestCase):
+    requires = [T5]
+
+    def test_save_no_data(self):
+        t5 = T5.create()
+        self.assertTrue(t5.id >= 1)
+
+        t5.val = 3
+        t5.save()
+
+        t5_db = T5.get(T5.id == t5.id)
+        self.assertEqual(t5_db.val, 3)
+
+        t5.val = None
+        t5.save()
+
+        t5_db = T5.get(T5.id == t5.id)
+        self.assertTrue(t5_db.val is None)
+
+    def test_save_no_data2(self):
+        t5 = T5.create()
+
+        t5_db = T5.get(T5.id == t5.id)
+        t5_db.save()
+
+        t5_db = T5.get(T5.id == t5.id)
+        self.assertTrue(t5_db.val is None)
+
+    def test_save_no_data3(self):
+        t5 = T5.create()
+        self.assertRaises(ValueError, t5.save)
+
+    def test_save_only_no_data(self):
+        t5 = T5.create(val=1)
+        t5.val = 2
+        self.assertRaises(ValueError, t5.save, only=[])
+        t5_db = T5.get(T5.id == t5.id)
+        self.assertEqual(t5_db.val, 1)
+
+
+class TestDeleteInstance(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [User, Account, Tweet, Favorite, Relationship]
+
+    def setUp(self):
+        super(TestDeleteInstance, self).setUp()
+        with self.database.atomic():
+            huey = User.create(username='huey')
+            acct = Account.create(user=huey, email='huey@meow.com')
+            for content in ('meow', 'purr'):
+                Tweet.create(user=huey, content=content)
+            mickey = User.create(username='mickey')
+            woof = Tweet.create(user=mickey, content='woof')
+            Favorite.create(user=huey, tweet=woof)
+            Favorite.create(user=mickey,
+                            tweet=Tweet.create(user=huey, content='hiss'))
+
+    def test_delete_instance_recursive(self):
+        huey = User.get(User.username == 'huey')
+        a = []
+        for d in huey.dependencies():
+            a.append(d)
+        with self.assertQueryCount(5):
+            huey.delete_instance(recursive=True)
+
+        self.assertHistory(5, [
+            ('DELETE FROM "favorite" WHERE ("favorite"."user_id" = ?)',
+             [huey.id]),
+            ('DELETE FROM "favorite" WHERE ('
+             '"favorite"."tweet_id" IN ('
+             'SELECT "t1"."id" FROM "tweet" AS "t1" WHERE ('
+             '"t1"."user_id" = ?)))', [huey.id]),
+            ('DELETE FROM "tweet" WHERE ("tweet"."user_id" = ?)', [huey.id]),
+            ('UPDATE "account" SET "user_id" = ? '
+             'WHERE ("account"."user_id" = ?)',
+             [None, huey.id]),
+            ('DELETE FROM "users" WHERE ("users"."id" = ?)', [huey.id]),
+        ])
+
+        # Only one user left.
+        self.assertEqual(User.select().count(), 1)
+
+        # Huey's account has had the FK cleared out.
+        acct = Account.get(Account.email == 'huey@meow.com')
+        self.assertTrue(acct.user is None)
+
+        # Huey owned a favorite and one of huey's tweets was the other fav.
+        self.assertEqual(Favorite.select().count(), 0)
+
+        # The only tweet left is mickey's.
+        self.assertEqual(Tweet.select().count(), 1)
+        tweet = Tweet.get()
+        self.assertEqual(tweet.content, 'woof')
+
+    def test_delete_nullable(self):
+        huey = User.get(User.username == 'huey')
+        # Favorite -> Tweet -> User (other users' favorites of huey's tweets)
+        # Favorite -> User (huey's favorite tweets)
+        # Account -> User (huey's account)
+        # User ... for a total of 5. Favorite x2, Tweet, Account, User.
+        with self.assertQueryCount(5):
+            huey.delete_instance(recursive=True, delete_nullable=True)
+
+        # Get the last 5 delete queries.
+        self.assertHistory(5, [
+            ('DELETE FROM "favorite" WHERE ("favorite"."user_id" = ?)',
+             [huey.id]),
+            ('DELETE FROM "favorite" WHERE ('
+             '"favorite"."tweet_id" IN ('
+             'SELECT "t1"."id" FROM "tweet" AS "t1" WHERE ('
+             '"t1"."user_id" = ?)))', [huey.id]),
+            ('DELETE FROM "tweet" WHERE ("tweet"."user_id" = ?)', [huey.id]),
+            ('DELETE FROM "account" WHERE ("account"."user_id" = ?)',
+             [huey.id]),
+            ('DELETE FROM "users" WHERE ("users"."id" = ?)', [huey.id]),
+        ])
+
+        self.assertEqual(User.select().count(), 1)
+        self.assertEqual(Account.select().count(), 0)
+        self.assertEqual(Favorite.select().count(), 0)
+
+        self.assertEqual(Tweet.select().count(), 1)
+        tweet = Tweet.get()
+        self.assertEqual(tweet.content, 'woof')
+
+
+class CascadeParent(TestModel):
+    name = TextField()
+
+class CascadeChild(TestModel):
+    parent = ForeignKeyField(CascadeParent, backref='children',
+                             on_delete='CASCADE')
+    data = TextField()
+
+
+class TestCascadeDeleteIntegration(ModelTestCase):
+    requires = [CascadeParent, CascadeChild]
+
+    def setUp(self):
+        super(TestCascadeDeleteIntegration, self).setUp()
+        if IS_SQLITE:
+            self.database.pragma('foreign_keys', 1)
+
+    def test_cascade_delete(self):
+        p1 = CascadeParent.create(name='p1')
+        p2 = CascadeParent.create(name='p2')
+        CascadeChild.create(parent=p1, data='c1')
+        CascadeChild.create(parent=p1, data='c2')
+        CascadeChild.create(parent=p2, data='c3')
+
+        self.assertEqual(CascadeChild.select().count(), 3)
+        p1.delete_instance()
+        self.assertEqual(CascadeChild.select().count(), 1)
+        self.assertEqual(CascadeChild.get().data, 'c3')
+
+
+# ===========================================================================
+# Joins and aliases
+# ===========================================================================
 
 
 class TestJoinModelAlias(ModelTestCase):
@@ -2106,9 +2331,338 @@ class TestJoinModelAlias(ModelTestCase):
                 self.assertEqual(data, [('meow', 'huey'), ('purr', 'huey')])
 
 
-@skip_unless(
-    IS_POSTGRESQL or IS_MYSQL_ADVANCED_FEATURES or IS_SQLITE_25 or IS_CRDB,
-    'window function')
+class TestModelAliasFieldProperties(ModelTestCase):
+    database = get_in_memory_db()
+
+    def test_field_properties(self):
+        class Person(TestModel):
+            name = TextField()
+            dob = DateField()
+            class Meta:
+                database = self.database
+
+        class Job(TestModel):
+            worker = ForeignKeyField(Person, backref='jobs')
+            client = ForeignKeyField(Person, backref='jobs_hired')
+            class Meta:
+                database = self.database
+
+        Worker = Person.alias()
+        Client = Person.alias()
+
+        expected_sql = (
+            'SELECT "t1"."id", "t1"."worker_id", "t1"."client_id" '
+            'FROM "job" AS "t1" '
+            'INNER JOIN "person" AS "t2" ON ("t1"."client_id" = "t2"."id") '
+            'INNER JOIN "person" AS "t3" ON ("t1"."worker_id" = "t3"."id") '
+            'WHERE (date_part(?, "t2"."dob") = ?)')
+        expected_params = ['year', 1983]
+
+        query = (Job
+                 .select()
+                 .join(Client, on=(Job.client == Client.id))
+                 .switch(Job)
+                 .join(Worker, on=(Job.worker == Worker.id))
+                 .where(Client.dob.year == 1983))
+        self.assertSQL(query, expected_sql, expected_params)
+
+        query = (Job
+                 .select()
+                 .join(Client, on=(Job.client == Client.id))
+                 .switch(Job)
+                 .join(Person, on=(Job.worker == Person.id))
+                 .where(Client.dob.year == 1983))
+        self.assertSQL(query, expected_sql, expected_params)
+
+        query = (Job
+                 .select()
+                 .join(Person, on=(Job.client == Person.id))
+                 .switch(Job)
+                 .join(Worker, on=(Job.worker == Worker.id))
+                 .where(Person.dob.year == 1983))
+        self.assertSQL(query, expected_sql, expected_params)
+
+
+class TestJoinSubquery(ModelTestCase):
+    requires = [Person, Relationship]
+
+    def test_join_subquery(self):
+        # Set up some relationships such that there exists a relationship from
+        # the left-hand to the right-hand name.
+        data = (
+            ('charlie', None),
+            ('huey', 'charlie'),
+            ('mickey', 'charlie'),
+            ('zaizee', 'charlie'),
+            ('zaizee', 'huey'))
+        people = {}
+        def get_person(name):
+            if name not in people:
+                people[name] = Person.create(first=name, last=name,
+                                             dob=datetime.date(2017, 1, 1))
+            return people[name]
+
+        for person, related_to in data:
+            p1 = get_person(person)
+            if related_to is not None:
+                p2 = get_person(related_to)
+                Relationship.create(from_person=p1, to_person=p2)
+
+        # Create the subquery.
+        Friend = Person.alias('friend')
+        subq = (Relationship
+                .select(Friend.first.alias('friend_name'),
+                        Relationship.from_person)
+                .join(Friend, on=(Relationship.to_person == Friend.id))
+                .alias('subq'))
+
+        # Outer query does a LEFT OUTER JOIN. We join on the subquery because
+        # it uses an INNER JOIN, saving us doing two LEFT OUTER joins in the
+        # single query.
+        query = (Person
+                 .select(Person.first, subq.c.friend_name)
+                 .join(subq, JOIN.LEFT_OUTER,
+                       on=(Person.id == subq.c.from_person_id))
+                 .order_by(Person.first, subq.c.friend_name))
+        self.assertSQL(query, (
+            'SELECT "t1"."first", "subq"."friend_name" '
+            'FROM "person" AS "t1" '
+            'LEFT OUTER JOIN ('
+            'SELECT "friend"."first" AS "friend_name", "t2"."from_person_id" '
+            'FROM "relationship" AS "t2" '
+            'INNER JOIN "person" AS "friend" '
+            'ON ("t2"."to_person_id" = "friend"."id")) AS "subq" '
+            'ON ("t1"."id" = "subq"."from_person_id") '
+            'ORDER BY "t1"."first", "subq"."friend_name"'), [])
+
+        db_data = [row for row in query.tuples()]
+        self.assertEqual(db_data, list(data))
+
+
+class Task(TestModel):
+    heading = ForeignKeyField('self', backref='tasks', null=True)
+    project = ForeignKeyField('self', backref='projects', null=True)
+    title = TextField()
+    type = IntegerField()
+
+    PROJECT = 1
+    HEADING = 2
+
+
+class TestMultiSelfJoin(ModelTestCase):
+    requires = [Task]
+
+    def setUp(self):
+        super(TestMultiSelfJoin, self).setUp()
+
+        with self.database.atomic():
+            p_dev = Task.create(title='dev', type=Task.PROJECT)
+            p_p = Task.create(title='peewee', project=p_dev, type=Task.PROJECT)
+            p_h = Task.create(title='huey', project=p_dev, type=Task.PROJECT)
+
+            heading_data = (
+                ('peewee-1', p_p, 2),
+                ('peewee-2', p_p, 0),
+                ('huey-1', p_h, 1),
+                ('huey-2', p_h, 1))
+            for title, proj, n_subtasks in heading_data:
+                t = Task.create(title=title, project=proj, type=Task.HEADING)
+                for i in range(n_subtasks):
+                    Task.create(title='%s-%s' % (title, i + 1), project=proj,
+                                heading=t, type=Task.HEADING)
+
+    def test_multi_self_join(self):
+        Project = Task.alias()
+        Heading = Task.alias()
+        query = (Task
+                 .select(Task, Project, Heading)
+                 .join(Heading, JOIN.LEFT_OUTER,
+                       on=(Task.heading == Heading.id).alias('heading'))
+                 .switch(Task)
+                 .join(Project, JOIN.LEFT_OUTER,
+                       on=(Task.project == Project.id).alias('project'))
+                 .order_by(Task.id))
+
+        with self.assertQueryCount(1):
+            accum = []
+            for task in query:
+                h_title = task.heading.title if task.heading else None
+                p_title = task.project.title if task.project else None
+                accum.append((task.title, h_title, p_title))
+
+        self.assertEqual(accum, [
+            # title - heading - project
+            ('dev', None, None),
+            ('peewee', None, 'dev'),
+            ('huey', None, 'dev'),
+            ('peewee-1', None, 'peewee'),
+            ('peewee-1-1', 'peewee-1', 'peewee'),
+            ('peewee-1-2', 'peewee-1', 'peewee'),
+            ('peewee-2', None, 'peewee'),
+            ('huey-1', None, 'huey'),
+            ('huey-1-1', 'huey-1', 'huey'),
+            ('huey-2', None, 'huey'),
+            ('huey-2-1', 'huey-2', 'huey'),
+        ])
+
+
+class CJ_A(TestModel):
+    id = IntegerField(primary_key=True)
+class CJ_B(TestModel):
+    id = IntegerField(primary_key=True)
+class CJ_C(TestModel):
+    id = IntegerField(primary_key=True)
+    a = ForeignKeyField(CJ_A)
+    b = ForeignKeyField(CJ_B)
+
+class TestCrossJoin(ModelTestCase):
+    requires = [CJ_A, CJ_B, CJ_C]
+
+    def setUp(self):
+        super(TestCrossJoin, self).setUp()
+        CJ_A.insert_many([(1,), (2,), (3,)], fields=[CJ_A.id]).execute()
+        CJ_B.insert_many([(1,), (2,)], fields=[CJ_B.id]).execute()
+        CJ_C.insert_many([
+            (1, 1, 1),
+            (2, 1, 2),
+            (3, 2, 1)], fields=[CJ_C.id, CJ_C.a, CJ_C.b]).execute()
+
+    def test_cross_join(self):
+        query = (CJ_A
+                 .select(CJ_A.id.alias('aid'), CJ_B.id.alias('bid'))
+                 .join(CJ_B, JOIN.CROSS)
+                 .join(CJ_C, JOIN.LEFT_OUTER, on=(
+                     (CJ_C.a == CJ_A.id) &
+                     (CJ_C.b == CJ_B.id)))
+                 .where(CJ_C.id.is_null())
+                 .order_by(CJ_A.id, CJ_B.id))
+        self.assertEqual(list(query.tuples()), [(2, 2), (3, 1), (3, 2)])
+
+
+class Student(TestModel):
+    name = TextField()
+
+class Course(TestModel):
+    name = TextField()
+
+class Attendance(TestModel):
+    student = ForeignKeyField(Student)
+    course = ForeignKeyField(Course)
+
+
+class TestManyToManyJoining(ModelTestCase):
+    requires = [Student, Course, Attendance]
+
+    def setUp(self):
+        super(TestManyToManyJoining, self).setUp()
+
+        data = (
+            ('charlie', ('eng101', 'cs101', 'cs111')),
+            ('huey', ('cats1', 'cats2', 'cats3')),
+            ('zaizee', ('cats2', 'cats3')))
+        c = {}
+        with self.database.atomic():
+            for name, courses in data:
+                student = Student.create(name=name)
+                for course in courses:
+                    if course not in c:
+                        c[course] = Course.create(name=course)
+                    Attendance.create(student=student, course=c[course])
+
+    def assertQuery(self, query):
+        with self.assertQueryCount(1):
+            query = query.order_by(Attendance.id)
+            results = [(a.student.name, a.course.name) for a in query]
+            self.assertEqual(results, [
+                ('charlie', 'eng101'),
+                ('charlie', 'cs101'),
+                ('charlie', 'cs111'),
+                ('huey', 'cats1'),
+                ('huey', 'cats2'),
+                ('zaizee', 'cats2')])
+
+    def test_join_subquery(self):
+        courses = (Course
+                   .select(Course.id, Course.name)
+                   .order_by(Course.id)
+                   .limit(5))
+        query = (Attendance
+                 .select(Attendance, Student, courses.c.name)
+                 .join_from(Attendance, Student)
+                 .join_from(Attendance, courses,
+                            on=(Attendance.course == courses.c.id)))
+        self.assertQuery(query)
+
+    @skip_if(IS_MYSQL)
+    def test_join_where_subquery(self):
+        courses = Course.select().order_by(Course.id).limit(5)
+        query = (Attendance
+                 .select(Attendance, Student, Course)
+                 .join_from(Attendance, Student)
+                 .join_from(Attendance, Course)
+                 .where(Attendance.course.in_(courses)))
+        self.assertQuery(query)
+
+
+class Player(TestModel):
+    name = TextField()
+
+class Game(TestModel):
+    name = TextField()
+    player = ForeignKeyField(Player)
+
+class Score(TestModel):
+    game = ForeignKeyField(Game)
+    points = IntegerField()
+
+class TestJoinSubqueryAggregateViaLeftOuter(ModelTestCase):
+    requires = [Player, Game, Score]
+
+    def test_join_subquery_aggregate_left_outer(self):
+        with self.database.atomic():
+            p1, p2 = [Player.create(name=name) for name in ('p1', 'p2')]
+            games = []
+            for p in (p1, p2):
+                for gnum in (1, 2):
+                    g = Game.create(name='%s-g%s' % (p.name, gnum), player=p)
+                    games.append(g)
+
+            score_list = (
+                (10, 20, 30),
+                (),
+                (100, 110, 100),
+                (50, 50))
+            for g, plist in zip(games, score_list):
+                for p in plist:
+                    Score.create(game=g, points=p)
+
+        subq = (Game
+                .select(Game.player, fn.SUM(Score.points).alias('ptotal'),
+                        fn.AVG(Score.points).alias('pavg'))
+                .join(Score, JOIN.LEFT_OUTER)
+                .group_by(Game.player))
+        query = (Player
+                 .select(Player, subq.c.ptotal, subq.c.pavg)
+                 .join(subq, on=(Player.id == subq.c.player_id))
+                 .order_by(Player.name))
+
+        with self.assertQueryCount(1):
+            results = [(p.name, p.game.ptotal, p.game.pavg) for p in query]
+
+        self.assertEqual(results, [('p1', 60, 20), ('p2', 410, 82)])
+
+        with self.assertQueryCount(1):
+            obj_query = query.objects()
+            results = [(p.name, p.ptotal, p.pavg) for p in obj_query]
+
+        self.assertEqual(results, [('p1', 60, 20), ('p2', 410, 82)])
+
+
+# ===========================================================================
+# Advanced query features (window functions, tuples, compound selects, etc.)
+# ===========================================================================
+
+@skip_unless(not IS_SQLITE or IS_SQLITE_25, 'window functions')
 class TestWindowFunctionIntegration(ModelTestCase):
     requires = [Sample]
 
@@ -2357,8 +2911,9 @@ class TestWindowFunctionIntegration(ModelTestCase):
         self.assertEqual(list(query),
                          [(1, 1), (1, 2), (2, 3), (2, 4), (3, 5)])
 
+    @skip_if(IS_MYSQL, 'flaky on mysql')
     def test_sum_with_frame(self):
-        w = Window(order_by=[Sample.counter],
+        w = Window(order_by=[Sample.counter, Sample.value],
                    frame_type=Window.ROWS,
                    start=Window.preceding(1),
                    end=Window.CURRENT_ROW)
@@ -2377,13 +2932,14 @@ class TestWindowFunctionIntegration(ModelTestCase):
             (2, 4.0),  # 1 + 3
             (3, 103.0)])  # 3 + 100
 
+    @skip_if(IS_MYSQL, 'flaky on mysql')
     def test_lag_lead(self):
         query = (Sample
                  .select(Sample.counter,
-                         fn.LAG(Sample.value, 1).over(
-                             order_by=[Sample.counter]).alias('prev'),
-                         fn.LEAD(Sample.value, 1).over(
-                             order_by=[Sample.counter]).alias('next'))
+                         fn.LAG(Sample.value, 1).over(order_by=[
+                             Sample.counter, Sample.value]).alias('prev'),
+                         fn.LEAD(Sample.value, 1).over(order_by=[
+                             Sample.counter, Sample.value]).alias('next'))
                  .order_by(Sample.counter)
                  .tuples())
         results = list(query)
@@ -2393,402 +2949,483 @@ class TestWindowFunctionIntegration(ModelTestCase):
             (2, 20.0, 3.0),
             (2, 1.0, 100.0),
             (3, 3.0, None)])
-        #values = ((1, 10), (1, 20), (2, 1), (2, 3), (3, 100))
 
 
-@skip_if(IS_SQLITE or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
-@skip_unless(db.for_update, 'requires for update')
-class TestForUpdateIntegration(ModelTestCase):
+@skip_if(not IS_SQLITE_15, 'requires row-values')
+class TestTupleComparison(ModelTestCase):
+    requires = [User]
+
+    def test_tuples(self):
+        ua, ub, uc = [User.create(username=username) for username in 'abc']
+        query = User.select().where(
+            Tuple(User.username, User.id) == ('b', ub.id))
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
+            'WHERE (("t1"."username", "t1"."id") = (?, ?))'), ['b', ub.id])
+        self.assertEqual(query.count(), 1)
+        obj = query.get()
+        self.assertEqual(obj, ub)
+
+    def test_tuple_subquery(self):
+        ua, ub, uc = [User.create(username=username) for username in 'abc']
+        UA = User.alias()
+        subquery = (UA
+                    .select(UA.username, UA.id)
+                    .where(UA.username != 'b'))
+
+        query = (User
+                 .select(User.username)
+                 .where(Tuple(User.username, User.id).in_(subquery))
+                 .order_by(User.username))
+        self.assertEqual([u.username for u in query], ['a', 'c'])
+
+    @requires_models(CPK)
+    def test_row_value_composite_key(self):
+        CPK.insert_many([('k1', 1, 1), ('k2', 2, 2), ('k3', 3, 3)]).execute()
+
+        cpk = CPK.get(CPK._meta.primary_key == ('k2', 2))
+        self.assertEqual(cpk._pk, ('k2', 2))
+
+        cpk = CPK['k3', 3]
+        self.assertEqual(cpk._pk, ('k3', 3))
+
+        uq = CPK.update(extra=20).where(CPK._meta.primary_key != ('k2', 2))
+        uq.execute()
+
+        self.assertEqual(list(sorted(CPK.select().tuples())), [
+            ('k1', 1, 20), ('k2', 2, 2), ('k3', 3, 20)])
+
+
+class CNote(TestModel):
+    content = TextField()
+    timestamp = TimestampField()
+
+class CFile(TestModel):
+    filename = CharField(primary_key=True)
+    data = TextField()
+    timestamp = TimestampField()
+
+
+class TestCompoundSelectModels(ModelTestCase):
+    requires = [CFile, CNote]
+
+    def setUp(self):
+        super(TestCompoundSelectModels, self).setUp()
+        def generate_ts():
+            i = [0]
+            def _inner():
+                i[0] += 1
+                return datetime.datetime(2018, 1, i[0])
+            return _inner
+        make_ts = generate_ts()
+        self.ts = lambda i: datetime.datetime(2018, 1, i)
+
+        with self.database.atomic():
+            for i, content in enumerate(('note-a', 'note-b', 'note-c'), 1):
+                CNote.create(id=i, content=content, timestamp=make_ts())
+
+            file_data = (
+                ('peewee.txt', 'peewee orm'),
+                ('walrus.txt', 'walrus redis toolkit'),
+                ('huey.txt', 'huey task queue'))
+            for filename, data in file_data:
+                CFile.create(filename=filename, data=data, timestamp=make_ts())
+
+    def test_mix_models_with_model_row_type(self):
+        cast = 'CHAR' if IS_MYSQL else 'TEXT'
+        lhs = CNote.select(CNote.id.cast(cast).alias('id_text'),
+                           CNote.content, CNote.timestamp)
+        rhs = CFile.select(CFile.filename, CFile.data, CFile.timestamp)
+        query = (lhs | rhs).order_by(SQL('timestamp')).limit(4)
+
+        data = [(n.id_text, n.content, n.timestamp) for n in query]
+        self.assertEqual(data, [
+            ('1', 'note-a', self.ts(1)),
+            ('2', 'note-b', self.ts(2)),
+            ('3', 'note-c', self.ts(3)),
+            ('peewee.txt', 'peewee orm', self.ts(4))])
+
+    def test_mixed_models_tuple_row_type(self):
+        cast = 'CHAR' if IS_MYSQL else 'TEXT'
+        lhs = CNote.select(CNote.id.cast(cast).alias('id'),
+                           CNote.content, CNote.timestamp)
+        rhs = CFile.select(CFile.filename, CFile.data, CFile.timestamp)
+        query = (lhs | rhs).order_by(SQL('timestamp')).limit(5)
+
+        self.assertEqual(list(query.tuples()), [
+            ('1', 'note-a', self.ts(1)),
+            ('2', 'note-b', self.ts(2)),
+            ('3', 'note-c', self.ts(3)),
+            ('peewee.txt', 'peewee orm', self.ts(4)),
+            ('walrus.txt', 'walrus redis toolkit', self.ts(5))])
+
+    def test_mixed_models_dict_row_type(self):
+        notes = CNote.select(CNote.content, CNote.timestamp)
+        files = CFile.select(CFile.filename, CFile.timestamp)
+
+        query = (notes | files).order_by(SQL('timestamp').desc()).limit(4)
+        self.assertEqual(list(query.dicts()), [
+            {'content': 'huey.txt', 'timestamp': self.ts(6)},
+            {'content': 'walrus.txt', 'timestamp': self.ts(5)},
+            {'content': 'peewee.txt', 'timestamp': self.ts(4)},
+            {'content': 'note-c', 'timestamp': self.ts(3)}])
+
+
+def _create_users_tweets(db):
+    data = (
+        ('huey', ('meow', 'hiss', 'purr')),
+        ('mickey', ('woof', 'bark')),
+        ('zaizee', ()))
+    with db.atomic():
+        for username, tweets in data:
+            user = User.create(username=username)
+            for tweet in tweets:
+                Tweet.create(user=user, content=tweet)
+
+
+class TestSubqueryInSelect(ModelTestCase):
     requires = [User, Tweet]
 
     def setUp(self):
-        super(TestForUpdateIntegration, self).setUp()
-        self.alt_db = new_connection()
-        class AltUser(User):
-            class Meta:
-                database = self.alt_db
-                table_name = User._meta.table_name
-        class AltTweet(Tweet):
-            class Meta:
-                database = self.alt_db
-                table_name = Tweet._meta.table_name
-        self.AltUser = AltUser
-        self.AltTweet = AltTweet
+        super(TestSubqueryInSelect, self).setUp()
+        _create_users_tweets(self.database)
 
-    def tearDown(self):
-        self.alt_db.close()
-        super(TestForUpdateIntegration, self).tearDown()
+    def test_subquery_in_select(self):
+        subq = User.select().where(User.username == 'huey')
+        query = (Tweet
+                 .select(Tweet.content, Tweet.user.in_(subq).alias('is_huey'))
+                 .order_by(Tweet.content))
+        self.assertEqual([(r.content, r.is_huey) for r in query], [
+            ('bark', False),
+            ('hiss', True),
+            ('meow', True),
+            ('purr', True),
+            ('woof', False)])
 
-    @skip_if(IS_CRDB, 'crdb locks-up on this test, blocking reads')
-    def test_for_update(self):
+
+class TUser(TestModel):
+    username = TextField()
+
+
+class Transaction(TestModel):
+    user = ForeignKeyField(TUser, backref='transactions')
+    amount = FloatField(default=0.)
+
+
+class TestSumCase(ModelTestCase):
+    @requires_models(User)
+    def test_sum_case(self):
+        for username in ('charlie', 'huey', 'zaizee'):
+            User.create(username=username)
+
+        case = Case(None, [(User.username.endswith('e'), 1)], 0)
+        e_sum = fn.SUM(case)
+        query = (User
+                 .select(User.username, e_sum.alias('e_sum'))
+                 .group_by(User.username)
+                 .order_by(User.username))
+        self.assertSQL(query, (
+            'SELECT "t1"."username", '
+            'SUM(CASE WHEN ("t1"."username" ILIKE ?) THEN ? ELSE ? END) '
+            'AS "e_sum" '
+            'FROM "users" AS "t1" '
+            'GROUP BY "t1"."username" '
+            'ORDER BY "t1"."username"'), ['%e', 1, 0])
+
+        data = [(user.username, user.e_sum) for user in query]
+        self.assertEqual(data, [
+            ('charlie', 1),
+            ('huey', 0),
+            ('zaizee', 1)])
+
+
+class TestMaxAlias(ModelTestCase):
+    requires = [Transaction, TUser]
+
+    def test_max_alias(self):
         with self.database.atomic():
-            User.create(username='huey')
-            zaizee = User.create(username='zaizee')
+            charlie = TUser.create(username='charlie')
+            huey = TUser.create(username='huey')
 
-        AltUser = self.AltUser
-
-        with self.database.manual_commit():
-            self.database.begin()
-            users = (User.select().where(User.username == 'zaizee')
-                     .for_update()
-                     .execute())
-            updated = (User
-                       .update(username='ziggy')
-                       .where(User.username == 'zaizee')
-                       .execute())
-            self.assertEqual(updated, 1)
-
-            if IS_POSTGRESQL:
-                nrows = (AltUser
-                         .update(username='huey-x')
-                         .where(AltUser.username == 'huey')
-                         .execute())
-                self.assertEqual(nrows, 1)
-
-            query = (AltUser
-                     .select(AltUser.username)
-                     .where(AltUser.id == zaizee.id))
-            self.assertEqual(query.get().username, 'zaizee')
-
-            self.database.commit()
-            self.assertEqual(query.get().username, 'ziggy')
-
-    def test_for_update_blocking(self):
-        User.create(username='u1')
-
-        AltUser = self.AltUser
-        evt = threading.Event()
-        def run_in_thread():
-            with self.alt_db.atomic():
-                evt.wait()
-                n = (AltUser.update(username='u1-y')
-                     .where(AltUser.username == 'u1')
-                     .execute())
-                self.assertEqual(n, 0)
-
-        t = threading.Thread(target=run_in_thread)
-        t.daemon = True
-        t.start()
-
-        with self.database.atomic() as txn:
-            q = (User.select()
-                 .where(User.username == 'u1')
-                 .for_update()
-                 .execute())
-            evt.set()
-
-            n = (User.update(username='u1-x')
-                 .where(User.username == 'u1')
-                 .execute())
-            self.assertEqual(n, 1)
-
-        t.join(timeout=5)
-        u = User.get()
-        self.assertEqual(u.username, 'u1-x')
-
-    def test_for_update_nested(self):
-        User.insert_many([(u,) for u in 'abc']).execute()
-        subq = User.select().where(User.username != 'b').for_update()
-        nrows = (User
-                 .delete()
-                 .where(User.id.in_(subq))
-                 .execute())
-        self.assertEqual(nrows, 2)
-
-    def test_for_update_nowait(self):
-        User.create(username='huey')
-        zaizee = User.create(username='zaizee')
-
-        AltUser = self.AltUser
-
-        with self.database.manual_commit():
-            self.database.begin()
-            users = (User
-                     .select(User.username)
-                     .where(User.username == 'zaizee')
-                     .for_update(nowait=True)
-                     .execute())
-
-            def will_fail():
-                return (AltUser
-                        .select()
-                        .where(AltUser.username == 'zaizee')
-                        .for_update(nowait=True)
-                        .get())
-
-            self.assertRaises((OperationalError, InternalError), will_fail)
-            self.database.commit()
-
-    @requires_postgresql
-    @requires_models(User, Tweet)
-    def test_for_update_of(self):
-        h = User.create(username='huey')
-        z = User.create(username='zaizee')
-        Tweet.create(user=h, content='h')
-        Tweet.create(user=z, content='z')
-
-        AltUser, AltTweet = self.AltUser, self.AltTweet
-
-        with self.database.manual_commit():
-            self.database.begin()
-            # Lock tweets by huey.
-            query = (Tweet
-                     .select()
-                     .join(User)
-                     .where(User.username == 'huey')
-                     .for_update(of=Tweet, nowait=True))
-            qr = query.execute()
-
-            # No problem updating zaizee's tweet or huey's user.
-            nrows = (AltTweet
-                     .update(content='zx')
-                     .where(AltTweet.user == z.id)
-                     .execute())
-            self.assertEqual(nrows, 1)
-
-            nrows = (AltUser
-                     .update(username='huey-x')
-                     .where(AltUser.username == 'huey')
-                     .execute())
-            self.assertEqual(nrows, 1)
-
-            def will_fail():
-                (AltTweet
-                 .select()
-                 .where(AltTweet.user == h)
-                 .for_update(nowait=True)
-                 .get())
-            self.assertRaises((OperationalError, InternalError), will_fail)
-
-            self.database.commit()
-
-        query = Tweet.select(Tweet, User).join(User).order_by(Tweet.id)
-        self.assertEqual([(t.content, t.user.username) for t in query],
-                         [('h', 'huey-x'), ('zx', 'zaizee')])
-
-
-class ServerDefault(TestModel):
-    timestamp = DateTimeField(constraints=[SQL('default (now())')])
-
-
-@requires_postgresql
-class TestReturningIntegration(ModelTestCase):
-    requires = [User]
-
-    def test_simple_returning(self):
-        query = User.insert(username='charlie')
-        self.assertSQL(query, (
-            'INSERT INTO "users" ("username") VALUES (?) '
-            'RETURNING "users"."id"'),
-            ['charlie'])
-
-        self.assertEqual(query.execute(), 1)
-
-        # By default returns a tuple.
-        query = User.insert(username='huey')
-        self.assertEqual(query.execute(), 2)
-        self.assertEqual(list(query), [(2,)])
-
-        # If we specify a returning clause we get user instances.
-        query = User.insert(username='snoobie').returning(User)
-        query.execute()
-        self.assertEqual([x.username for x in query], ['snoobie'])
-
-        query = (User
-                 .insert(username='zaizee')
-                 .returning(User.id, User.username)
-                 .dicts())
-        self.assertSQL(query, (
-            'INSERT INTO "users" ("username") VALUES (?) '
-            'RETURNING "users"."id", "users"."username"'), ['zaizee'])
-
-        cursor = query.execute()
-        row, = list(cursor)
-        self.assertEqual(row, {'id': 4, 'username': 'zaizee'})
-
-        query = (User
-                 .insert(username='mickey')
-                 .returning(User)
-                 .objects())
-        self.assertSQL(query, (
-            'INSERT INTO "users" ("username") VALUES (?) '
-            'RETURNING "users"."id", "users"."username"'), ['mickey'])
-        cursor = query.execute()
-        row, = list(cursor)
-        self.assertEqual(row.id, 5)
-        self.assertEqual(row.username, 'mickey')
-
-        # Can specify aliases.
-        query = (User
-                 .insert(username='sipp')
-                 .returning(User.username.alias('new_username')))
-        self.assertEqual([x.new_username for x in query.execute()], ['sipp'])
-
-        # Minimal test with insert_many.
-        query = User.insert_many([('u7',), ('u8',)])
-        self.assertEqual([r for r, in query.execute()], [7, 8])
-
-        # Test with insert / on conflict.
-        query = (User
-                 .insert_many([(7, 'u7',), (9, 'u9',)],
-                              [User.id, User.username])
-                 .on_conflict(conflict_target=[User.id],
-                              update={User.username: User.username + 'x'})
-                 .returning(User))
-        self.assertEqual([(x.id, x.username) for x in query],
-                         [(7, 'u7x'), (9, 'u9')])
-
-    def test_simple_returning_insert_update_delete(self):
-        res = User.insert(username='charlie').returning(User).execute()
-        self.assertEqual([u.username for u in res], ['charlie'])
-
-        res = (User
-               .update(username='charlie2')
-               .where(User.id == 1)
-               .returning(User)
-               .execute())
-        # Subsequent iterations are cached.
-        for _ in range(2):
-            self.assertEqual([u.username for u in res], ['charlie2'])
-
-        res = (User
-               .delete()
-               .where(User.id == 1)
-               .returning(User)
-               .execute())
-        # Subsequent iterations are cached.
-        for _ in range(2):
-            self.assertEqual([u.username for u in res], ['charlie2'])
-
-    def test_simple_insert_update_delete_no_returning(self):
-        query = User.insert(username='charlie')
-        self.assertEqual(query.execute(), 1)
-
-        query = User.insert(username='huey')
-        self.assertEqual(query.execute(), 2)
-
-        query = User.update(username='huey2').where(User.username == 'huey')
-        self.assertEqual(query.execute(), 1)
-        self.assertEqual(query.execute(), 0)  # No rows updated!
-
-        query = User.delete().where(User.username == 'huey2')
-        self.assertEqual(query.execute(), 1)
-        self.assertEqual(query.execute(), 0)  # No rows updated!
-
-    @requires_models(ServerDefault)
-    def test_returning_server_defaults(self):
-        query = (ServerDefault
-                 .insert()
-                 .returning(ServerDefault.id, ServerDefault.timestamp))
-        self.assertSQL(query, (
-            'INSERT INTO "server_default" '
-            'DEFAULT VALUES '
-            'RETURNING "server_default"."id", "server_default"."timestamp"'),
-            [])
+            data = (
+                (charlie, 10.),
+                (charlie, 20.),
+                (charlie, 30.),
+                (huey, 1.5),
+                (huey, 2.5))
+            for user, amount in data:
+                Transaction.create(user=user, amount=amount)
 
         with self.assertQueryCount(1):
-            cursor = query.dicts().execute()
-            row, = list(cursor)
+            amount = fn.MAX(Transaction.amount).alias('amount')
+            query = (Transaction
+                     .select(amount, TUser.username)
+                     .join(TUser)
+                     .group_by(TUser.username)
+                     .order_by(TUser.username))
+            data = [(txn.amount, txn.user.username) for txn in query]
 
-        self.assertTrue(row['timestamp'] is not None)
+        self.assertEqual(data, [
+            (30., 'charlie'),
+            (2.5, 'huey')])
 
-        obj = ServerDefault.get(ServerDefault.id == row['id'])
-        self.assertEqual(obj.timestamp, row['timestamp'])
 
-    def test_no_return(self):
-        query = User.insert(username='huey').returning()
-        self.assertIsNone(query.execute())
+class Datum(TestModel):
+    key = TextField()
+    value = IntegerField(null=True)
 
-        user = User.get(User.username == 'huey')
-        self.assertEqual(user.username, 'huey')
-        self.assertTrue(user.id >= 1)
+class TestNullOrdering(ModelTestCase):
+    requires = [Datum]
 
-    @requires_models(Category)
-    def test_non_int_pk_returning(self):
-        query = Category.insert(name='root')
-        self.assertSQL(query, (
-            'INSERT INTO "category" ("name") VALUES (?) '
-            'RETURNING "category"."name"'), ['root'])
+    def test_null_ordering(self):
+        values = [('k1', 1), ('ka', None), ('k2', 2), ('kb', None)]
+        Datum.insert_many(values, fields=[Datum.key, Datum.value]).execute()
 
-        self.assertEqual(query.execute(), 'root')
+        def assertOrder(ordering, expected):
+            query = Datum.select().order_by(*ordering)
+            self.assertEqual([d.key for d in query], expected)
 
-    def test_returning_multi(self):
-        data = [{'username': 'huey'}, {'username': 'mickey'}]
-        query = User.insert_many(data)
-        self.assertSQL(query, (
-            'INSERT INTO "users" ("username") VALUES (?), (?) '
-            'RETURNING "users"."id"'), ['huey', 'mickey'])
+        # Ascending order.
+        nulls_last = (Datum.value.asc(nulls='last'), Datum.key)
+        assertOrder(nulls_last, ['k1', 'k2', 'ka', 'kb'])
 
-        data = query.execute()
+        nulls_first = (Datum.value.asc(nulls='first'), Datum.key)
+        assertOrder(nulls_first, ['ka', 'kb', 'k1', 'k2'])
 
-        # Check that the result wrapper is correctly set up.
-        self.assertTrue(len(data.select) == 1 and data.select[0] is User.id)
-        self.assertEqual(list(data), [(1,), (2,)])
+        # Descending order.
+        nulls_last = (Datum.value.desc(nulls='last'), Datum.key)
+        assertOrder(nulls_last, ['k2', 'k1', 'ka', 'kb'])
+
+        nulls_first = (Datum.value.desc(nulls='first'), Datum.key)
+        assertOrder(nulls_first, ['ka', 'kb', 'k2', 'k1'])
+
+        # Invalid values.
+        self.assertRaises(ValueError, Datum.value.desc, nulls='bar')
+        self.assertRaises(ValueError, Datum.value.asc, nulls='foo')
+
+
+class TestColumnNameStripping(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [Person]
+
+    def test_column_name_stripping(self):
+        d1 = datetime.date(1990, 1, 1)
+        d2 = datetime.date(1990, 1, 1)
+        p1 = Person.create(first='f1', last='l1', dob=d1)
+        p2 = Person.create(first='f2', last='l2', dob=d2)
+
+        query = Person.select(
+            fn.MIN(Person.dob),
+            fn.MAX(Person.dob).alias('mdob'))
+        # Get the row as a model.
+        row = query.get()
+        self.assertEqual(row.dob, d1)
+        self.assertEqual(row.mdob, d2)
+
+        row = query.dicts().get()
+        self.assertEqual(row['dob'], d1)
+        self.assertEqual(row['mdob'], d2)
+
+
+class TestSelectValueConversion(ModelTestCase):
+    requires = [User]
+
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL)
+    def test_select_value_conversion(self):
+        u1 = User.create(username='u1')
+        cte = User.select(User.id.cast('text')).cte('tmp', columns=('id',))
+
+        query = User.select(cte.c.id.alias('id')).with_cte(cte).from_(cte)
+        u1_id, = [user.id for user in query]
+        self.assertEqual(u1_id, u1.id)
+
+        query2 = User.select(cte.c.id.coerce(False)).with_cte(cte).from_(cte)
+        u1_id, = [user.id for user in query2]
+        self.assertEqual(u1_id, str(u1.id))
+
+
+class TestOrWhere(ModelTestCase):
+    requires = [User]
+
+    def test_orwhere(self):
+        User.insert_many([{'username': u} for u in
+                          ('huey', 'mickey', 'zaizee')]).execute()
+        query = (User
+                 .select()
+                 .orwhere(User.username == 'huey')
+                 .orwhere(User.username == 'zaizee')
+                 .order_by(User.username))
+        self.assertEqual([u.username for u in query], ['huey', 'zaizee'])
+
+    def test_where_then_orwhere(self):
+        User.insert_many([{'username': u} for u in
+                          ('huey', 'mickey', 'zaizee')]).execute()
+        # where + orwhere: the where is OR'd with subsequent orwhere calls.
+        query = (User
+                 .select()
+                 .where(User.username == 'huey')
+                 .orwhere(User.username == 'zaizee')
+                 .order_by(User.username))
+        self.assertEqual([u.username for u in query], ['huey', 'zaizee'])
+
+
+class TestEnsureJoin(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_ensure_join_noop(self):
+        u = User.create(username='huey')
+        Tweet.create(user=u, content='meow')
 
         query = (User
-                 .insert_many([{'username': 'foo'},
-                               {'username': 'bar'},
-                               {'username': 'baz'}])
-                 .returning(User.id, User.username)
-                 .namedtuples())
-        data = query.execute()
-        self.assertEqual([(row.id, row.username) for row in data], [
-            (3, 'foo'),
-            (4, 'bar'),
-            (5, 'baz')])
+                 .select(User, Tweet.content)
+                 .join(Tweet)
+                 .switch(User)
+                 .ensure_join(User, Tweet))
+        with self.assertQueryCount(1):
+            result = [(row.username, row.tweet.content) for row in query]
+            self.assertEqual(result, [('huey', 'meow')])
 
-    @requires_models(Category)
-    def test_returning_query(self):
-        for name in ('huey', 'mickey', 'zaizee'):
-            Category.create(name=name)
-
-        source = Category.select(Category.name).order_by(Category.name)
-        query = User.insert_from(source, (User.username,))
-        self.assertSQL(query, (
-            'INSERT INTO "users" ("username") '
-            'SELECT "t1"."name" FROM "category" AS "t1" ORDER BY "t1"."name" '
-            'RETURNING "users"."id"'), [])
-
-        data = query.execute()
-
-        # Check that the result wrapper is correctly set up.
-        self.assertTrue(len(data.select) == 1 and data.select[0] is User.id)
-        self.assertEqual(list(data), [(1,), (2,), (3,)])
-
-    def test_update_returning(self):
-        id_list = User.insert_many([{'username': 'huey'},
-                                    {'username': 'zaizee'}]).execute()
-        huey_id, zaizee_id = [pk for pk, in id_list]
+    def test_ensure_join_adds_when_missing(self):
+        u = User.create(username='huey')
+        Tweet.create(user=u, content='meow')
 
         query = (User
-                 .update(username='ziggy')
-                 .where(User.username == 'zaizee')
-                 .returning(User.id, User.username))
-        self.assertSQL(query, (
-            'UPDATE "users" SET "username" = ? '
-            'WHERE ("users"."username" = ?) '
-            'RETURNING "users"."id", "users"."username"'), ['ziggy', 'zaizee'])
-        data = query.execute()
-        user = data[0]
-        self.assertEqual(user.username, 'ziggy')
-        self.assertEqual(user.id, zaizee_id)
+                 .select(User, Tweet.content)
+                 .ensure_join(User, Tweet))
+        with self.assertQueryCount(1):
+            result = [(row.username, row.tweet.content) for row in query]
+            self.assertEqual(result, [('huey', 'meow')])
 
-    def test_delete_returning(self):
-        id_list = User.insert_many([{'username': 'huey'},
-                                    {'username': 'zaizee'}]).execute()
-        huey_id, zaizee_id = [pk for pk, in id_list]
 
-        query = (User
-                 .delete()
-                 .where(User.username == 'zaizee')
-                 .returning(User.id, User.username))
-        self.assertSQL(query, (
-            'DELETE FROM "users" WHERE ("users"."username" = ?) '
-            'RETURNING "users"."id", "users"."username"'), ['zaizee'])
-        data = query.execute()
-        user = data[0]
-        self.assertEqual(user.username, 'zaizee')
-        self.assertEqual(user.id, zaizee_id)
+class TestScalarIntegration(ModelTestCase):
+    requires = [User, Sample]
+
+    @requires_models(User)
+    def test_scalar(self):
+        for u in ('huey', 'mickey', 'zaizee'):
+            User.create(username=u)
+        count = User.select(fn.COUNT(User.id)).scalar()
+        self.assertEqual(count, 3)
+
+    @requires_models(User)
+    def test_scalar_as_tuple(self):
+        for u in ('huey', 'mickey', 'zaizee'):
+            User.create(username=u)
+        count, mx = (User
+                     .select(fn.COUNT(User.id), fn.MAX(User.id))
+                     .scalar(as_tuple=True))
+        self.assertEqual(count, 3)
+        self.assertTrue(mx > 0)
+
+    @requires_models(User)
+    def test_scalar_as_dict(self):
+        for u in ('huey', 'mickey', 'zaizee'):
+            User.create(username=u)
+        result = (User
+                  .select(fn.COUNT(User.id).alias('ct'))
+                  .scalar(as_dict=True))
+        self.assertEqual(result, {'ct': 3})
+
+    @requires_models(Sample)
+    def test_scalar_empty_result(self):
+        val = (Sample
+               .select(fn.MAX(Sample.value))
+               .scalar())
+        self.assertTrue(val is None)
+
+
+class TestExistsIntegration(ModelTestCase):
+    requires = [User]
+
+    @requires_models(User)
+    def test_exists_true(self):
+        User.create(username='huey')
+        self.assertTrue(
+            User.select().where(User.username == 'huey').exists())
+
+        self.assertFalse(
+            User.select().where(User.username == 'nobody').exists())
+
+
+class VL(TestModel):
+    n = IntegerField()
+    s = CharField()
+
+
+@skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB)
+class TestValuesListIntegration(ModelTestCase):
+    requires = [VL]
+    _data = [(1, 'one'), (2, 'two'), (3, 'three')]
+
+    def test_insert_into_select_from_vl(self):
+        vl = ValuesList(self._data)
+        cte = vl.cte('newvals', columns=['n', 's'])
+        res = (VL
+               .insert_from(cte.select(cte.c.n, cte.c.s), fields=[VL.n, VL.s])
+               .with_cte(cte)
+               .execute())
+
+        vq = VL.select().order_by(VL.n)
+        self.assertEqual([(v.n, v.s) for v in vq], self._data)
+
+    def test_update_vl_cte(self):
+        VL.insert_many(self._data).execute()
+
+        new_values = [(1, 'One'), (3, 'Three'), (4, 'Four')]
+        cte = ValuesList(new_values).cte('new_values', columns=('n', 's'))
+
+        # We have to use a subquery to update the individual column, as SQLite
+        # does not support UPDATE/FROM syntax.
+        subq = (cte
+                .select(cte.c.s)
+                .where(VL.n == cte.c.n))
+
+        # Perform the update, assigning extra the new value from the values
+        # list, and restricting the overall update using the composite pk.
+        res = (VL
+               .update(s=subq)
+               .where(VL.n.in_(cte.select(cte.c.n)))
+               .with_cte(cte)
+               .execute())
+
+        vq = VL.select().order_by(VL.n)
+        self.assertEqual([(v.n, v.s) for v in vq], [
+            (1, 'One'), (2, 'two'), (3, 'Three')])
+
+    def test_values_list(self):
+        vl = ValuesList(self._data)
+
+        query = vl.select(SQL('*'))
+        self.assertEqual(list(query.tuples().bind(self.database)), self._data)
+
+    @requires_postgresql
+    def test_values_list_named_columns(self):
+        vl = ValuesList(self._data).columns('idx', 'name')
+        query = (vl
+                 .select(vl.c.idx, vl.c.name)
+                 .order_by(vl.c.idx.desc()))
+        self.assertEqual(list(query.tuples().bind(self.database)),
+                         self._data[::-1])
+
+    def test_values_list_named_columns_in_cte(self):
+        vl = ValuesList(self._data)
+        cte = vl.cte('val', columns=('idx', 'name'))
+        query = (cte
+                 .select(cte.c.idx, cte.c.name)
+                 .order_by(cte.c.idx.desc())
+                 .with_cte(cte))
+        self.assertEqual(list(query.tuples().bind(self.database)),
+                         self._data[::-1])
+
+    def test_named_values_list(self):
+        vl = ValuesList(self._data).alias('vl')
+        query = vl.select()
+        self.assertEqual(list(query.tuples().bind(self.database)), self._data)
+
+
+# ===========================================================================
+# Common Table Expressions (CTE)
+# ===========================================================================
 
 
 class Member(TestModel):
@@ -3077,594 +3714,134 @@ class TestCTEIntegration(ModelTestCase):
         self.assertEqual(result, 50.0)
 
 
-@skip_if(not IS_SQLITE_15, 'requires row-values')
-class TestTupleComparison(ModelTestCase):
-    requires = [User]
-
-    def test_tuples(self):
-        ua, ub, uc = [User.create(username=username) for username in 'abc']
-        query = User.select().where(
-            Tuple(User.username, User.id) == ('b', ub.id))
-        self.assertSQL(query, (
-            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
-            'WHERE (("t1"."username", "t1"."id") = (?, ?))'), ['b', ub.id])
-        self.assertEqual(query.count(), 1)
-        obj = query.get()
-        self.assertEqual(obj, ub)
-
-    def test_tuple_subquery(self):
-        ua, ub, uc = [User.create(username=username) for username in 'abc']
-        UA = User.alias()
-        subquery = (UA
-                    .select(UA.username, UA.id)
-                    .where(UA.username != 'b'))
-
-        query = (User
-                 .select(User.username)
-                 .where(Tuple(User.username, User.id).in_(subquery))
-                 .order_by(User.username))
-        self.assertEqual([u.username for u in query], ['a', 'c'])
-
-    @requires_models(CPK)
-    def test_row_value_composite_key(self):
-        CPK.insert_many([('k1', 1, 1), ('k2', 2, 2), ('k3', 3, 3)]).execute()
-
-        cpk = CPK.get(CPK._meta.primary_key == ('k2', 2))
-        self.assertEqual(cpk._pk, ('k2', 2))
-
-        cpk = CPK['k3', 3]
-        self.assertEqual(cpk._pk, ('k3', 3))
-
-        uq = CPK.update(extra=20).where(CPK._meta.primary_key != ('k2', 2))
-        uq.execute()
-
-        self.assertEqual(list(sorted(CPK.select().tuples())), [
-            ('k1', 1, 20), ('k2', 2, 2), ('k3', 3, 20)])
-
-
-class TestModelGraph(BaseTestCase):
-    def test_bind_model_database(self):
-        class User(Model): pass
-        class Tweet(Model):
-            user = ForeignKeyField(User)
-        class Relationship(Model):
-            from_user = ForeignKeyField(User, backref='relationships')
-            to_user = ForeignKeyField(User, backref='related_to')
-        class Flag(Model):
-            tweet = ForeignKeyField(Tweet)
-        class Unrelated(Model): pass
-
-        fake_db = SqliteDatabase(None)
-        User.bind(fake_db)
-        for model in (User, Tweet, Relationship, Flag):
-            self.assertTrue(model._meta.database is fake_db)
-        self.assertTrue(Unrelated._meta.database is None)
-        User.bind(None)
-
-        with User.bind_ctx(fake_db) as (FUser,):
-            self.assertTrue(FUser._meta.database is fake_db)
-            self.assertTrue(Unrelated._meta.database is None)
-
-        self.assertTrue(User._meta.database is None)
-
-
-class TestFieldInheritance(BaseTestCase):
-    def test_field_inheritance(self):
-        class BaseModel(Model):
-            class Meta:
-                database = get_in_memory_db()
-
-        class BasePost(BaseModel):
-            content = TextField()
-            timestamp = TimestampField()
-
-        class Photo(BasePost):
-            image = TextField()
-
-        class Note(BasePost):
-            category = TextField()
-
-        self.assertEqual(BasePost._meta.sorted_field_names,
-                         ['id', 'content', 'timestamp'])
-        self.assertEqual(BasePost._meta.sorted_fields, [
-            BasePost.id,
-            BasePost.content,
-            BasePost.timestamp])
-
-        self.assertEqual(Photo._meta.sorted_field_names,
-                         ['id', 'content', 'timestamp', 'image'])
-        self.assertEqual(Photo._meta.sorted_fields, [
-            Photo.id,
-            Photo.content,
-            Photo.timestamp,
-            Photo.image])
-
-        self.assertEqual(Note._meta.sorted_field_names,
-                         ['id', 'content', 'timestamp', 'category'])
-        self.assertEqual(Note._meta.sorted_fields, [
-            Note.id,
-            Note.content,
-            Note.timestamp,
-            Note.category])
-
-        self.assertTrue(id(Photo.id) != id(Note.id))
-
-    def test_foreign_key_field_inheritance(self):
-        class BaseModel(Model):
-            class Meta:
-                database = get_in_memory_db()
-
-        class Category(BaseModel):
-            name = TextField()
-
-        class BasePost(BaseModel):
-            category = ForeignKeyField(Category)
-            timestamp = TimestampField()
-
-        class Photo(BasePost):
-            image = TextField()
-
-        class Note(BasePost):
-            content = TextField()
-
-        self.assertEqual(BasePost._meta.sorted_field_names,
-                         ['id', 'category', 'timestamp'])
-        self.assertEqual(BasePost._meta.sorted_fields, [
-            BasePost.id,
-            BasePost.category,
-            BasePost.timestamp])
-
-        self.assertEqual(Photo._meta.sorted_field_names,
-                         ['id', 'category', 'timestamp', 'image'])
-        self.assertEqual(Photo._meta.sorted_fields, [
-            Photo.id,
-            Photo.category,
-            Photo.timestamp,
-            Photo.image])
-
-        self.assertEqual(Note._meta.sorted_field_names,
-                         ['id', 'category', 'timestamp', 'content'])
-        self.assertEqual(Note._meta.sorted_fields, [
-            Note.id,
-            Note.category,
-            Note.timestamp,
-            Note.content])
-
-        self.assertEqual(Category._meta.backrefs, {
-            BasePost.category: BasePost,
-            Photo.category: Photo,
-            Note.category: Note})
-        self.assertEqual(BasePost._meta.refs, {BasePost.category: Category})
-        self.assertEqual(Photo._meta.refs, {Photo.category: Category})
-        self.assertEqual(Note._meta.refs, {Note.category: Category})
-
-        self.assertEqual(BasePost.category.backref, 'basepost_set')
-        self.assertEqual(Photo.category.backref, 'photo_set')
-        self.assertEqual(Note.category.backref, 'note_set')
-
-    def test_foreign_key_pk_inheritance(self):
-        class BaseModel(Model):
-            class Meta:
-                database = get_in_memory_db()
-        class Account(BaseModel): pass
-        class BaseUser(BaseModel):
-            account = ForeignKeyField(Account, primary_key=True)
-        class User(BaseUser):
-            username = TextField()
-        class Admin(BaseUser):
-            role = TextField()
-
-        self.assertEqual(Account._meta.backrefs, {
-            Admin.account: Admin,
-            User.account: User,
-            BaseUser.account: BaseUser})
-
-        self.assertEqual(BaseUser.account.backref, 'baseuser_set')
-        self.assertEqual(User.account.backref, 'user_set')
-        self.assertEqual(Admin.account.backref, 'admin_set')
-        self.assertTrue(Account.user_set.model is Account)
-        self.assertTrue(Account.admin_set.model is Account)
-        self.assertTrue(Account.user_set.rel_model is User)
-        self.assertTrue(Account.admin_set.rel_model is Admin)
-
-        self.assertSQL(Account._schema._create_table(), (
-            'CREATE TABLE IF NOT EXISTS "account" ('
-            '"id" INTEGER NOT NULL PRIMARY KEY)'), [])
-
-        self.assertSQL(User._schema._create_table(), (
-            'CREATE TABLE IF NOT EXISTS "user" ('
-            '"account_id" INTEGER NOT NULL PRIMARY KEY, '
-            '"username" TEXT NOT NULL, '
-            'FOREIGN KEY ("account_id") REFERENCES "account" ("id"))'), [])
-
-        self.assertSQL(Admin._schema._create_table(), (
-            'CREATE TABLE IF NOT EXISTS "admin" ('
-            '"account_id" INTEGER NOT NULL PRIMARY KEY, '
-            '"role" TEXT NOT NULL, '
-            'FOREIGN KEY ("account_id") REFERENCES "account" ("id"))'), [])
-
-    def test_backref_inheritance(self):
-        class Category(TestModel): pass
-        def backref(fk_field):
-            return '%ss' % fk_field.model._meta.name
-        class BasePost(TestModel):
-            category = ForeignKeyField(Category, backref=backref)
-        class Note(BasePost): pass
-        class Photo(BasePost): pass
-
-        self.assertEqual(Category._meta.backrefs, {
-            BasePost.category: BasePost,
-            Note.category: Note,
-            Photo.category: Photo})
-        self.assertEqual(BasePost.category.backref, 'baseposts')
-        self.assertEqual(Note.category.backref, 'notes')
-        self.assertEqual(Photo.category.backref, 'photos')
-        self.assertTrue(Category.baseposts.rel_model is BasePost)
-        self.assertTrue(Category.baseposts.model is Category)
-        self.assertTrue(Category.notes.rel_model is Note)
-        self.assertTrue(Category.notes.model is Category)
-        self.assertTrue(Category.photos.rel_model is Photo)
-        self.assertTrue(Category.photos.model is Category)
-
-        class BaseItem(TestModel):
-            category = ForeignKeyField(Category, backref='items')
-        class ItemA(BaseItem): pass
-        class ItemB(BaseItem): pass
-
-        self.assertEqual(BaseItem.category.backref, 'items')
-        self.assertEqual(ItemA.category.backref, 'itema_set')
-        self.assertEqual(ItemB.category.backref, 'itemb_set')
-        self.assertTrue(Category.items.rel_model is BaseItem)
-        self.assertTrue(Category.itema_set.rel_model is ItemA)
-        self.assertTrue(Category.itema_set.model is Category)
-        self.assertTrue(Category.itemb_set.rel_model is ItemB)
-        self.assertTrue(Category.itemb_set.model is Category)
-
-    @skip_if(IS_SQLITE, 'sqlite is not supported')
-    @skip_if(IS_MYSQL, 'mysql is not raising this error(?)')
-    @skip_if(IS_CRDB, 'crdb is not raising the error in this test(?)')
-    def test_deferred_fk_creation(self):
-        class B(TestModel):
-            a = DeferredForeignKey('A', null=True)
-            b = TextField()
-        class A(TestModel):
-            a = TextField()
-
-        db.create_tables([A, B])
-
-        try:
-            # Test that we can create B with null "a_id" column:
-            a = A.create(a='a')
-            b = B.create(b='b')
-
-            # Test that we can create B that has no corresponding A:
-            fake_a = A(id=31337)
-            b2 = B.create(a=fake_a, b='b2')
-            b2_db = B.get(B.a == fake_a)
-            self.assertEqual(b2_db.b, 'b2')
-
-            # Ensure error occurs trying to create_foreign_key.
-            with db.atomic():
-                self.assertRaises(
-                    IntegrityError,
-                    B._schema.create_foreign_key,
-                    B.a)
-
-            b2_db.delete_instance()
-
-            # We can now create the foreign key.
-            B._schema.create_foreign_key(B.a)
-
-            # The foreign-key is enforced:
-            with db.atomic():
-                self.assertRaises(IntegrityError, B.create, a=fake_a, b='b3')
-        finally:
-            db.drop_tables([A, B])
-
-
-class TestMetaTableName(BaseTestCase):
-    def test_table_name_behavior(self):
-        def make_model(model_name, table=None):
-            class Meta:
-                legacy_table_names = False
-                table_name = table
-            return type(model_name, (Model,), {'Meta': Meta})
-        def assertTableName(expected, model_name, table_name=None):
-            model_class = make_model(model_name, table_name)
-            self.assertEqual(model_class._meta.table_name, expected)
-
-        assertTableName('users', 'User', 'users')
-        assertTableName('tweet', 'Tweet')
-        assertTableName('user_profile', 'UserProfile')
-        assertTableName('activity_log_status', 'ActivityLogStatus')
-
-        assertTableName('camel_case', 'CamelCase')
-        assertTableName('camel_camel_case', 'CamelCamelCase')
-        assertTableName('camel2_camel2_case', 'Camel2Camel2Case')
-        assertTableName('http_request', 'HTTPRequest')
-        assertTableName('api_response', 'APIResponse')
-        assertTableName('api_response', 'API_Response')
-        assertTableName('web_http_request', 'WebHTTPRequest')
-        assertTableName('get_http_response_code', 'getHTTPResponseCode')
-        assertTableName('foo_bar', 'foo_Bar')
-        assertTableName('foo_bar', 'Foo__Bar')
-
-
-class TestMetaInheritance(BaseTestCase):
-    def test_table_name(self):
-        class Foo(Model):
-            class Meta:
-                def table_function(klass):
-                    return 'xxx_%s' % klass.__name__.lower()
-
-        class Bar(Foo): pass
-        class Baze(Foo):
-            class Meta:
-                table_name = 'yyy_baze'
-        class Biz(Baze): pass
-        class Nug(Foo):
-            class Meta:
-                def table_function(klass):
-                    return 'zzz_%s' % klass.__name__.lower()
-
-        self.assertEqual(Foo._meta.table_name, 'xxx_foo')
-        self.assertEqual(Bar._meta.table_name, 'xxx_bar')
-        self.assertEqual(Baze._meta.table_name, 'yyy_baze')
-        self.assertEqual(Biz._meta.table_name, 'xxx_biz')
-        self.assertEqual(Nug._meta.table_name, 'zzz_nug')
-
-    def test_composite_key_inheritance(self):
-        class Foo(Model):
-            key = TextField()
-            value = TextField()
-
-            class Meta:
-                primary_key = CompositeKey('key', 'value')
-
-        class Bar(Foo): pass
-        class Baze(Foo):
-            value = IntegerField()
-
-        foo = Foo(key='k1', value='v1')
-        self.assertEqual(foo.__composite_key__, ('k1', 'v1'))
-
-        bar = Bar(key='k2', value='v2')
-        self.assertEqual(bar.__composite_key__, ('k2', 'v2'))
-
-        baze = Baze(key='k3', value=3)
-        self.assertEqual(baze.__composite_key__, ('k3', 3))
-
-    def test_no_primary_key_inheritable(self):
-        class Foo(Model):
-            data = TextField()
-
-            class Meta:
-                primary_key = False
-
-        class Bar(Foo): pass
-        class Baze(Foo):
-            pk = AutoField()
-        class Zai(Foo):
-            zee = TextField(primary_key=True)
-
-        self.assertFalse(Foo._meta.primary_key)
-        self.assertEqual(Foo._meta.sorted_field_names, ['data'])
-        self.assertFalse(Bar._meta.primary_key)
-        self.assertEqual(Bar._meta.sorted_field_names, ['data'])
-
-        self.assertTrue(Baze._meta.primary_key is Baze.pk)
-        self.assertEqual(Baze._meta.sorted_field_names, ['pk', 'data'])
-
-        self.assertTrue(Zai._meta.primary_key is Zai.zee)
-        self.assertEqual(Zai._meta.sorted_field_names, ['zee', 'data'])
-
-    def test_inheritance(self):
-        db = SqliteDatabase(':memory:')
-
-        class Base(Model):
-            class Meta:
-                constraints = ['c1', 'c2']
-                database = db
-                indexes = (
-                    (('username',), True),
-                )
-                only_save_dirty = True
-                options = {'key': 'value'}
-                schema = 'magic'
-
-        class Child(Base): pass
-        class GrandChild(Child): pass
-
-        for ModelClass in (Child, GrandChild):
-            self.assertEqual(ModelClass._meta.constraints, ['c1', 'c2'])
-            self.assertTrue(ModelClass._meta.database is db)
-            self.assertEqual(ModelClass._meta.indexes, [(('username',), True)])
-            self.assertEqual(ModelClass._meta.options, {'key': 'value'})
-            self.assertTrue(ModelClass._meta.only_save_dirty)
-            self.assertEqual(ModelClass._meta.schema, 'magic')
-
-        class Overrides(Base):
-            class Meta:
-                constraints = None
-                indexes = None
-                only_save_dirty = False
-                options = {'foo': 'bar'}
-                schema = None
-
-        self.assertTrue(Overrides._meta.constraints is None)
-        self.assertEqual(Overrides._meta.indexes, [])
-        self.assertFalse(Overrides._meta.only_save_dirty)
-        self.assertEqual(Overrides._meta.options, {'foo': 'bar'})
-        self.assertTrue(Overrides._meta.schema is None)
-
-    def test_temporary_inheritance(self):
-        class T0(TestModel): pass
-        class T1(TestModel):
-            class Meta:
-                temporary = True
-
-        class T2(T1): pass
-        class T3(T1):
-            class Meta:
-                temporary = False
-
-        self.assertFalse(T0._meta.temporary)
-        self.assertTrue(T1._meta.temporary)
-        self.assertTrue(T2._meta.temporary)
-        self.assertFalse(T3._meta.temporary)
-
-
-class TestModelMetadataMisc(BaseTestCase):
-    database = get_in_memory_db()
-
-    def test_subclass_aware_metadata(self):
-        class SchemaPropagateMetadata(SubclassAwareMetadata):
-            @property
-            def schema(self):
-                return self._schema
-            @schema.setter
-            def schema(self, value):
-                # self.models is a singleton, essentially, shared among all
-                # classes that use this metadata implementation.
-                for model in self.models:
-                    model._meta._schema = value
-
-        class Base(Model):
-            class Meta:
-                database = self.database
-                model_metadata_class = SchemaPropagateMetadata
-
-        class User(Base):
-            username = TextField()
-        class Tweet(Base):
-            user = ForeignKeyField(User, backref='tweets')
-            content = TextField()
-
-        self.assertTrue(User._meta.schema is None)
-        self.assertTrue(Tweet._meta.schema is None)
-
-        Base._meta.schema = 'temp'
-        self.assertEqual(User._meta.schema, 'temp')
-        self.assertEqual(Tweet._meta.schema, 'temp')
-
-        User._meta.schema = None
-        for model in (Base, User, Tweet):
-            self.assertTrue(model._meta.schema is None)
-
-
-class TestModelSetDatabase(BaseTestCase):
-    def test_set_database(self):
-        class Register(Model):
-            value = IntegerField()
-
-        db_a = get_in_memory_db()
-        db_b = get_in_memory_db()
-        Register._meta.set_database(db_a)
-        Register.create_table()
-        Register._meta.set_database(db_b)
-        self.assertFalse(Register.table_exists())
-        self.assertEqual(db_a.get_tables(), ['register'])
-        self.assertEqual(db_b.get_tables(), [])
-        db_a.close()
-        db_b.close()
-
-
-class TestForeignKeyFieldDescriptors(BaseTestCase):
-    def test_foreign_key_field_descriptors(self):
-        class User(Model): pass
-        class T0(Model):
-            user = ForeignKeyField(User)
-        class T1(Model):
-            user = ForeignKeyField(User, column_name='uid')
-        class T2(Model):
-            user = ForeignKeyField(User, object_id_name='uid')
-        class T3(Model):
-            user = ForeignKeyField(User, column_name='x', object_id_name='uid')
-        class T4(Model):
-            foo = ForeignKeyField(User, column_name='user')
-        class T5(Model):
-            foo = ForeignKeyField(User, object_id_name='uid')
-
-        self.assertEqual(T0.user.object_id_name, 'user_id')
-        self.assertEqual(T1.user.object_id_name, 'uid')
-        self.assertEqual(T2.user.object_id_name, 'uid')
-        self.assertEqual(T3.user.object_id_name, 'uid')
-        self.assertEqual(T4.foo.object_id_name, 'user')
-        self.assertEqual(T5.foo.object_id_name, 'uid')
-
-        user = User(id=1337)
-        self.assertEqual(T0(user=user).user_id, 1337)
-        self.assertEqual(T1(user=user).uid, 1337)
-        self.assertEqual(T2(user=user).uid, 1337)
-        self.assertEqual(T3(user=user).uid, 1337)
-        self.assertEqual(T4(foo=user).user, 1337)
-        self.assertEqual(T5(foo=user).uid, 1337)
-
-        def conflicts_with_field():
-            class TE(Model):
-                user = ForeignKeyField(User, object_id_name='user')
-
-        self.assertRaises(ValueError, conflicts_with_field)
-
-    def test_column_name(self):
-        class User(Model): pass
-        class T1(Model):
-            user = ForeignKeyField(User, column_name='user')
-
-        self.assertEqual(T1.user.column_name, 'user')
-        self.assertEqual(T1.user.object_id_name, 'user_id')
-
-
-class TestModelAliasFieldProperties(ModelTestCase):
-    database = get_in_memory_db()
-
-    def test_field_properties(self):
-        class Person(TestModel):
-            name = TextField()
-            dob = DateField()
-            class Meta:
-                database = self.database
-
-        class Job(TestModel):
-            worker = ForeignKeyField(Person, backref='jobs')
-            client = ForeignKeyField(Person, backref='jobs_hired')
-            class Meta:
-                database = self.database
-
-        Worker = Person.alias()
-        Client = Person.alias()
-
-        expected_sql = (
-            'SELECT "t1"."id", "t1"."worker_id", "t1"."client_id" '
-            'FROM "job" AS "t1" '
-            'INNER JOIN "person" AS "t2" ON ("t1"."client_id" = "t2"."id") '
-            'INNER JOIN "person" AS "t3" ON ("t1"."worker_id" = "t3"."id") '
-            'WHERE (date_part(?, "t2"."dob") = ?)')
-        expected_params = ['year', 1983]
-
-        query = (Job
-                 .select()
-                 .join(Client, on=(Job.client == Client.id))
-                 .switch(Job)
-                 .join(Worker, on=(Job.worker == Worker.id))
-                 .where(Client.dob.year == 1983))
-        self.assertSQL(query, expected_sql, expected_params)
-
-        query = (Job
-                 .select()
-                 .join(Client, on=(Job.client == Client.id))
-                 .switch(Job)
-                 .join(Person, on=(Job.worker == Person.id))
-                 .where(Client.dob.year == 1983))
-        self.assertSQL(query, expected_sql, expected_params)
-
-        query = (Job
-                 .select()
-                 .join(Person, on=(Job.client == Person.id))
-                 .switch(Job)
-                 .join(Worker, on=(Job.worker == Worker.id))
-                 .where(Person.dob.year == 1983))
-        self.assertSQL(query, expected_sql, expected_params)
+class C_Product(TestModel):
+    name = CharField()
+    price = IntegerField(default=0)
+
+class C_Archive(TestModel):
+    name = CharField()
+    price = IntegerField(default=0)
+
+class C_Part(TestModel):
+    part = CharField(primary_key=True)
+    sub_part = ForeignKeyField('self', null=True)
+
+
+@skip_unless(IS_POSTGRESQL)
+class TestDataModifyingCTEIntegration(ModelTestCase):
+    requires = [C_Product, C_Archive, C_Part]
+
+    def setUp(self):
+        super(TestDataModifyingCTEIntegration, self).setUp()
+        for i in range(5):
+            C_Product.create(name='p%s' % i, price=i)
+        mp1_c_g = C_Part.create(part='mp1-c-g')
+        mp1_c = C_Part.create(part='mp1-c', sub_part=mp1_c_g)
+        mp1 = C_Part.create(part='mp1', sub_part=mp1_c)
+        mp2_c_g = C_Part.create(part='mp2-c-g')
+        mp2_c = C_Part.create(part='mp2-c', sub_part=mp2_c_g)
+        mp2 = C_Part.create(part='mp2', sub_part=mp2_c)
+
+    def test_data_modifying_cte_delete(self):
+        query = (C_Product.delete()
+                 .where(C_Product.price < 3)
+                 .returning(C_Product))
+        cte = query.cte('moved_rows')
+
+        src = Select((cte,), (cte.c.id, cte.c.name, cte.c.price))
+        res = (C_Archive
+               .insert_from(src, (C_Archive.id, C_Archive.name, C_Archive.price))
+               .with_cte(cte)
+               .execute())
+        self.assertEqual(len(list(res)), 3)
+
+        self.assertEqual(
+            sorted([(p.name, p.price) for p in C_Product.select()]),
+            [('p3', 3), ('p4', 4)])
+        self.assertEqual(
+            sorted([(p.name, p.price) for p in C_Archive.select()]),
+            [('p0', 0), ('p1', 1), ('p2', 2)])
+
+        base = (C_Part
+                .select(C_Part.sub_part, C_Part.part)
+                .where(C_Part.part == 'mp1')
+                .cte('included_parts', recursive=True,
+                     columns=('sub_part', 'part')))
+        PA = C_Part.alias('p')
+        recursive = (PA
+                     .select(PA.sub_part, PA.part)
+                     .join(base, on=(PA.part == base.c.sub_part)))
+        cte = base.union_all(recursive)
+
+        sq = Select((cte,), (cte.c.part,))
+        res = (C_Part.delete()
+               .where(C_Part.part.in_(sq))
+               .with_cte(cte)
+               .execute())
+
+        self.assertEqual(sorted([p.part for p in C_Part.select()]),
+                         ['mp2', 'mp2-c', 'mp2-c-g'])
+
+    def test_data_modifying_cte_update(self):
+        # Populate archive table w/copy of data in product.
+        C_Archive.insert_from(
+            C_Product.select(),
+            (C_Product.id, C_Product.name, C_Product.price)).execute()
+
+        query = (C_Product
+                 .update(price=C_Product.price * 2)
+                 .returning(C_Product.id, C_Product.name, C_Product.price))
+        cte = query.cte('t')
+
+        sq = cte.select_from(cte.c.id, cte.c.name, cte.c.price)
+        self.assertEqual(sorted([(x.name, x.price) for x in sq]), [
+            ('p0', 0), ('p1', 2), ('p2', 4), ('p3', 6), ('p4', 8)])
+
+        # Ensure changes were persisted.
+        self.assertEqual(sorted([(x.name, x.price) for x in C_Product]), [
+            ('p0', 0), ('p1', 2), ('p2', 4), ('p3', 6), ('p4', 8)])
+
+        sq = Select((cte,), (cte.c.id, cte.c.price))
+        res = (C_Archive
+               .update(price=sq.c.price)
+               .from_(sq)
+               .where(C_Archive.id == sq.c.id)
+               .with_cte(cte)
+               .execute())
+
+        self.assertEqual(sorted([(x.name, x.price) for x in C_Product]), [
+            ('p0', 0), ('p1', 4), ('p2', 8), ('p3', 12), ('p4', 16)])
+        self.assertEqual(sorted([(x.name, x.price) for x in C_Archive]), [
+            ('p0', 0), ('p1', 4), ('p2', 8), ('p3', 12), ('p4', 16)])
+
+    def test_data_modifying_cte_insert(self):
+        query = (C_Product
+                 .insert({'name': 'p5', 'price': 5})
+                 .returning(C_Product.id, C_Product.name, C_Product.price))
+        cte = query.cte('t')
+
+        sq = cte.select_from(cte.c.id, cte.c.name, cte.c.price)
+        self.assertEqual([(p.name, p.price) for p in sq], [('p5', 5)])
+
+        query = (C_Product
+                 .insert({'name': 'p6', 'price': 6})
+                 .returning(C_Product.id, C_Product.name, C_Product.price))
+        cte = query.cte('t')
+        sq = Select((cte,), (cte.c.id, cte.c.name, cte.c.price))
+        res = (C_Archive
+               .insert_from(sq, (sq.c.id, sq.c.name, sq.c.price))
+               .with_cte(cte)
+               .execute())
+        self.assertEqual([(p.name, p.price) for p in C_Archive], [('p6', 6)])
+
+        self.assertEqual(sorted([(p.name, p.price) for p in C_Product]), [
+            ('p0', 0), ('p1', 1), ('p2', 2), ('p3', 3), ('p4', 4), ('p5', 5),
+            ('p6', 6)])
+
+
+# ===========================================================================
+# INSERT conflict handling / upsert (per-dialect)
+# ===========================================================================
 
 
 class OnConflictTests(object):
@@ -4213,230 +4390,494 @@ class TestUpsertPostgresql(PGOnConflictTests, ModelTestCase):
         self.assertEqual(obj.last, 'catlands')
 
 
-class TestJoinSubquery(ModelTestCase):
-    requires = [Person, Relationship]
-
-    def test_join_subquery(self):
-        # Set up some relationships such that there exists a relationship from
-        # the left-hand to the right-hand name.
-        data = (
-            ('charlie', None),
-            ('huey', 'charlie'),
-            ('mickey', 'charlie'),
-            ('zaizee', 'charlie'),
-            ('zaizee', 'huey'))
-        people = {}
-        def get_person(name):
-            if name not in people:
-                people[name] = Person.create(first=name, last=name,
-                                             dob=datetime.date(2017, 1, 1))
-            return people[name]
-
-        for person, related_to in data:
-            p1 = get_person(person)
-            if related_to is not None:
-                p2 = get_person(related_to)
-                Relationship.create(from_person=p1, to_person=p2)
-
-        # Create the subquery.
-        Friend = Person.alias('friend')
-        subq = (Relationship
-                .select(Friend.first.alias('friend_name'),
-                        Relationship.from_person)
-                .join(Friend, on=(Relationship.to_person == Friend.id))
-                .alias('subq'))
-
-        # Outer query does a LEFT OUTER JOIN. We join on the subquery because
-        # it uses an INNER JOIN, saving us doing two LEFT OUTER joins in the
-        # single query.
-        query = (Person
-                 .select(Person.first, subq.c.friend_name)
-                 .join(subq, JOIN.LEFT_OUTER,
-                       on=(Person.id == subq.c.from_person_id))
-                 .order_by(Person.first, subq.c.friend_name))
-        self.assertSQL(query, (
-            'SELECT "t1"."first", "subq"."friend_name" '
-            'FROM "person" AS "t1" '
-            'LEFT OUTER JOIN ('
-            'SELECT "friend"."first" AS "friend_name", "t2"."from_person_id" '
-            'FROM "relationship" AS "t2" '
-            'INNER JOIN "person" AS "friend" '
-            'ON ("t2"."to_person_id" = "friend"."id")) AS "subq" '
-            'ON ("t1"."id" = "subq"."from_person_id") '
-            'ORDER BY "t1"."first", "subq"."friend_name"'), [])
-
-        db_data = [row for row in query.tuples()]
-        self.assertEqual(db_data, list(data))
+# ===========================================================================
+# FOR UPDATE, RETURNING, UPDATE FROM, and LATERAL
+# ===========================================================================
 
 
-class TestSumCase(ModelTestCase):
-    @requires_models(User)
-    def test_sum_case(self):
-        for username in ('charlie', 'huey', 'zaizee'):
-            User.create(username=username)
-
-        case = Case(None, [(User.username.endswith('e'), 1)], 0)
-        e_sum = fn.SUM(case)
-        query = (User
-                 .select(User.username, e_sum.alias('e_sum'))
-                 .group_by(User.username)
-                 .order_by(User.username))
-        self.assertSQL(query, (
-            'SELECT "t1"."username", '
-            'SUM(CASE WHEN ("t1"."username" ILIKE ?) THEN ? ELSE ? END) '
-            'AS "e_sum" '
-            'FROM "users" AS "t1" '
-            'GROUP BY "t1"."username" '
-            'ORDER BY "t1"."username"'), ['%e', 1, 0])
-
-        data = [(user.username, user.e_sum) for user in query]
-        self.assertEqual(data, [
-            ('charlie', 1),
-            ('huey', 0),
-            ('zaizee', 1)])
-
-
-class TUser(TestModel):
-    username = TextField()
-
-
-class Transaction(TestModel):
-    user = ForeignKeyField(TUser, backref='transactions')
-    amount = FloatField(default=0.)
-
-
-class TestMaxAlias(ModelTestCase):
-    requires = [Transaction, TUser]
-
-    def test_max_alias(self):
-        with self.database.atomic():
-            charlie = TUser.create(username='charlie')
-            huey = TUser.create(username='huey')
-
-            data = (
-                (charlie, 10.),
-                (charlie, 20.),
-                (charlie, 30.),
-                (huey, 1.5),
-                (huey, 2.5))
-            for user, amount in data:
-                Transaction.create(user=user, amount=amount)
-
-        with self.assertQueryCount(1):
-            amount = fn.MAX(Transaction.amount).alias('amount')
-            query = (Transaction
-                     .select(amount, TUser.username)
-                     .join(TUser)
-                     .group_by(TUser.username)
-                     .order_by(TUser.username))
-            data = [(txn.amount, txn.user.username) for txn in query]
-
-        self.assertEqual(data, [
-            (30., 'charlie'),
-            (2.5, 'huey')])
-
-
-class CNote(TestModel):
-    content = TextField()
-    timestamp = TimestampField()
-
-class CFile(TestModel):
-    filename = CharField(primary_key=True)
-    data = TextField()
-    timestamp = TimestampField()
-
-
-class TestCompoundSelectModels(ModelTestCase):
-    requires = [CFile, CNote]
+@skip_if(IS_SQLITE or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
+@skip_unless(db.for_update, 'requires for update')
+class TestForUpdateIntegration(ModelTestCase):
+    requires = [User, Tweet]
 
     def setUp(self):
-        super(TestCompoundSelectModels, self).setUp()
-        def generate_ts():
-            i = [0]
-            def _inner():
-                i[0] += 1
-                return datetime.datetime(2018, 1, i[0])
-            return _inner
-        make_ts = generate_ts()
-        self.ts = lambda i: datetime.datetime(2018, 1, i)
+        super(TestForUpdateIntegration, self).setUp()
+        self.alt_db = new_connection()
+        class AltUser(User):
+            class Meta:
+                database = self.alt_db
+                table_name = User._meta.table_name
+        class AltTweet(Tweet):
+            class Meta:
+                database = self.alt_db
+                table_name = Tweet._meta.table_name
+        self.AltUser = AltUser
+        self.AltTweet = AltTweet
 
+    def tearDown(self):
+        self.alt_db.close()
+        super(TestForUpdateIntegration, self).tearDown()
+
+    @skip_if(IS_CRDB, 'crdb locks-up on this test, blocking reads')
+    def test_for_update(self):
         with self.database.atomic():
-            for i, content in enumerate(('note-a', 'note-b', 'note-c'), 1):
-                CNote.create(id=i, content=content, timestamp=make_ts())
+            User.create(username='huey')
+            zaizee = User.create(username='zaizee')
 
-            file_data = (
-                ('peewee.txt', 'peewee orm'),
-                ('walrus.txt', 'walrus redis toolkit'),
-                ('huey.txt', 'huey task queue'))
-            for filename, data in file_data:
-                CFile.create(filename=filename, data=data, timestamp=make_ts())
+        AltUser = self.AltUser
 
-    def test_mix_models_with_model_row_type(self):
-        cast = 'CHAR' if IS_MYSQL else 'TEXT'
-        lhs = CNote.select(CNote.id.cast(cast).alias('id_text'),
-                           CNote.content, CNote.timestamp)
-        rhs = CFile.select(CFile.filename, CFile.data, CFile.timestamp)
-        query = (lhs | rhs).order_by(SQL('timestamp')).limit(4)
+        with self.database.manual_commit():
+            self.database.begin()
+            users = (User.select().where(User.username == 'zaizee')
+                     .for_update()
+                     .execute())
+            updated = (User
+                       .update(username='ziggy')
+                       .where(User.username == 'zaizee')
+                       .execute())
+            self.assertEqual(updated, 1)
 
-        data = [(n.id_text, n.content, n.timestamp) for n in query]
-        self.assertEqual(data, [
-            ('1', 'note-a', self.ts(1)),
-            ('2', 'note-b', self.ts(2)),
-            ('3', 'note-c', self.ts(3)),
-            ('peewee.txt', 'peewee orm', self.ts(4))])
+            if IS_POSTGRESQL:
+                nrows = (AltUser
+                         .update(username='huey-x')
+                         .where(AltUser.username == 'huey')
+                         .execute())
+                self.assertEqual(nrows, 1)
 
-    def test_mixed_models_tuple_row_type(self):
-        cast = 'CHAR' if IS_MYSQL else 'TEXT'
-        lhs = CNote.select(CNote.id.cast(cast).alias('id'),
-                           CNote.content, CNote.timestamp)
-        rhs = CFile.select(CFile.filename, CFile.data, CFile.timestamp)
-        query = (lhs | rhs).order_by(SQL('timestamp')).limit(5)
+            query = (AltUser
+                     .select(AltUser.username)
+                     .where(AltUser.id == zaizee.id))
+            self.assertEqual(query.get().username, 'zaizee')
 
-        self.assertEqual(list(query.tuples()), [
-            ('1', 'note-a', self.ts(1)),
-            ('2', 'note-b', self.ts(2)),
-            ('3', 'note-c', self.ts(3)),
-            ('peewee.txt', 'peewee orm', self.ts(4)),
-            ('walrus.txt', 'walrus redis toolkit', self.ts(5))])
+            self.database.commit()
+            self.assertEqual(query.get().username, 'ziggy')
 
-    def test_mixed_models_dict_row_type(self):
-        notes = CNote.select(CNote.content, CNote.timestamp)
-        files = CFile.select(CFile.filename, CFile.timestamp)
+    def test_for_update_blocking(self):
+        User.create(username='u1')
 
-        query = (notes | files).order_by(SQL('timestamp').desc()).limit(4)
-        self.assertEqual(list(query.dicts()), [
-            {'content': 'huey.txt', 'timestamp': self.ts(6)},
-            {'content': 'walrus.txt', 'timestamp': self.ts(5)},
-            {'content': 'peewee.txt', 'timestamp': self.ts(4)},
-            {'content': 'note-c', 'timestamp': self.ts(3)}])
+        AltUser = self.AltUser
+        evt = threading.Event()
+        def run_in_thread():
+            with self.alt_db.atomic():
+                evt.wait()
+                n = (AltUser.update(username='u1-y')
+                     .where(AltUser.username == 'u1')
+                     .execute())
+                self.assertEqual(n, 0)
+
+        t = threading.Thread(target=run_in_thread)
+        t.daemon = True
+        t.start()
+
+        with self.database.atomic() as txn:
+            q = (User.select()
+                 .where(User.username == 'u1')
+                 .for_update()
+                 .execute())
+            evt.set()
+
+            n = (User.update(username='u1-x')
+                 .where(User.username == 'u1')
+                 .execute())
+            self.assertEqual(n, 1)
+
+        t.join(timeout=5)
+        u = User.get()
+        self.assertEqual(u.username, 'u1-x')
+
+    def test_for_update_nested(self):
+        User.insert_many([(u,) for u in 'abc']).execute()
+        subq = User.select().where(User.username != 'b').for_update()
+        nrows = (User
+                 .delete()
+                 .where(User.id.in_(subq))
+                 .execute())
+        self.assertEqual(nrows, 2)
+
+    def test_for_update_nowait(self):
+        User.create(username='huey')
+        zaizee = User.create(username='zaizee')
+
+        AltUser = self.AltUser
+
+        with self.database.manual_commit():
+            self.database.begin()
+            users = (User
+                     .select(User.username)
+                     .where(User.username == 'zaizee')
+                     .for_update(nowait=True)
+                     .execute())
+
+            def will_fail():
+                return (AltUser
+                        .select()
+                        .where(AltUser.username == 'zaizee')
+                        .for_update(nowait=True)
+                        .get())
+
+            self.assertRaises((OperationalError, InternalError), will_fail)
+            self.database.commit()
+
+    @requires_postgresql
+    @requires_models(User, Tweet)
+    def test_for_update_of(self):
+        h = User.create(username='huey')
+        z = User.create(username='zaizee')
+        Tweet.create(user=h, content='h')
+        Tweet.create(user=z, content='z')
+
+        AltUser, AltTweet = self.AltUser, self.AltTweet
+
+        with self.database.manual_commit():
+            self.database.begin()
+            # Lock tweets by huey.
+            query = (Tweet
+                     .select()
+                     .join(User)
+                     .where(User.username == 'huey')
+                     .for_update(of=Tweet, nowait=True))
+            qr = query.execute()
+
+            # No problem updating zaizee's tweet or huey's user.
+            nrows = (AltTweet
+                     .update(content='zx')
+                     .where(AltTweet.user == z.id)
+                     .execute())
+            self.assertEqual(nrows, 1)
+
+            nrows = (AltUser
+                     .update(username='huey-x')
+                     .where(AltUser.username == 'huey')
+                     .execute())
+            self.assertEqual(nrows, 1)
+
+            def will_fail():
+                (AltTweet
+                 .select()
+                 .where(AltTweet.user == h)
+                 .for_update(nowait=True)
+                 .get())
+            self.assertRaises((OperationalError, InternalError), will_fail)
+
+            self.database.commit()
+
+        query = Tweet.select(Tweet, User).join(User).order_by(Tweet.id)
+        self.assertEqual([(t.content, t.user.username) for t in query],
+                         [('h', 'huey-x'), ('zx', 'zaizee')])
 
 
-class SequenceModel(TestModel):
-    seq_id = IntegerField(sequence='seq_id_sequence')
-    key = TextField()
+class ServerDefault(TestModel):
+    timestamp = DateTimeField(constraints=[SQL('default (now())')])
 
 
-@requires_pglike
-class TestSequence(ModelTestCase):
-    requires = [SequenceModel]
+@requires_postgresql
+class TestReturningIntegration(ModelTestCase):
+    requires = [User]
 
-    def test_create_table(self):
-        query = SequenceModel._schema._create_table()
+    def test_simple_returning(self):
+        query = User.insert(username='charlie')
         self.assertSQL(query, (
-            'CREATE TABLE IF NOT EXISTS "sequence_model" ('
-            '"id" SERIAL NOT NULL PRIMARY KEY, '
-            '"seq_id" INTEGER NOT NULL DEFAULT NEXTVAL(\'seq_id_sequence\'), '
-            '"key" TEXT NOT NULL)'), [])
+            'INSERT INTO "users" ("username") VALUES (?) '
+            'RETURNING "users"."id"'),
+            ['charlie'])
 
-    def test_sequence(self):
-        for key in ('k1', 'k2', 'k3'):
-            SequenceModel.create(key=key)
+        self.assertEqual(query.execute(), 1)
 
-        s1, s2, s3 = SequenceModel.select().order_by(SequenceModel.key)
+        # By default returns a tuple.
+        query = User.insert(username='huey')
+        self.assertEqual(query.execute(), 2)
+        self.assertEqual(list(query), [(2,)])
 
-        self.assertEqual(s1.seq_id, 1)
-        self.assertEqual(s2.seq_id, 2)
-        self.assertEqual(s3.seq_id, 3)
+        # If we specify a returning clause we get user instances.
+        query = User.insert(username='snoobie').returning(User)
+        query.execute()
+        self.assertEqual([x.username for x in query], ['snoobie'])
+
+        query = (User
+                 .insert(username='zaizee')
+                 .returning(User.id, User.username)
+                 .dicts())
+        self.assertSQL(query, (
+            'INSERT INTO "users" ("username") VALUES (?) '
+            'RETURNING "users"."id", "users"."username"'), ['zaizee'])
+
+        cursor = query.execute()
+        row, = list(cursor)
+        self.assertEqual(row, {'id': 4, 'username': 'zaizee'})
+
+        query = (User
+                 .insert(username='mickey')
+                 .returning(User)
+                 .objects())
+        self.assertSQL(query, (
+            'INSERT INTO "users" ("username") VALUES (?) '
+            'RETURNING "users"."id", "users"."username"'), ['mickey'])
+        cursor = query.execute()
+        row, = list(cursor)
+        self.assertEqual(row.id, 5)
+        self.assertEqual(row.username, 'mickey')
+
+        # Can specify aliases.
+        query = (User
+                 .insert(username='sipp')
+                 .returning(User.username.alias('new_username')))
+        self.assertEqual([x.new_username for x in query.execute()], ['sipp'])
+
+        # Minimal test with insert_many.
+        query = User.insert_many([('u7',), ('u8',)])
+        self.assertEqual([r for r, in query.execute()], [7, 8])
+
+        # Test with insert / on conflict.
+        query = (User
+                 .insert_many([(7, 'u7',), (9, 'u9',)],
+                              [User.id, User.username])
+                 .on_conflict(conflict_target=[User.id],
+                              update={User.username: User.username + 'x'})
+                 .returning(User))
+        self.assertEqual([(x.id, x.username) for x in query],
+                         [(7, 'u7x'), (9, 'u9')])
+
+    def test_simple_returning_insert_update_delete(self):
+        res = User.insert(username='charlie').returning(User).execute()
+        self.assertEqual([u.username for u in res], ['charlie'])
+
+        res = (User
+               .update(username='charlie2')
+               .where(User.id == 1)
+               .returning(User)
+               .execute())
+        # Subsequent iterations are cached.
+        for _ in range(2):
+            self.assertEqual([u.username for u in res], ['charlie2'])
+
+        res = (User
+               .delete()
+               .where(User.id == 1)
+               .returning(User)
+               .execute())
+        # Subsequent iterations are cached.
+        for _ in range(2):
+            self.assertEqual([u.username for u in res], ['charlie2'])
+
+    def test_simple_insert_update_delete_no_returning(self):
+        query = User.insert(username='charlie')
+        self.assertEqual(query.execute(), 1)
+
+        query = User.insert(username='huey')
+        self.assertEqual(query.execute(), 2)
+
+        query = User.update(username='huey2').where(User.username == 'huey')
+        self.assertEqual(query.execute(), 1)
+        self.assertEqual(query.execute(), 0)  # No rows updated!
+
+        query = User.delete().where(User.username == 'huey2')
+        self.assertEqual(query.execute(), 1)
+        self.assertEqual(query.execute(), 0)  # No rows updated!
+
+    @requires_models(ServerDefault)
+    def test_returning_server_defaults(self):
+        query = (ServerDefault
+                 .insert()
+                 .returning(ServerDefault.id, ServerDefault.timestamp))
+        self.assertSQL(query, (
+            'INSERT INTO "server_default" '
+            'DEFAULT VALUES '
+            'RETURNING "server_default"."id", "server_default"."timestamp"'),
+            [])
+
+        with self.assertQueryCount(1):
+            cursor = query.dicts().execute()
+            row, = list(cursor)
+
+        self.assertTrue(row['timestamp'] is not None)
+
+        obj = ServerDefault.get(ServerDefault.id == row['id'])
+        self.assertEqual(obj.timestamp, row['timestamp'])
+
+    def test_no_return(self):
+        query = User.insert(username='huey').returning()
+        self.assertIsNone(query.execute())
+
+        user = User.get(User.username == 'huey')
+        self.assertEqual(user.username, 'huey')
+        self.assertTrue(user.id >= 1)
+
+    @requires_models(Category)
+    def test_non_int_pk_returning(self):
+        query = Category.insert(name='root')
+        self.assertSQL(query, (
+            'INSERT INTO "category" ("name") VALUES (?) '
+            'RETURNING "category"."name"'), ['root'])
+
+        self.assertEqual(query.execute(), 'root')
+
+    def test_returning_multi(self):
+        data = [{'username': 'huey'}, {'username': 'mickey'}]
+        query = User.insert_many(data)
+        self.assertSQL(query, (
+            'INSERT INTO "users" ("username") VALUES (?), (?) '
+            'RETURNING "users"."id"'), ['huey', 'mickey'])
+
+        data = query.execute()
+
+        # Check that the result wrapper is correctly set up.
+        self.assertTrue(len(data.select) == 1 and data.select[0] is User.id)
+        self.assertEqual(list(data), [(1,), (2,)])
+
+        query = (User
+                 .insert_many([{'username': 'foo'},
+                               {'username': 'bar'},
+                               {'username': 'baz'}])
+                 .returning(User.id, User.username)
+                 .namedtuples())
+        data = query.execute()
+        self.assertEqual([(row.id, row.username) for row in data], [
+            (3, 'foo'),
+            (4, 'bar'),
+            (5, 'baz')])
+
+    @requires_models(Category)
+    def test_returning_query(self):
+        for name in ('huey', 'mickey', 'zaizee'):
+            Category.create(name=name)
+
+        source = Category.select(Category.name).order_by(Category.name)
+        query = User.insert_from(source, (User.username,))
+        self.assertSQL(query, (
+            'INSERT INTO "users" ("username") '
+            'SELECT "t1"."name" FROM "category" AS "t1" ORDER BY "t1"."name" '
+            'RETURNING "users"."id"'), [])
+
+        data = query.execute()
+
+        # Check that the result wrapper is correctly set up.
+        self.assertTrue(len(data.select) == 1 and data.select[0] is User.id)
+        self.assertEqual(list(data), [(1,), (2,), (3,)])
+
+    def test_update_returning(self):
+        id_list = User.insert_many([{'username': 'huey'},
+                                    {'username': 'zaizee'}]).execute()
+        huey_id, zaizee_id = [pk for pk, in id_list]
+
+        query = (User
+                 .update(username='ziggy')
+                 .where(User.username == 'zaizee')
+                 .returning(User.id, User.username))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "username" = ? '
+            'WHERE ("users"."username" = ?) '
+            'RETURNING "users"."id", "users"."username"'), ['ziggy', 'zaizee'])
+        data = query.execute()
+        user = data[0]
+        self.assertEqual(user.username, 'ziggy')
+        self.assertEqual(user.id, zaizee_id)
+
+    def test_delete_returning(self):
+        id_list = User.insert_many([{'username': 'huey'},
+                                    {'username': 'zaizee'}]).execute()
+        huey_id, zaizee_id = [pk for pk, in id_list]
+
+        query = (User
+                 .delete()
+                 .where(User.username == 'zaizee')
+                 .returning(User.id, User.username))
+        self.assertSQL(query, (
+            'DELETE FROM "users" WHERE ("users"."username" = ?) '
+            'RETURNING "users"."id", "users"."username"'), ['zaizee'])
+        data = query.execute()
+        user = data[0]
+        self.assertEqual(user.username, 'zaizee')
+        self.assertEqual(user.id, zaizee_id)
+
+
+class Reg(TestModel):
+    k = CharField()
+    v = IntegerField()
+    x = IntegerField()
+    class Meta:
+        indexes = (
+            (('k', 'v'), True),
+        )
+
+
+returning_support = db.returning_clause or IS_SQLITE_35
+
+
+@skip_unless(returning_support, 'database does not support RETURNING')
+class TestReturningClauseIntegration(ModelTestCase):
+    requires = [Reg]
+
+    def test_crud(self):
+        iq = Reg.insert_many([('k1', 1, 0), ('k2', 2, 0)]).returning(Reg)
+        self.assertEqual([(r.id is not None, r.k, r.v) for r in iq.execute()],
+                         [(True, 'k1', 1), (True, 'k2', 2)])
+
+        iq = (Reg
+              .insert_many([('k1', 1, 1), ('k2', 2, 1), ('k3', 3, 0)])
+              .on_conflict(
+                  conflict_target=[Reg.k, Reg.v],
+                  preserve=[Reg.x],
+                  update={Reg.v: Reg.v + 1},
+                  where=(Reg.k != 'k1'))
+              .returning(Reg))
+        ic = iq.execute()
+        self.assertEqual([(r.id is not None, r.k, r.v, r.x) for r in ic], [
+            (True, 'k2', 3, 1),
+            (True, 'k3', 3, 0)])
+
+        uq = (Reg
+              .update({Reg.v: Reg.v - 1, Reg.x: Reg.x + 1})
+              .where(Reg.k != 'k1')
+              .returning(Reg))
+        self.assertEqual([(r.k, r.v, r.x) for r in uq.execute()], [
+            ('k2', 2, 2), ('k3', 2, 1)])
+
+        dq = Reg.delete().where(Reg.k != 'k1').returning(Reg)
+        self.assertEqual([(r.k, r.v, r.x) for r in dq.execute()], [
+            ('k2', 2, 2), ('k3', 2, 1)])
+
+    def test_returning_expression(self):
+        Rs = (Reg.v + Reg.x).alias('s')
+        iq = (Reg
+              .insert_many([('k1', 1, 10), ('k2', 2, 20)])
+              .returning(Reg.k, Reg.v, Rs))
+        self.assertEqual([(r.k, r.v, r.s) for r in iq.execute()], [
+            ('k1', 1, 11), ('k2', 2, 22)])
+
+        uq = (Reg
+              .update({Reg.k: Reg.k + 'x', Reg.v: Reg.v + 1})
+              .returning(Reg.k, Reg.v, Rs))
+        self.assertEqual([(r.k, r.v, r.s) for r in uq.execute()], [
+            ('k1x', 2, 12), ('k2x', 3, 23)])
+
+        dq = Reg.delete().returning(Reg.k, Reg.v, Rs)
+        self.assertEqual([(r.k, r.v, r.s) for r in dq.execute()], [
+            ('k1x', 2, 12), ('k2x', 3, 23)])
+
+    def test_returning_types(self):
+        Rs = (Reg.v + Reg.x).alias('s')
+        mapping = (
+            ((lambda q: q), (lambda r: (r.k, r.v, r.s))),
+            ((lambda q: q.dicts()), (lambda r: (r['k'], r['v'], r['s']))),
+            ((lambda q: q.tuples()), (lambda r: r)),
+            ((lambda q: q.namedtuples()), (lambda r: (r.k, r.v, r.s))))
+
+        for qconv, r2t in mapping:
+            iq = (Reg
+                  .insert_many([('k1', 1, 10), ('k2', 2, 20)])
+                  .returning(Reg.k, Reg.v, Rs))
+            self.assertEqual([r2t(r) for r in qconv(iq).execute()], [
+                ('k1', 1, 11), ('k2', 2, 22)])
+
+            uq = (Reg
+                  .update({Reg.k: Reg.k + 'x', Reg.v: Reg.v + 1})
+                  .returning(Reg.k, Reg.v, Rs))
+            self.assertEqual([r2t(r) for r in qconv(uq).execute()], [
+                ('k1x', 2, 12), ('k2x', 3, 23)])
+
+            dq = Reg.delete().returning(Reg.k, Reg.v, Rs)
+            self.assertEqual([r2t(r) for r in qconv(dq).execute()], [
+                ('k1x', 2, 12), ('k2x', 3, 23)])
 
 
 @requires_postgresql
@@ -4530,116 +4971,646 @@ class TestLateralJoin(ModelTestCase):
             {'username': 'u2', 'content': 'u2-t2'}])
 
 
-class Task(TestModel):
-    heading = ForeignKeyField('self', backref='tasks', null=True)
-    project = ForeignKeyField('self', backref='projects', null=True)
-    title = TextField()
-    type = IntegerField()
-
-    PROJECT = 1
-    HEADING = 2
+# ===========================================================================
+# Bulk operations
+# ===========================================================================
 
 
-class TestMultiSelfJoin(ModelTestCase):
-    requires = [Task]
+class BCUser(TestModel):
+    username = CharField(unique=True)
 
-    def setUp(self):
-        super(TestMultiSelfJoin, self).setUp()
+class BCTweet(TestModel):
+    user = ForeignKeyField(BCUser, field=BCUser.username)
+    content = TextField()
 
-        with self.database.atomic():
-            p_dev = Task.create(title='dev', type=Task.PROJECT)
-            p_p = Task.create(title='peewee', project=p_dev, type=Task.PROJECT)
-            p_h = Task.create(title='huey', project=p_dev, type=Task.PROJECT)
 
-            heading_data = (
-                ('peewee-1', p_p, 2),
-                ('peewee-2', p_p, 0),
-                ('huey-1', p_h, 1),
-                ('huey-2', p_h, 1))
-            for title, proj, n_subtasks in heading_data:
-                t = Task.create(title=title, project=proj, type=Task.HEADING)
-                for i in range(n_subtasks):
-                    Task.create(title='%s-%s' % (title, i + 1), project=proj,
-                                heading=t, type=Task.HEADING)
+class TestBulkCreateWithFK(ModelTestCase):
+    @requires_models(BCUser, BCTweet)
+    def test_bulk_create_with_fk(self):
+        u1 = BCUser.create(username='u1')
+        u2 = BCUser.create(username='u2')
+        with self.assertQueryCount(1):
+            BCTweet.bulk_create([
+                BCTweet(user='u1', content='t%s' % i)
+                for i in range(4)])
 
-    def test_multi_self_join(self):
-        Project = Task.alias()
-        Heading = Task.alias()
-        query = (Task
-                 .select(Task, Project, Heading)
-                 .join(Heading, JOIN.LEFT_OUTER,
-                       on=(Task.heading == Heading.id).alias('heading'))
-                 .switch(Task)
-                 .join(Project, JOIN.LEFT_OUTER,
-                       on=(Task.project == Project.id).alias('project'))
-                 .order_by(Task.id))
+        self.assertEqual(BCTweet.select().where(BCTweet.user == 'u1').count(), 4)
+        self.assertEqual(BCTweet.select().where(BCTweet.user != 'u1').count(), 0)
+
+        u = BCUser(username='u3')
+        t = BCTweet(user=u, content='tx')
+        with self.assertQueryCount(2):
+            BCUser.bulk_create([u])
+            BCTweet.bulk_create([t])
 
         with self.assertQueryCount(1):
-            accum = []
-            for task in query:
-                h_title = task.heading.title if task.heading else None
-                p_title = task.project.title if task.project else None
-                accum.append((task.title, h_title, p_title))
+            t_db = (BCTweet
+                    .select(BCTweet, BCUser)
+                    .join(BCUser)
+                    .where(BCUser.username == 'u3')
+                    .get())
+            self.assertEqual(t_db.content, 'tx')
+            self.assertEqual(t_db.user.username, 'u3')
 
-        self.assertEqual(accum, [
-            # title - heading - project
-            ('dev', None, None),
-            ('peewee', None, 'dev'),
-            ('huey', None, 'dev'),
-            ('peewee-1', None, 'peewee'),
-            ('peewee-1-1', 'peewee-1', 'peewee'),
-            ('peewee-1-2', 'peewee-1', 'peewee'),
-            ('peewee-2', None, 'peewee'),
-            ('huey-1', None, 'huey'),
-            ('huey-1-1', 'huey-1', 'huey'),
-            ('huey-2', None, 'huey'),
-            ('huey-2-1', 'huey-2', 'huey'),
-        ])
+    @requires_postgresql
+    @requires_models(User, Tweet)
+    def test_bulk_create_related_objects(self):
+        u = User(username='u1')
+        t = Tweet(user=u, content='t1')
+        with self.assertQueryCount(2):
+            User.bulk_create([u])
+            Tweet.bulk_create([t])
+
+        with self.assertQueryCount(1):
+            t_db = Tweet.select(Tweet, User).join(User).get()
+            self.assertEqual(t_db.content, 't1')
+            self.assertEqual(t_db.user.username, 'u1')
 
 
-class Product(TestModel):
-    name = TextField()
-    price = IntegerField()
-    flags = IntegerField(constraints=[SQL('DEFAULT 99')])
-    status = CharField(constraints=[Check("status IN ('a', 'b', 'c')")])
+class UUIDReg(TestModel):
+    id = UUIDField(primary_key=True, default=uuid.uuid4)
+    key = TextField()
 
+class CharPKKV(TestModel):
+    id = CharField(primary_key=True)
+    key = TextField()
+    value = IntegerField(default=0)
+
+
+class TestBulkUpdateNonIntegerPK(ModelTestCase):
+    @requires_models(UUIDReg)
+    def test_bulk_update_uuid_pk(self):
+        r1 = UUIDReg.create(key='k1')
+        r2 = UUIDReg.create(key='k2')
+        r1.key = 'k1-x'
+        r2.key = 'k2-x'
+        UUIDReg.bulk_update((r1, r2), (UUIDReg.key,))
+
+        r1_db, r2_db = UUIDReg.select().order_by(UUIDReg.key)
+        self.assertEqual(r1_db.key, 'k1-x')
+        self.assertEqual(r2_db.key, 'k2-x')
+
+    @requires_models(CharPKKV)
+    def test_bulk_update_non_integer_pk(self):
+        a, b, c = [CharPKKV.create(id=c, key='k%s' % c) for c in 'abc']
+        a.key = 'ka-x'
+        a.value = 1
+        b.value = 2
+        c.key = 'kc-x'
+        c.value = 3
+        CharPKKV.bulk_update((a, b, c), (CharPKKV.key, CharPKKV.value))
+
+        data = list(CharPKKV.select().order_by(CharPKKV.id).tuples())
+        self.assertEqual(data, [
+            ('a', 'ka-x', 1),
+            ('b', 'kb', 2),
+            ('c', 'kc-x', 3)])
+
+
+class NDF(TestModel):
+    key = CharField(primary_key=True)
+    date = DateTimeField(null=True)
+
+class TestBulkUpdateAllNull(ModelTestCase):
+    requires = [NDF]
+
+    @skip_unless(IS_SQLITE or IS_MYSQL, 'postgres cannot do this properly')
+    def test_bulk_update_all_null(self):
+        n1 = NDF.create(key='n1', date=datetime.datetime(2021, 1, 1))
+        n2 = NDF.create(key='n2', date=datetime.datetime(2021, 1, 2))
+        rows = [NDF(key=key, date=None) for key in ('n1', 'n2')]
+        NDF.bulk_update(rows, fields=['date'])
+
+        query = NDF.select().order_by(NDF.key).tuples()
+        self.assertEqual([r for r in query], [('n1', None), ('n2', None)])
+
+
+class IMC(TestModel):
+    a = IntegerField()
+    b = IntegerField(null=True)
+
+class TestChunkedInsertMany(ModelTestCase):
+    requires = [IMC]
+
+    def test_chunked_insert_many(self):
+        data = [(i, i if i % 2 == 0 else None) for i in range(100)]
+        for chunk in chunked(data, 10):
+            IMC.insert_many(chunk).execute()
+
+        q = IMC.select(IMC.a, IMC.b).order_by(IMC.id).tuples()
+        self.assertEqual(list(q), data)
+        IMC.delete().execute()
+
+        data = [{'a': i, 'b': i if i % 2 == 0 else None} for i in range(100)]
+        for chunk in chunked(data, 5):
+            IMC.insert_many(chunk).execute()
+        q = IMC.select(IMC.a, IMC.b).order_by(IMC.id).dicts()
+        self.assertEqual(list(q), data)
+        IMC.delete().execute()
+
+
+# ===========================================================================
+# Model metadata and configuration
+# ===========================================================================
+
+
+class TestModelGraph(BaseTestCase):
+    def test_bind_model_database(self):
+        class User(Model): pass
+        class Tweet(Model):
+            user = ForeignKeyField(User)
+        class Relationship(Model):
+            from_user = ForeignKeyField(User, backref='relationships')
+            to_user = ForeignKeyField(User, backref='related_to')
+        class Flag(Model):
+            tweet = ForeignKeyField(Tweet)
+        class Unrelated(Model): pass
+
+        fake_db = SqliteDatabase(None)
+        User.bind(fake_db)
+        for model in (User, Tweet, Relationship, Flag):
+            self.assertTrue(model._meta.database is fake_db)
+        self.assertTrue(Unrelated._meta.database is None)
+        User.bind(None)
+
+        with User.bind_ctx(fake_db) as (FUser,):
+            self.assertTrue(FUser._meta.database is fake_db)
+            self.assertTrue(Unrelated._meta.database is None)
+
+        self.assertTrue(User._meta.database is None)
+
+
+class TestFieldInheritance(BaseTestCase):
+    def test_field_inheritance(self):
+        class BaseModel(Model):
+            class Meta:
+                database = get_in_memory_db()
+
+        class BasePost(BaseModel):
+            content = TextField()
+            timestamp = TimestampField()
+
+        class Photo(BasePost):
+            image = TextField()
+
+        class Note(BasePost):
+            category = TextField()
+
+        self.assertEqual(BasePost._meta.sorted_field_names,
+                         ['id', 'content', 'timestamp'])
+        self.assertEqual(BasePost._meta.sorted_fields, [
+            BasePost.id,
+            BasePost.content,
+            BasePost.timestamp])
+
+        self.assertEqual(Photo._meta.sorted_field_names,
+                         ['id', 'content', 'timestamp', 'image'])
+        self.assertEqual(Photo._meta.sorted_fields, [
+            Photo.id,
+            Photo.content,
+            Photo.timestamp,
+            Photo.image])
+
+        self.assertEqual(Note._meta.sorted_field_names,
+                         ['id', 'content', 'timestamp', 'category'])
+        self.assertEqual(Note._meta.sorted_fields, [
+            Note.id,
+            Note.content,
+            Note.timestamp,
+            Note.category])
+
+        self.assertTrue(id(Photo.id) != id(Note.id))
+
+    def test_foreign_key_field_inheritance(self):
+        class BaseModel(Model):
+            class Meta:
+                database = get_in_memory_db()
+
+        class Category(BaseModel):
+            name = TextField()
+
+        class BasePost(BaseModel):
+            category = ForeignKeyField(Category)
+            timestamp = TimestampField()
+
+        class Photo(BasePost):
+            image = TextField()
+
+        class Note(BasePost):
+            content = TextField()
+
+        self.assertEqual(BasePost._meta.sorted_field_names,
+                         ['id', 'category', 'timestamp'])
+        self.assertEqual(BasePost._meta.sorted_fields, [
+            BasePost.id,
+            BasePost.category,
+            BasePost.timestamp])
+
+        self.assertEqual(Photo._meta.sorted_field_names,
+                         ['id', 'category', 'timestamp', 'image'])
+        self.assertEqual(Photo._meta.sorted_fields, [
+            Photo.id,
+            Photo.category,
+            Photo.timestamp,
+            Photo.image])
+
+        self.assertEqual(Note._meta.sorted_field_names,
+                         ['id', 'category', 'timestamp', 'content'])
+        self.assertEqual(Note._meta.sorted_fields, [
+            Note.id,
+            Note.category,
+            Note.timestamp,
+            Note.content])
+
+        self.assertEqual(Category._meta.backrefs, {
+            BasePost.category: BasePost,
+            Photo.category: Photo,
+            Note.category: Note})
+        self.assertEqual(BasePost._meta.refs, {BasePost.category: Category})
+        self.assertEqual(Photo._meta.refs, {Photo.category: Category})
+        self.assertEqual(Note._meta.refs, {Note.category: Category})
+
+        self.assertEqual(BasePost.category.backref, 'basepost_set')
+        self.assertEqual(Photo.category.backref, 'photo_set')
+        self.assertEqual(Note.category.backref, 'note_set')
+
+    def test_foreign_key_pk_inheritance(self):
+        class BaseModel(Model):
+            class Meta:
+                database = get_in_memory_db()
+        class Account(BaseModel): pass
+        class BaseUser(BaseModel):
+            account = ForeignKeyField(Account, primary_key=True)
+        class User(BaseUser):
+            username = TextField()
+        class Admin(BaseUser):
+            role = TextField()
+
+        self.assertEqual(Account._meta.backrefs, {
+            Admin.account: Admin,
+            User.account: User,
+            BaseUser.account: BaseUser})
+
+        self.assertEqual(BaseUser.account.backref, 'baseuser_set')
+        self.assertEqual(User.account.backref, 'user_set')
+        self.assertEqual(Admin.account.backref, 'admin_set')
+        self.assertTrue(Account.user_set.model is Account)
+        self.assertTrue(Account.admin_set.model is Account)
+        self.assertTrue(Account.user_set.rel_model is User)
+        self.assertTrue(Account.admin_set.rel_model is Admin)
+
+        self.assertSQL(Account._schema._create_table(), (
+            'CREATE TABLE IF NOT EXISTS "account" ('
+            '"id" INTEGER NOT NULL PRIMARY KEY)'), [])
+
+        self.assertSQL(User._schema._create_table(), (
+            'CREATE TABLE IF NOT EXISTS "user" ('
+            '"account_id" INTEGER NOT NULL PRIMARY KEY, '
+            '"username" TEXT NOT NULL, '
+            'FOREIGN KEY ("account_id") REFERENCES "account" ("id"))'), [])
+
+        self.assertSQL(Admin._schema._create_table(), (
+            'CREATE TABLE IF NOT EXISTS "admin" ('
+            '"account_id" INTEGER NOT NULL PRIMARY KEY, '
+            '"role" TEXT NOT NULL, '
+            'FOREIGN KEY ("account_id") REFERENCES "account" ("id"))'), [])
+
+    def test_backref_inheritance(self):
+        class Category(TestModel): pass
+        def backref(fk_field):
+            return '%ss' % fk_field.model._meta.name
+        class BasePost(TestModel):
+            category = ForeignKeyField(Category, backref=backref)
+        class Note(BasePost): pass
+        class Photo(BasePost): pass
+
+        self.assertEqual(Category._meta.backrefs, {
+            BasePost.category: BasePost,
+            Note.category: Note,
+            Photo.category: Photo})
+        self.assertEqual(BasePost.category.backref, 'baseposts')
+        self.assertEqual(Note.category.backref, 'notes')
+        self.assertEqual(Photo.category.backref, 'photos')
+        self.assertTrue(Category.baseposts.rel_model is BasePost)
+        self.assertTrue(Category.baseposts.model is Category)
+        self.assertTrue(Category.notes.rel_model is Note)
+        self.assertTrue(Category.notes.model is Category)
+        self.assertTrue(Category.photos.rel_model is Photo)
+        self.assertTrue(Category.photos.model is Category)
+
+        class BaseItem(TestModel):
+            category = ForeignKeyField(Category, backref='items')
+        class ItemA(BaseItem): pass
+        class ItemB(BaseItem): pass
+
+        self.assertEqual(BaseItem.category.backref, 'items')
+        self.assertEqual(ItemA.category.backref, 'itema_set')
+        self.assertEqual(ItemB.category.backref, 'itemb_set')
+        self.assertTrue(Category.items.rel_model is BaseItem)
+        self.assertTrue(Category.itema_set.rel_model is ItemA)
+        self.assertTrue(Category.itema_set.model is Category)
+        self.assertTrue(Category.itemb_set.rel_model is ItemB)
+        self.assertTrue(Category.itemb_set.model is Category)
+
+    @skip_if(IS_SQLITE, 'sqlite is not supported')
+    @skip_if(IS_MYSQL, 'mysql is not raising this error(?)')
+    @skip_if(IS_CRDB, 'crdb is not raising the error in this test(?)')
+    def test_deferred_fk_creation(self):
+        class B(TestModel):
+            a = DeferredForeignKey('A', null=True)
+            b = TextField()
+        class A(TestModel):
+            a = TextField()
+
+        db.create_tables([A, B])
+
+        try:
+            # Test that we can create B with null "a_id" column:
+            a = A.create(a='a')
+            b = B.create(b='b')
+
+            # Test that we can create B that has no corresponding A:
+            fake_a = A(id=31337)
+            b2 = B.create(a=fake_a, b='b2')
+            b2_db = B.get(B.a == fake_a)
+            self.assertEqual(b2_db.b, 'b2')
+
+            # Ensure error occurs trying to create_foreign_key.
+            with db.atomic():
+                self.assertRaises(
+                    IntegrityError,
+                    B._schema.create_foreign_key,
+                    B.a)
+
+            b2_db.delete_instance()
+
+            # We can now create the foreign key.
+            B._schema.create_foreign_key(B.a)
+
+            # The foreign-key is enforced:
+            with db.atomic():
+                self.assertRaises(IntegrityError, B.create, a=fake_a, b='b3')
+        finally:
+            db.drop_tables([A, B])
+
+
+class TestMetaTableName(BaseTestCase):
+    def test_table_name_behavior(self):
+        def make_model(model_name, table=None):
+            class Meta:
+                legacy_table_names = False
+                table_name = table
+            return type(model_name, (Model,), {'Meta': Meta})
+        def assertTableName(expected, model_name, table_name=None):
+            model_class = make_model(model_name, table_name)
+            self.assertEqual(model_class._meta.table_name, expected)
+
+        assertTableName('users', 'User', 'users')
+        assertTableName('tweet', 'Tweet')
+        assertTableName('user_profile', 'UserProfile')
+        assertTableName('activity_log_status', 'ActivityLogStatus')
+
+        assertTableName('camel_case', 'CamelCase')
+        assertTableName('camel_camel_case', 'CamelCamelCase')
+        assertTableName('camel2_camel2_case', 'Camel2Camel2Case')
+        assertTableName('http_request', 'HTTPRequest')
+        assertTableName('api_response', 'APIResponse')
+        assertTableName('api_response', 'API_Response')
+        assertTableName('web_http_request', 'WebHTTPRequest')
+        assertTableName('get_http_response_code', 'getHTTPResponseCode')
+        assertTableName('foo_bar', 'foo_Bar')
+        assertTableName('foo_bar', 'Foo__Bar')
+
+
+class TestMetaInheritance(BaseTestCase):
+    def test_table_name(self):
+        class Foo(Model):
+            class Meta:
+                def table_function(klass):
+                    return 'xxx_%s' % klass.__name__.lower()
+
+        class Bar(Foo): pass
+        class Baze(Foo):
+            class Meta:
+                table_name = 'yyy_baze'
+        class Biz(Baze): pass
+        class Nug(Foo):
+            class Meta:
+                def table_function(klass):
+                    return 'zzz_%s' % klass.__name__.lower()
+
+        self.assertEqual(Foo._meta.table_name, 'xxx_foo')
+        self.assertEqual(Bar._meta.table_name, 'xxx_bar')
+        self.assertEqual(Baze._meta.table_name, 'yyy_baze')
+        self.assertEqual(Biz._meta.table_name, 'xxx_biz')
+        self.assertEqual(Nug._meta.table_name, 'zzz_nug')
+
+    def test_composite_key_inheritance(self):
+        class Foo(Model):
+            key = TextField()
+            value = TextField()
+
+            class Meta:
+                primary_key = CompositeKey('key', 'value')
+
+        class Bar(Foo): pass
+        class Baze(Foo):
+            value = IntegerField()
+
+        foo = Foo(key='k1', value='v1')
+        self.assertEqual(foo.__composite_key__, ('k1', 'v1'))
+
+        bar = Bar(key='k2', value='v2')
+        self.assertEqual(bar.__composite_key__, ('k2', 'v2'))
+
+        baze = Baze(key='k3', value=3)
+        self.assertEqual(baze.__composite_key__, ('k3', 3))
+
+    def test_no_primary_key_inheritable(self):
+        class Foo(Model):
+            data = TextField()
+
+            class Meta:
+                primary_key = False
+
+        class Bar(Foo): pass
+        class Baze(Foo):
+            pk = AutoField()
+        class Zai(Foo):
+            zee = TextField(primary_key=True)
+
+        self.assertFalse(Foo._meta.primary_key)
+        self.assertEqual(Foo._meta.sorted_field_names, ['data'])
+        self.assertFalse(Bar._meta.primary_key)
+        self.assertEqual(Bar._meta.sorted_field_names, ['data'])
+
+        self.assertTrue(Baze._meta.primary_key is Baze.pk)
+        self.assertEqual(Baze._meta.sorted_field_names, ['pk', 'data'])
+
+        self.assertTrue(Zai._meta.primary_key is Zai.zee)
+        self.assertEqual(Zai._meta.sorted_field_names, ['zee', 'data'])
+
+    def test_inheritance(self):
+        db = SqliteDatabase(':memory:')
+
+        class Base(Model):
+            class Meta:
+                constraints = ['c1', 'c2']
+                database = db
+                indexes = (
+                    (('username',), True),
+                )
+                only_save_dirty = True
+                options = {'key': 'value'}
+                schema = 'magic'
+
+        class Child(Base): pass
+        class GrandChild(Child): pass
+
+        for ModelClass in (Child, GrandChild):
+            self.assertEqual(ModelClass._meta.constraints, ['c1', 'c2'])
+            self.assertTrue(ModelClass._meta.database is db)
+            self.assertEqual(ModelClass._meta.indexes, [(('username',), True)])
+            self.assertEqual(ModelClass._meta.options, {'key': 'value'})
+            self.assertTrue(ModelClass._meta.only_save_dirty)
+            self.assertEqual(ModelClass._meta.schema, 'magic')
+
+        class Overrides(Base):
+            class Meta:
+                constraints = None
+                indexes = None
+                only_save_dirty = False
+                options = {'foo': 'bar'}
+                schema = None
+
+        self.assertTrue(Overrides._meta.constraints is None)
+        self.assertEqual(Overrides._meta.indexes, [])
+        self.assertFalse(Overrides._meta.only_save_dirty)
+        self.assertEqual(Overrides._meta.options, {'foo': 'bar'})
+        self.assertTrue(Overrides._meta.schema is None)
+
+    def test_temporary_inheritance(self):
+        class T0(TestModel): pass
+        class T1(TestModel):
+            class Meta:
+                temporary = True
+
+        class T2(T1): pass
+        class T3(T1):
+            class Meta:
+                temporary = False
+
+        self.assertFalse(T0._meta.temporary)
+        self.assertTrue(T1._meta.temporary)
+        self.assertTrue(T2._meta.temporary)
+        self.assertFalse(T3._meta.temporary)
+
+
+class TestModelMetadataMisc(BaseTestCase):
+    database = get_in_memory_db()
+
+    def test_subclass_aware_metadata(self):
+        class SchemaPropagateMetadata(SubclassAwareMetadata):
+            @property
+            def schema(self):
+                return self._schema
+            @schema.setter
+            def schema(self, value):
+                # self.models is a singleton, essentially, shared among all
+                # classes that use this metadata implementation.
+                for model in self.models:
+                    model._meta._schema = value
+
+        class Base(Model):
+            class Meta:
+                database = self.database
+                model_metadata_class = SchemaPropagateMetadata
+
+        class User(Base):
+            username = TextField()
+        class Tweet(Base):
+            user = ForeignKeyField(User, backref='tweets')
+            content = TextField()
+
+        self.assertTrue(User._meta.schema is None)
+        self.assertTrue(Tweet._meta.schema is None)
+
+        Base._meta.schema = 'temp'
+        self.assertEqual(User._meta.schema, 'temp')
+        self.assertEqual(Tweet._meta.schema, 'temp')
+
+        User._meta.schema = None
+        for model in (Base, User, Tweet):
+            self.assertTrue(model._meta.schema is None)
+
+
+class TestModelSetDatabase(BaseTestCase):
+    def test_set_database(self):
+        class Register(Model):
+            value = IntegerField()
+
+        db_a = get_in_memory_db()
+        db_b = get_in_memory_db()
+        Register._meta.set_database(db_a)
+        Register.create_table()
+        Register._meta.set_database(db_b)
+        self.assertFalse(Register.table_exists())
+        self.assertEqual(db_a.get_tables(), ['register'])
+        self.assertEqual(db_b.get_tables(), [])
+        db_a.close()
+        db_b.close()
+
+
+class TestForeignKeyFieldDescriptors(BaseTestCase):
+    def test_foreign_key_field_descriptors(self):
+        class User(Model): pass
+        class T0(Model):
+            user = ForeignKeyField(User)
+        class T1(Model):
+            user = ForeignKeyField(User, column_name='uid')
+        class T2(Model):
+            user = ForeignKeyField(User, object_id_name='uid')
+        class T3(Model):
+            user = ForeignKeyField(User, column_name='x', object_id_name='uid')
+        class T4(Model):
+            foo = ForeignKeyField(User, column_name='user')
+        class T5(Model):
+            foo = ForeignKeyField(User, object_id_name='uid')
+
+        self.assertEqual(T0.user.object_id_name, 'user_id')
+        self.assertEqual(T1.user.object_id_name, 'uid')
+        self.assertEqual(T2.user.object_id_name, 'uid')
+        self.assertEqual(T3.user.object_id_name, 'uid')
+        self.assertEqual(T4.foo.object_id_name, 'user')
+        self.assertEqual(T5.foo.object_id_name, 'uid')
+
+        user = User(id=1337)
+        self.assertEqual(T0(user=user).user_id, 1337)
+        self.assertEqual(T1(user=user).uid, 1337)
+        self.assertEqual(T2(user=user).uid, 1337)
+        self.assertEqual(T3(user=user).uid, 1337)
+        self.assertEqual(T4(foo=user).user, 1337)
+        self.assertEqual(T5(foo=user).uid, 1337)
+
+        def conflicts_with_field():
+            class TE(Model):
+                user = ForeignKeyField(User, object_id_name='user')
+
+        self.assertRaises(ValueError, conflicts_with_field)
+
+    def test_column_name(self):
+        class User(Model): pass
+        class T1(Model):
+            user = ForeignKeyField(User, column_name='user')
+
+        self.assertEqual(T1.user.column_name, 'user')
+        self.assertEqual(T1.user.object_id_name, 'user_id')
+
+
+class NoPK(TestModel):
+    data = IntegerField()
     class Meta:
-        constraints = [Check('price > 0')]
-
-
-class TestModelConstraints(ModelTestCase):
-    requires = [Product]
-
-    def test_model_constraints(self):
-        p = Product.create(name='p1', price=1, status='a')
-        self.assertTrue(p.flags is None)
-
-        # Price was saved successfully, flags got server-side default value.
-        p_db = Product.get(Product.id == p.id)
-        self.assertEqual(p_db.price, 1)
-        self.assertEqual(p_db.flags, 99)
-        self.assertEqual(p_db.status, 'a')
-
-        # Cannot update price with invalid value, must be > 0.
-        with self.database.atomic():
-            p.price = -1
-            self.assertRaises(DatabaseError, p.save)
-
-        # Nor can we create a new product with an invalid price.
-        with self.database.atomic():
-            self.assertRaises(DatabaseError, Product.create, name='p2',
-                              price=0, status='a')
-
-        # Cannot set status to a value other than 1, 2 or 3.
-        with self.database.atomic():
-            p.price = 1
-            p.status = 'd'
-            self.assertRaises(DatabaseError, p.save)
-
-        # Cannot create a new product with invalid status.
-        with self.database.atomic():
-            self.assertRaises(DatabaseError, Product.create, name='p3',
-                              price=1, status='x')
+        primary_key = False
 
 
 class TestModelFieldReprs(BaseTestCase):
@@ -4692,6 +5663,206 @@ class TestModelFieldReprs(BaseTestCase):
 
         u = User(username='charlie')
         self.assertEqual(repr(u), '<User: Charlie>')
+
+
+class ColAlias(TestModel):
+    name = TextField(column_name='pname')
+
+
+class CARef(TestModel):
+    colalias = ForeignKeyField(ColAlias, backref='carefs', column_name='ca',
+                               object_id_name='colalias_id')
+
+
+class TestQueryAliasToColumnName(ModelTestCase):
+    requires = [ColAlias, CARef]
+
+    def setUp(self):
+        super(TestQueryAliasToColumnName, self).setUp()
+        with self.database.atomic():
+            for name in ('huey', 'mickey'):
+                col_alias = ColAlias.create(name=name)
+                CARef.create(colalias=col_alias)
+
+    def test_alias_to_column_name(self):
+        # The issue here occurs when we take a field whose name differs from
+        # it's underlying column name, then alias that field to it's column
+        # name. In this case, peewee was *not* respecting the alias and using
+        # the field name instead.
+        query = (ColAlias
+                 .select(ColAlias.name.alias('pname'))
+                 .order_by(ColAlias.name))
+        self.assertEqual([c.pname for c in query], ['huey', 'mickey'])
+
+        # Ensure that when using dicts the logic is preserved.
+        query = query.dicts()
+        self.assertEqual([r['pname'] for r in query], ['huey', 'mickey'])
+
+    def test_alias_overlap_with_join(self):
+        query = (CARef
+                 .select(CARef, ColAlias.name.alias('pname'))
+                 .join(ColAlias)
+                 .order_by(ColAlias.name))
+        with self.assertQueryCount(1):
+            self.assertEqual([r.colalias.pname for r in query],
+                             ['huey', 'mickey'])
+
+        # Note: we cannot alias the join to "ca", as this is the object-id
+        # descriptor name.
+        query = (CARef
+                 .select(CARef, ColAlias.name.alias('pname'))
+                 .join(ColAlias,
+                       on=(CARef.colalias == ColAlias.id).alias('ca'))
+                 .order_by(ColAlias.name))
+        with self.assertQueryCount(1):
+            self.assertEqual([r.ca.pname for r in query], ['huey', 'mickey'])
+
+    def test_cannot_alias_join_to_object_id_name(self):
+        query = CARef.select(CARef, ColAlias.name.alias('pname'))
+        expr = (CARef.colalias == ColAlias.id).alias('colalias_id')
+        self.assertRaises(ValueError, query.join, ColAlias, on=expr)
+
+
+class TestOverrideModelRepr(BaseTestCase):
+    def test_custom_reprs(self):
+        # In 3.5.0, Peewee included a new implementation and semantics for
+        # customizing model reprs. This introduced a regression where model
+        # classes that defined a __repr__() method had this override ignored
+        # silently. This test ensures that it is possible to completely
+        # override the model repr.
+        class Foo(Model):
+            def __repr__(self):
+                return 'FOO: %s' % self.id
+
+        f = Foo(id=1337)
+        self.assertEqual(repr(f), 'FOO: 1337')
+
+
+class Product(TestModel):
+    name = TextField()
+    price = IntegerField()
+    flags = IntegerField(constraints=[SQL('DEFAULT 99')])
+    status = CharField(constraints=[Check("status IN ('a', 'b', 'c')")])
+
+    class Meta:
+        constraints = [Check('price > 0')]
+
+
+class TestModelConstraints(ModelTestCase):
+    requires = [Product]
+
+    def test_model_constraints(self):
+        p = Product.create(name='p1', price=1, status='a')
+        self.assertTrue(p.flags is None)
+
+        # Price was saved successfully, flags got server-side default value.
+        p_db = Product.get(Product.id == p.id)
+        self.assertEqual(p_db.price, 1)
+        self.assertEqual(p_db.flags, 99)
+        self.assertEqual(p_db.status, 'a')
+
+        # Cannot update price with invalid value, must be > 0.
+        with self.database.atomic():
+            p.price = -1
+            self.assertRaises(DatabaseError, p.save)
+
+        # Nor can we create a new product with an invalid price.
+        with self.database.atomic():
+            self.assertRaises(DatabaseError, Product.create, name='p2',
+                              price=0, status='a')
+
+        # Cannot set status to a value other than 1, 2 or 3.
+        with self.database.atomic():
+            p.price = 1
+            p.status = 'd'
+            self.assertRaises(DatabaseError, p.save)
+
+        # Cannot create a new product with invalid status.
+        with self.database.atomic():
+            self.assertRaises(DatabaseError, Product.create, name='p3',
+                              price=1, status='x')
+
+
+class SequenceModel(TestModel):
+    seq_id = IntegerField(sequence='seq_id_sequence')
+    key = TextField()
+
+
+@requires_pglike
+class TestSequence(ModelTestCase):
+    requires = [SequenceModel]
+
+    def test_create_table(self):
+        query = SequenceModel._schema._create_table()
+        self.assertSQL(query, (
+            'CREATE TABLE IF NOT EXISTS "sequence_model" ('
+            '"id" SERIAL NOT NULL PRIMARY KEY, '
+            '"seq_id" INTEGER NOT NULL DEFAULT NEXTVAL(\'seq_id_sequence\'), '
+            '"key" TEXT NOT NULL)'), [])
+
+    def test_sequence(self):
+        for key in ('k1', 'k2', 'k3'):
+            SequenceModel.create(key=key)
+
+        s1, s2, s3 = SequenceModel.select().order_by(SequenceModel.key)
+
+        self.assertEqual(s1.seq_id, 1)
+        self.assertEqual(s2.seq_id, 2)
+        self.assertEqual(s3.seq_id, 3)
+
+
+# ===========================================================================
+# Database integration
+# ===========================================================================
+
+
+class TestBindTo(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_bind_to(self):
+        for i in (1, 2, 3):
+            user = User.create(username='u%s' % i)
+            Tweet.create(user=user, content='t%s' % i)
+
+        # Alias to a particular field-name.
+        name = Case(User.username, [
+            ('u1', 'user 1'),
+            ('u2', 'user 2')], 'someone else')
+        q = (Tweet
+             .select(Tweet.content, name.alias('username').bind_to(User))
+             .join(User)
+             .order_by(Tweet.content))
+        with self.assertQueryCount(1):
+            self.assertEqual([(t.content, t.user.username) for t in q], [
+                ('t1', 'user 1'),
+                ('t2', 'user 2'),
+                ('t3', 'someone else')])
+
+        # Use a different alias.
+        q = (Tweet
+             .select(Tweet.content, name.alias('display').bind_to(User))
+             .join(User)
+             .order_by(Tweet.content))
+        with self.assertQueryCount(1):
+            self.assertEqual([(t.content, t.user.display) for t in q], [
+                ('t1', 'user 1'),
+                ('t2', 'user 2'),
+                ('t3', 'someone else')])
+
+        # Ensure works with model and field aliases.
+        TA, UA = Tweet.alias(), User.alias()
+        name = Case(UA.username, [
+            ('u1', 'user 1'),
+            ('u2', 'user 2')], 'someone else')
+        q = (TA
+             .select(TA.content, name.alias('display').bind_to(UA))
+             .join(UA, on=(UA.id == TA.user))
+             .order_by(TA.content))
+        with self.assertQueryCount(1):
+            self.assertEqual([(t.content, t.user.display) for t in q], [
+                ('t1', 'user 1'),
+                ('t2', 'user 2'),
+                ('t3', 'someone else')])
 
 
 class TestGetWithSecondDatabase(ModelTestCase):
@@ -4750,402 +5921,1133 @@ class TestDatabaseExecuteQuery(ModelTestCase):
         self.assertEqual([row[1] for row in cursor], ['zaizee', 'huey'])
 
 
-class Datum(TestModel):
-    key = TextField()
-    value = IntegerField(null=True)
+class ConflictDetectedException(Exception): pass
 
-class TestNullOrdering(ModelTestCase):
-    requires = [Datum]
+class BaseVersionedModel(TestModel):
+    version = IntegerField(default=1, index=True)
 
-    def test_null_ordering(self):
-        values = [('k1', 1), ('ka', None), ('k2', 2), ('kb', None)]
-        Datum.insert_many(values, fields=[Datum.key, Datum.value]).execute()
+    def save_optimistic(self):
+        if not self.id:
+            # This is a new record, so the default logic is to perform an
+            # INSERT. Ideally your model would also have a unique
+            # constraint that made it impossible for two INSERTs to happen
+            # at the same time.
+            return self.save()
 
-        def assertOrder(ordering, expected):
-            query = Datum.select().order_by(*ordering)
-            self.assertEqual([d.key for d in query], expected)
+        # Update any data that has changed and bump the version counter.
+        field_data = dict(self.__data__)
+        current_version = field_data.pop('version', 1)
+        self._populate_unsaved_relations(field_data)
+        field_data = self._prune_fields(field_data, self.dirty_fields)
+        if not field_data:
+            raise ValueError('No changes have been made.')
 
-        # Ascending order.
-        nulls_last = (Datum.value.asc(nulls='last'), Datum.key)
-        assertOrder(nulls_last, ['k1', 'k2', 'ka', 'kb'])
+        ModelClass = type(self)
+        field_data['version'] = ModelClass.version + 1  # Atomic increment.
 
-        nulls_first = (Datum.value.asc(nulls='first'), Datum.key)
-        assertOrder(nulls_first, ['ka', 'kb', 'k1', 'k2'])
+        query = ModelClass.update(**field_data).where(
+            (ModelClass.version == current_version) &
+            (ModelClass.id == self.id))
+        if query.execute() == 0:
+            # No rows were updated, indicating another process has saved
+            # a new version. How you handle this situation is up to you,
+            # but for simplicity I'm just raising an exception.
+            raise ConflictDetectedException()
+        else:
+            # Increment local version to match what is now in the db.
+            self.version += 1
+            return True
 
-        # Descending order.
-        nulls_last = (Datum.value.desc(nulls='last'), Datum.key)
-        assertOrder(nulls_last, ['k2', 'k1', 'ka', 'kb'])
+class VUser(BaseVersionedModel):
+    username = TextField()
 
-        nulls_first = (Datum.value.desc(nulls='first'), Datum.key)
-        assertOrder(nulls_first, ['ka', 'kb', 'k2', 'k1'])
-
-        # Invalid values.
-        self.assertRaises(ValueError, Datum.value.desc, nulls='bar')
-        self.assertRaises(ValueError, Datum.value.asc, nulls='foo')
-
-
-class Student(TestModel):
-    name = TextField()
-
-class Course(TestModel):
-    name = TextField()
-
-class Attendance(TestModel):
-    student = ForeignKeyField(Student)
-    course = ForeignKeyField(Course)
-
-
-class TestManyToManyJoining(ModelTestCase):
-    requires = [Student, Course, Attendance]
-
-    def setUp(self):
-        super(TestManyToManyJoining, self).setUp()
-
-        data = (
-            ('charlie', ('eng101', 'cs101', 'cs111')),
-            ('huey', ('cats1', 'cats2', 'cats3')),
-            ('zaizee', ('cats2', 'cats3')))
-        c = {}
-        with self.database.atomic():
-            for name, courses in data:
-                student = Student.create(name=name)
-                for course in courses:
-                    if course not in c:
-                        c[course] = Course.create(name=course)
-                    Attendance.create(student=student, course=c[course])
-
-    def assertQuery(self, query):
-        with self.assertQueryCount(1):
-            query = query.order_by(Attendance.id)
-            results = [(a.student.name, a.course.name) for a in query]
-            self.assertEqual(results, [
-                ('charlie', 'eng101'),
-                ('charlie', 'cs101'),
-                ('charlie', 'cs111'),
-                ('huey', 'cats1'),
-                ('huey', 'cats2'),
-                ('zaizee', 'cats2')])
-
-    def test_join_subquery(self):
-        courses = (Course
-                   .select(Course.id, Course.name)
-                   .order_by(Course.id)
-                   .limit(5))
-        query = (Attendance
-                 .select(Attendance, Student, courses.c.name)
-                 .join_from(Attendance, Student)
-                 .join_from(Attendance, courses,
-                            on=(Attendance.course == courses.c.id)))
-        self.assertQuery(query)
-
-    @skip_if(IS_MYSQL)
-    def test_join_where_subquery(self):
-        courses = Course.select().order_by(Course.id).limit(5)
-        query = (Attendance
-                 .select(Attendance, Student, Course)
-                 .join_from(Attendance, Student)
-                 .join_from(Attendance, Course)
-                 .where(Attendance.course.in_(courses)))
-        self.assertQuery(query)
+class VTweet(BaseVersionedModel):
+    user = ForeignKeyField(VUser, null=True)
+    content = TextField()
 
 
-class TestColumnNameStripping(ModelTestCase):
+class TestOptimisticLockingDemo(ModelTestCase):
+    requires = [VUser, VTweet]
+
+    def test_optimistic_locking(self):
+        vu = VUser(username='u1')
+        vu.save_optimistic()
+        vt = VTweet(user=vu, content='t1')
+        vt.save_optimistic()
+
+        # Update the "vt" row in the db, which bumps the version counter.
+        vt2 = VTweet.get(VTweet.id == vt.id)
+        vt2.content = 't1-x'
+        vt2.save_optimistic()
+
+        # Since no data was modified, this returns a ValueError.
+        self.assertRaises(ValueError, vt.save_optimistic)
+
+        # If we do make an update and attempt to save, a conflict is detected.
+        vt.content = 't1-y'
+        self.assertRaises(ConflictDetectedException, vt.save_optimistic)
+        self.assertEqual(vt.version, 1)
+
+        vt_db = VTweet.get(VTweet.id == vt.id)
+        self.assertEqual(vt_db.content, 't1-x')
+        self.assertEqual(vt_db.version, 2)
+        self.assertEqual(vt_db.user.username, 'u1')
+
+    def test_optimistic_locking_populate_fks(self):
+        vt = VTweet(content='t1')
+        vt.save_optimistic()
+
+        vu = VUser(username='u1')
+        vt.user = vu
+
+        vu.save_optimistic()
+        vt.save_optimistic()
+        vt_db = VTweet.get(VTweet.content == 't1')
+        self.assertEqual(vt_db.version, 2)
+        self.assertEqual(vt_db.user.username, 'u1')
+
+
+# ===========================================================================
+# Regressions and bug-fix tests
+# ===========================================================================
+
+
+class DiA(TestModel):
+    a = TextField(unique=True)
+class DiB(TestModel):
+    a = ForeignKeyField(DiA)
+    b = TextField()
+class DiC(TestModel):
+    b = ForeignKeyField(DiB)
+    c = TextField()
+class DiD(TestModel):
+    c = ForeignKeyField(DiC)
+    d = TextField()
+class DiBA(TestModel):
+    a = ForeignKeyField(DiA, to_field=DiA.a)
+    b = TextField()
+
+
+class TestDeleteInstanceRegression(ModelTestCase):
     database = get_in_memory_db()
-    requires = [Person]
+    requires = [DiA, DiB, DiC, DiD, DiBA]
 
-    def test_column_name_stripping(self):
-        d1 = datetime.date(1990, 1, 1)
-        d2 = datetime.date(1990, 1, 1)
-        p1 = Person.create(first='f1', last='l1', dob=d1)
-        p2 = Person.create(first='f2', last='l2', dob=d2)
+    def test_delete_instance_regression(self):
+        with self.database.atomic():
+            a1, a2, a3 = [DiA.create(a=a) for a in ('a1', 'a2', 'a3')]
+            for a in (a1, a2, a3):
+                for j in (1, 2):
+                    b = DiB.create(a=a, b='%s-b%s' % (a.a, j))
+                    c = DiC.create(b=b, c='%s-c' % (b.b))
+                    d = DiD.create(c=c, d='%s-d' % (c.c))
 
-        query = Person.select(
-            fn.MIN(Person.dob),
-            fn.MAX(Person.dob).alias('mdob'))
-        # Get the row as a model.
-        row = query.get()
-        self.assertEqual(row.dob, d1)
-        self.assertEqual(row.mdob, d2)
+                    DiBA.create(a=a, b='%s-b%s' % (a.a, j))
 
-        row = query.dicts().get()
-        self.assertEqual(row['dob'], d1)
-        self.assertEqual(row['mdob'], d2)
+        # (a1 (b1 (c (d))), (b2 (c (d)))), (a2 ...), (a3 ...)
+        with self.assertQueryCount(5):
+            a2.delete_instance(recursive=True)
 
+        self.assertHistory(5, [
+            ('DELETE FROM "di_d" WHERE ("di_d"."c_id" IN ('
+             'SELECT "t1"."id" FROM "di_c" AS "t1" WHERE ("t1"."b_id" IN ('
+             'SELECT "t2"."id" FROM "di_b" AS "t2" WHERE ("t2"."a_id" = ?)'
+             '))))', [2]),
+            ('DELETE FROM "di_c" WHERE ("di_c"."b_id" IN ('
+             'SELECT "t1"."id" FROM "di_b" AS "t1" WHERE ("t1"."a_id" = ?)'
+             '))', [2]),
+            ('DELETE FROM "di_ba" WHERE ("di_ba"."a_id" = ?)', ['a2']),
+            ('DELETE FROM "di_b" WHERE ("di_b"."a_id" = ?)', [2]),
+            ('DELETE FROM "di_a" WHERE ("di_a"."id" = ?)', [2])
+        ])
 
-class VL(TestModel):
-    n = IntegerField()
-    s = CharField()
+        # a1 & a3 exist, plus their relations.
+        self.assertTrue(DiA.select().count(), 2)
+        for rel in (DiB, DiBA, DiC, DiD):
+            self.assertTrue(rel.select().count(), 4)  # 2x2
 
+        with self.assertQueryCount(5):
+            a1.delete_instance(recursive=True)
 
-@skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB)
-class TestValuesListIntegration(ModelTestCase):
-    requires = [VL]
-    _data = [(1, 'one'), (2, 'two'), (3, 'three')]
-
-    def test_insert_into_select_from_vl(self):
-        vl = ValuesList(self._data)
-        cte = vl.cte('newvals', columns=['n', 's'])
-        res = (VL
-               .insert_from(cte.select(cte.c.n, cte.c.s), fields=[VL.n, VL.s])
-               .with_cte(cte)
-               .execute())
-
-        vq = VL.select().order_by(VL.n)
-        self.assertEqual([(v.n, v.s) for v in vq], self._data)
-
-    def test_update_vl_cte(self):
-        VL.insert_many(self._data).execute()
-
-        new_values = [(1, 'One'), (3, 'Three'), (4, 'Four')]
-        cte = ValuesList(new_values).cte('new_values', columns=('n', 's'))
-
-        # We have to use a subquery to update the individual column, as SQLite
-        # does not support UPDATE/FROM syntax.
-        subq = (cte
-                .select(cte.c.s)
-                .where(VL.n == cte.c.n))
-
-        # Perform the update, assigning extra the new value from the values
-        # list, and restricting the overall update using the composite pk.
-        res = (VL
-               .update(s=subq)
-               .where(VL.n.in_(cte.select(cte.c.n)))
-               .with_cte(cte)
-               .execute())
-
-        vq = VL.select().order_by(VL.n)
-        self.assertEqual([(v.n, v.s) for v in vq], [
-            (1, 'One'), (2, 'two'), (3, 'Three')])
-
-    def test_values_list(self):
-        vl = ValuesList(self._data)
-
-        query = vl.select(SQL('*'))
-        self.assertEqual(list(query.tuples().bind(self.database)), self._data)
-
-    @requires_postgresql
-    def test_values_list_named_columns(self):
-        vl = ValuesList(self._data).columns('idx', 'name')
-        query = (vl
-                 .select(vl.c.idx, vl.c.name)
-                 .order_by(vl.c.idx.desc()))
-        self.assertEqual(list(query.tuples().bind(self.database)),
-                         self._data[::-1])
-
-    def test_values_list_named_columns_in_cte(self):
-        vl = ValuesList(self._data)
-        cte = vl.cte('val', columns=('idx', 'name'))
-        query = (cte
-                 .select(cte.c.idx, cte.c.name)
-                 .order_by(cte.c.idx.desc())
-                 .with_cte(cte))
-        self.assertEqual(list(query.tuples().bind(self.database)),
-                         self._data[::-1])
-
-    def test_named_values_list(self):
-        vl = ValuesList(self._data).alias('vl')
-        query = vl.select()
-        self.assertEqual(list(query.tuples().bind(self.database)), self._data)
+        # Only the objects related to a3 exist still.
+        self.assertTrue(DiA.select().count(), 1)
+        self.assertEqual(DiA.get(DiA.a == 'a3').id, a3.id)
+        self.assertEqual([d.d for d in DiD.select().order_by(DiD.d)],
+                         ['a3-b1-c-d', 'a3-b2-c-d'])
+        self.assertEqual([c.c for c in DiC.select().order_by(DiC.c)],
+                         ['a3-b1-c', 'a3-b2-c'])
+        self.assertEqual([b.b for b in DiB.select().order_by(DiB.b)],
+                         ['a3-b1', 'a3-b2'])
+        self.assertEqual([ba.b for ba in DiBA.select().order_by(DiBA.b)],
+                         ['a3-b1', 'a3-b2'])
 
 
-class C_Product(TestModel):
-    name = CharField()
-    price = IntegerField(default=0)
+class User2(TestModel):
+    username = TextField()
 
-class C_Archive(TestModel):
-    name = CharField()
-    price = IntegerField(default=0)
+class Category2(TestModel):
+    name = TextField()
+    parent = ForeignKeyField('self', backref='children', null=True)
+    user = ForeignKeyField(User2)
 
-class C_Part(TestModel):
-    part = CharField(primary_key=True)
-    sub_part = ForeignKeyField('self', null=True)
+class TestCountUnionRegression(ModelTestCase):
+    @requires_mysql
+    @requires_models(User)
+    def test_count_union(self):
+        with self.database.atomic():
+            for i in range(5):
+                User.create(username='user-%d' % i)
 
-@skip_unless(IS_POSTGRESQL)
-class TestDataModifyingCTEIntegration(ModelTestCase):
-    requires = [C_Product, C_Archive, C_Part]
+        lhs = User.select()
+        rhs = User.select()
+        query = (lhs | rhs)
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
+            'UNION '
+            'SELECT "t2"."id", "t2"."username" FROM "users" AS "t2"'), [])
 
+        self.assertEqual(query.count(), 5)
+
+        query = query.limit(3)
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
+            'UNION '
+            'SELECT "t2"."id", "t2"."username" FROM "users" AS "t2" '
+            'LIMIT ?'), [3])
+        self.assertEqual(query.count(), 3)
+
+
+class TestGithub1354(ModelTestCase):
+    @requires_models(Category2, User2)
+    def test_get_or_create_self_referential_fk2(self):
+        huey = User2.create(username='huey')
+        parent = Category2.create(name='parent', user=huey)
+        child, created = Category2.get_or_create(parent=parent, name='child',
+                                                 user=huey)
+        child_db = Category2.get(Category2.parent == parent)
+        self.assertEqual(child_db.user.username, 'huey')
+        self.assertEqual(child_db.parent.name, 'parent')
+        self.assertEqual(child_db.name, 'child')
+
+
+class TestInsertFromSQL(ModelTestCase):
     def setUp(self):
-        super(TestDataModifyingCTEIntegration, self).setUp()
-        for i in range(5):
-            C_Product.create(name='p%s' % i, price=i)
-        mp1_c_g = C_Part.create(part='mp1-c-g')
-        mp1_c = C_Part.create(part='mp1-c', sub_part=mp1_c_g)
-        mp1 = C_Part.create(part='mp1', sub_part=mp1_c)
-        mp2_c_g = C_Part.create(part='mp2-c-g')
-        mp2_c = C_Part.create(part='mp2-c', sub_part=mp2_c_g)
-        mp2 = C_Part.create(part='mp2', sub_part=mp2_c)
+        super(TestInsertFromSQL, self).setUp()
 
-    def test_data_modifying_cte_delete(self):
-        query = (C_Product.delete()
-                 .where(C_Product.price < 3)
-                 .returning(C_Product))
-        cte = query.cte('moved_rows')
+        self.database.execute_sql('create table if not exists user_src '
+                                  '(name TEXT);')
+        tbl = Table('user_src').bind(self.database)
+        tbl.insert(name='foo').execute()
 
-        src = Select((cte,), (cte.c.id, cte.c.name, cte.c.price))
-        res = (C_Archive
-               .insert_from(src, (C_Archive.id, C_Archive.name, C_Archive.price))
-               .with_cte(cte)
-               .execute())
-        self.assertEqual(len(list(res)), 3)
+    def tearDown(self):
+        super(TestInsertFromSQL, self).tearDown()
+        self.database.execute_sql('drop table if exists user_src')
 
-        self.assertEqual(
-            sorted([(p.name, p.price) for p in C_Product.select()]),
-            [('p3', 3), ('p4', 4)])
-        self.assertEqual(
-            sorted([(p.name, p.price) for p in C_Archive.select()]),
-            [('p0', 0), ('p1', 1), ('p2', 2)])
-
-        base = (C_Part
-                .select(C_Part.sub_part, C_Part.part)
-                .where(C_Part.part == 'mp1')
-                .cte('included_parts', recursive=True,
-                     columns=('sub_part', 'part')))
-        PA = C_Part.alias('p')
-        recursive = (PA
-                     .select(PA.sub_part, PA.part)
-                     .join(base, on=(PA.part == base.c.sub_part)))
-        cte = base.union_all(recursive)
-
-        sq = Select((cte,), (cte.c.part,))
-        res = (C_Part.delete()
-               .where(C_Part.part.in_(sq))
-               .with_cte(cte)
-               .execute())
-
-        self.assertEqual(sorted([p.part for p in C_Part.select()]),
-                         ['mp2', 'mp2-c', 'mp2-c-g'])
-
-    def test_data_modifying_cte_update(self):
-        # Populate archive table w/copy of data in product.
-        C_Archive.insert_from(
-            C_Product.select(),
-            (C_Product.id, C_Product.name, C_Product.price)).execute()
-
-        query = (C_Product
-                 .update(price=C_Product.price * 2)
-                 .returning(C_Product.id, C_Product.name, C_Product.price))
-        cte = query.cte('t')
-
-        sq = cte.select_from(cte.c.id, cte.c.name, cte.c.price)
-        self.assertEqual(sorted([(x.name, x.price) for x in sq]), [
-            ('p0', 0), ('p1', 2), ('p2', 4), ('p3', 6), ('p4', 8)])
-
-        # Ensure changes were persisted.
-        self.assertEqual(sorted([(x.name, x.price) for x in C_Product]), [
-            ('p0', 0), ('p1', 2), ('p2', 4), ('p3', 6), ('p4', 8)])
-
-        sq = Select((cte,), (cte.c.id, cte.c.price))
-        res = (C_Archive
-               .update(price=sq.c.price)
-               .from_(sq)
-               .where(C_Archive.id == sq.c.id)
-               .with_cte(cte)
-               .execute())
-
-        self.assertEqual(sorted([(x.name, x.price) for x in C_Product]), [
-            ('p0', 0), ('p1', 4), ('p2', 8), ('p3', 12), ('p4', 16)])
-        self.assertEqual(sorted([(x.name, x.price) for x in C_Archive]), [
-            ('p0', 0), ('p1', 4), ('p2', 8), ('p3', 12), ('p4', 16)])
-
-    def test_data_modifying_cte_insert(self):
-        query = (C_Product
-                 .insert({'name': 'p5', 'price': 5})
-                 .returning(C_Product.id, C_Product.name, C_Product.price))
-        cte = query.cte('t')
-
-        sq = cte.select_from(cte.c.id, cte.c.name, cte.c.price)
-        self.assertEqual([(p.name, p.price) for p in sq], [('p5', 5)])
-
-        query = (C_Product
-                 .insert({'name': 'p6', 'price': 6})
-                 .returning(C_Product.id, C_Product.name, C_Product.price))
-        cte = query.cte('t')
-        sq = Select((cte,), (cte.c.id, cte.c.name, cte.c.price))
-        res = (C_Archive
-               .insert_from(sq, (sq.c.id, sq.c.name, sq.c.price))
-               .with_cte(cte)
-               .execute())
-        self.assertEqual([(p.name, p.price) for p in C_Archive], [('p6', 6)])
-
-        self.assertEqual(sorted([(p.name, p.price) for p in C_Product]), [
-            ('p0', 0), ('p1', 1), ('p2', 2), ('p3', 3), ('p4', 4), ('p5', 5),
-            ('p6', 6)])
+    @requires_models(User)
+    def test_insert_from_sql(self):
+        query_src = SQL('SELECT name FROM user_src')
+        User.insert_from(query=query_src, fields=[User.username]).execute()
+        self.assertEqual([u.username for u in User.select()], ['foo'])
 
 
-class TestBindTo(ModelTestCase):
+@requires_postgresql
+class TestReturningIntegrationRegressions(ModelTestCase):
     requires = [User, Tweet]
 
-    def test_bind_to(self):
-        for i in (1, 2, 3):
-            user = User.create(username='u%s' % i)
-            Tweet.create(user=user, content='t%s' % i)
+    def test_returning_integration_subqueries(self):
+        _create_users_tweets(self.database)
 
-        # Alias to a particular field-name.
-        name = Case(User.username, [
-            ('u1', 'user 1'),
-            ('u2', 'user 2')], 'someone else')
-        q = (Tweet
-             .select(Tweet.content, name.alias('username').bind_to(User))
-             .join(User)
-             .order_by(Tweet.content))
-        with self.assertQueryCount(1):
-            self.assertEqual([(t.content, t.user.username) for t in q], [
-                ('t1', 'user 1'),
-                ('t2', 'user 2'),
-                ('t3', 'someone else')])
+        # We can use a correlated subquery in the RETURNING clause.
+        subq = (Tweet
+                .select(fn.COUNT(Tweet.id).alias('ct'))
+                .where(Tweet.user == User.id))
+        query = (User
+                 .update(username=(User.username + '-x'))
+                 .returning(subq.alias('ct'), User.username))
+        result = query.execute()
+        self.assertEqual(sorted([(r.ct, r.username) for r in result]), [
+            (0, 'zaizee-x'), (2, 'mickey-x'), (3, 'huey-x')])
 
-        # Use a different alias.
-        q = (Tweet
-             .select(Tweet.content, name.alias('display').bind_to(User))
-             .join(User)
-             .order_by(Tweet.content))
-        with self.assertQueryCount(1):
-            self.assertEqual([(t.content, t.user.display) for t in q], [
-                ('t1', 'user 1'),
-                ('t2', 'user 2'),
-                ('t3', 'someone else')])
+        # We can use a correlated subquery via UPDATE...FROM, and reference the
+        # FROM table in both the update and the RETURNING clause.
+        subq = (User
+                .select(User.id, fn.COUNT(Tweet.id).alias('ct'))
+                .join(Tweet, JOIN.LEFT_OUTER)
+                .group_by(User.id))
+        query = (User
+                 .update(username=User.username + subq.c.ct)
+                 .from_(subq)
+                 .where(User.id == subq.c.id)
+                 .returning(subq.c.ct, User.username))
+        result = query.execute()
+        self.assertEqual(sorted([(r.ct, r.username) for r in result]), [
+            (0, 'zaizee-x0'), (2, 'mickey-x2'), (3, 'huey-x3')])
 
-        # Ensure works with model and field aliases.
-        TA, UA = Tweet.alias(), User.alias()
-        name = Case(UA.username, [
-            ('u1', 'user 1'),
-            ('u2', 'user 2')], 'someone else')
-        q = (TA
-             .select(TA.content, name.alias('display').bind_to(UA))
-             .join(UA, on=(UA.id == TA.user))
-             .order_by(TA.content))
-        with self.assertQueryCount(1):
-            self.assertEqual([(t.content, t.user.display) for t in q], [
-                ('t1', 'user 1'),
-                ('t2', 'user 2'),
-                ('t3', 'someone else')])
+    def test_returning_integration(self):
+        query = (User
+                 .insert_many([('huey',), ('mickey',), ('zaizee',)],
+                              fields=[User.username])
+                 .returning(User.id, User.username)
+                 .objects())
+        result = query.execute()
+        self.assertEqual([(r.id, r.username) for r in result], [
+            (1, 'huey'), (2, 'mickey'), (3, 'zaizee')])
 
-
-class CascadeParent(TestModel):
-    name = TextField()
-
-class CascadeChild(TestModel):
-    parent = ForeignKeyField(CascadeParent, backref='children',
-                             on_delete='CASCADE')
-    data = TextField()
+        query = (User
+                 .delete()
+                 .where(~User.username.startswith('h'))
+                 .returning(User.id, User.username)
+                 .objects())
+        result = query.execute()
+        self.assertEqual(sorted([(r.id, r.username) for r in result]), [
+            (2, 'mickey'), (3, 'zaizee')])
 
 
-class TestCascadeDeleteIntegration(ModelTestCase):
-    requires = [CascadeParent, CascadeChild]
+class TestUpdateIntegrationRegressions(ModelTestCase):
+    requires = [User, Tweet, Sample]
 
     def setUp(self):
-        super(TestCascadeDeleteIntegration, self).setUp()
+        super(TestUpdateIntegrationRegressions, self).setUp()
+        _create_users_tweets(self.database)
+        for i in range(4):
+            Sample.create(counter=i, value=i)
+
+    @skip_if(IS_MYSQL)
+    def test_update_examples(self):
+        # Do a simple update.
+        res = (User
+               .update(username=(User.username + '-cat'))
+               .where(User.username != 'mickey')
+               .execute())
+
+        users = User.select().order_by(User.username)
+        self.assertEqual([u.username for u in users.clone()],
+                         ['huey-cat', 'mickey', 'zaizee-cat'])
+
+        # Do an update using a subquery..
+        subq = User.select(User.username).where(User.username == 'mickey')
+        res = (User
+               .update(username=(User.username + '-dog'))
+               .where(User.username.in_(subq))
+               .execute())
+        self.assertEqual([u.username for u in users.clone()],
+                         ['huey-cat', 'mickey-dog', 'zaizee-cat'])
+
+        # Subquery referring to a different table.
+        subq = User.select().where(User.username == 'mickey-dog')
+        res = (Tweet
+               .update(content=(Tweet.content + '-x'))
+               .where(Tweet.user.in_(subq))
+               .execute())
+
+        self.assertEqual(
+            [t.content for t in Tweet.select().order_by(Tweet.id)],
+            ['meow', 'hiss', 'purr', 'woof-x', 'bark-x'])
+
+        # Subquery on the right-hand of the assignment.
+        subq = (Tweet
+                .select(fn.COUNT(Tweet.id).cast('text'))
+                .where(Tweet.user == User.id))
+        res = User.update(username=(User.username + '-' + subq)).execute()
+
+        self.assertEqual([u.username for u in users.clone()],
+                         ['huey-cat-3', 'mickey-dog-2', 'zaizee-cat-0'])
+
+    def test_update_examples_2(self):
+        SA = Sample.alias()
+        subq = (SA
+                .select(SA.value)
+                .where(SA.value.in_([1.0, 3.0])))
+        res = (Sample
+               .update(counter=(Sample.counter + Sample.value.cast('int')))
+               .where(Sample.value.in_(subq))
+               .execute())
+
+        query = (Sample
+                 .select(Sample.counter, Sample.value)
+                 .order_by(Sample.id)
+                 .tuples())
+        self.assertEqual(list(query.clone()), [(0, 0.), (2, 1.), (2, 2.),
+                                               (6, 3.)])
+
+        subq = (SA
+                .select(SA.counter - SA.value.cast('int'))
+                .where(SA.value == Sample.value))
+        res = (Sample
+               .update(counter=subq)
+               .where(Sample.value.in_([1., 3.]))
+               .execute())
+        self.assertEqual(list(query.clone()), [(0, 0.), (1, 1.), (2, 2.),
+                                               (3, 3.)])
+
+
+class MGProject(TestModel):
+    name = TextField()
+
+class MGTask(TestModel):
+    name = TextField()
+    mgproject = ForeignKeyField(MGProject, backref='tasks')
+    alt = ForeignKeyField(MGProject, backref='alt_tasks')
+
+
+class TestModelGraphMultiFK(ModelTestCase):
+    requires = [MGProject, MGTask]
+
+    def test_model_graph_multi_fk(self):
+        pa, pb, pc = [MGProject.create(name=name) for name in 'abc']
+        t1 = MGTask.create(name='t1', mgproject=pa, alt=pc)
+        t2 = MGTask.create(name='t2', mgproject=pb, alt=pb)
+
+        P1 = MGProject.alias('p1')
+        P2 = MGProject.alias('p2')
+        LO = JOIN.LEFT_OUTER
+
+        # Query using join expression.
+        q1 = (MGTask
+              .select(MGTask, P1, P2)
+              .join_from(MGTask, P1, LO, on=(MGTask.mgproject == P1.id))
+              .join_from(MGTask, P2, LO, on=(MGTask.alt == P2.id))
+              .order_by(MGTask.name))
+
+        # Query specifying target field.
+        q2 = (MGTask
+              .select(MGTask, P1, P2)
+              .join_from(MGTask, P1, LO, on=MGTask.mgproject)
+              .join_from(MGTask, P2, LO, on=MGTask.alt)
+              .order_by(MGTask.name))
+
+        # Query specifying with missing target field.
+        q3 = (MGTask
+              .select(MGTask, P1, P2)
+              .join_from(MGTask, P1, LO)  # Implicitly selects mgproject.
+              .join_from(MGTask, P2, LO, on=MGTask.alt)
+              .order_by(MGTask.name))
+
+        for query in (q1, q2, q3):
+            with self.assertQueryCount(1):
+                t1, t2 = list(query)
+                self.assertEqual(t1.mgproject.name, 'a')
+                self.assertEqual(t1.alt.name, 'c')
+                self.assertEqual(t2.mgproject.name, 'b')
+                self.assertEqual(t2.alt.name, 'b')
+
+
+class RS(TestModel):
+    name = TextField()
+
+class RD(TestModel):
+    key = TextField()
+    value = IntegerField()
+    rs = ForeignKeyField(RS, backref='rds')
+
+class RKV(TestModel):
+    key = CharField(max_length=10)
+    value = IntegerField()
+    extra = IntegerField()
+    class Meta:
+        primary_key = CompositeKey('key', 'value')
+
+
+class TestRegressionCountDistinct(ModelTestCase):
+    @requires_models(RS, RD)
+    def test_regression_count_distinct(self):
+        rs = RS.create(name='rs')
+
+        nums = [0, 1, 2, 3, 2, 1, 0]
+        RD.insert_many([('k%s' % i, i, rs) for i in nums]).execute()
+
+        query = RD.select(RD.key).distinct()
+        self.assertEqual(query.count(), 4)
+
+        # Try re-selecting using the id/key, which are all distinct.
+        query = query.select(RD.id, RD.key)
+        self.assertEqual(query.count(), 7)
+
+        # Re-select the key/value, of which there are 4 distinct.
+        query = query.select(RD.key, RD.value)
+        self.assertEqual(query.count(), 4)
+
+        query = rs.rds.select(RD.key).distinct()
+        self.assertEqual(query.count(), 4)
+
+        query = rs.rds.select(RD.key, RD.value).distinct()
+        self.assertEqual(query.count(), 4)  # Was returning 7!
+
+    @requires_models(RKV)
+    def test_regression_count_distinct_cpk(self):
+        RKV.insert_many([('k%s' % i, i, i) for i in range(5)]).execute()
+        self.assertEqual(RKV.select().distinct().count(), 5)
+
+
+class TestReselectModelRegression(ModelTestCase):
+    requires = [User]
+
+    def test_reselect_model_regression(self):
+        u1, u2, u3 = [User.create(username='u%s' % i) for i in '123']
+
+        query = User.select(User.username).order_by(User.username.desc())
+        self.assertEqual(list(query.tuples()), [('u3',), ('u2',), ('u1',)])
+
+        query = query.select(User)
+        self.assertEqual(list(query.tuples()), [
+            (u3.id, 'u3',),
+            (u2.id, 'u2',),
+            (u1.id, 'u1',)])
+
+
+class TestJoinCorrelatedSubquery(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_join_correlated_subquery(self):
+        for i in range(3):
+            user = User.create(username='u%s' % i)
+            for j in range(i + 1):
+                Tweet.create(user=user, content='u%s-%s' % (i, j))
+
+        UA = User.alias()
+        subq = (UA
+                .select(UA.username)
+                .where(UA.username.in_(('u0', 'u2'))))
+
+        query = (Tweet
+                 .select(Tweet, User)
+                 .join(User, on=(
+                     (Tweet.user == User.id) &
+                     (User.username.in_(subq))))
+                 .order_by(Tweet.id))
+
+        with self.assertQueryCount(1):
+            data = [(t.content, t.user.username) for t in query]
+            self.assertEqual(data, [
+                ('u0-0', 'u0'),
+                ('u2-0', 'u2'),
+                ('u2-1', 'u2'),
+                ('u2-2', 'u2')])
+
+
+class RU(TestModel):
+    username = TextField()
+
+class Recipe(TestModel):
+    name = TextField()
+    created_by = ForeignKeyField(RU, backref='recipes')
+    changed_by = ForeignKeyField(RU, backref='recipes_modified')
+
+
+class TestMultiFKJoinRegression(ModelTestCase):
+    requires = [RU, Recipe]
+
+    def test_multi_fk_join_regression(self):
+        u1, u2 = [RU.create(username=u) for u in ('u1', 'u2')]
+        for (n, a, m) in (('r11', u1, u1), ('r12', u1, u2), ('r21', u2, u1)):
+            Recipe.create(name=n, created_by=a, changed_by=m)
+
+        Change = RU.alias()
+        query = (Recipe
+                 .select(Recipe, RU, Change)
+                 .join(RU, on=(RU.id == Recipe.created_by).alias('a'))
+                 .switch(Recipe)
+                 .join(Change, on=(Change.id == Recipe.changed_by).alias('b'))
+                 .order_by(Recipe.name))
+        with self.assertQueryCount(1):
+            data = [(r.name, r.a.username, r.b.username) for r in query]
+            self.assertEqual(data, [
+                ('r11', 'u1', 'u1'),
+                ('r12', 'u1', 'u2'),
+                ('r21', 'u2', 'u1')])
+
+
+class TestCompoundExistsRegression(ModelTestCase):
+    requires = [User]
+
+    def test_compound_regressions_1961(self):
+        UA = User.alias()
+        cq = (User.select(User.id) | UA.select(UA.id))
+        # Calling .exists() fails with AttributeError, no attribute "columns".
+        self.assertFalse(cq.exists())
+        self.assertEqual(cq.count(), 0)
+
+        User.create(username='u1')
+        self.assertTrue(cq.exists())
+        self.assertEqual(cq.count(), 1)
+
+
+class TestLikeColumnValue(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_like_column_value(self):
+        # e.g., find all tweets that contain the users own username.
+        u1, u2, u3 = [User.create(username='u%s' % i) for i in (1, 2, 3)]
+        data = (
+            (u1, ('nada', 'i am u1', 'u1 is my name')),
+            (u2, ('nothing', 'he is u1')),
+            (u3, ('she is u2', 'hey u3 is me', 'xx')))
+        for user, tweets in data:
+            Tweet.insert_many([(user, tweet) for tweet in tweets],
+                              fields=[Tweet.user, Tweet.content]).execute()
+
+        expressions = (
+            (Tweet.content ** ('%' + User.username + '%')),
+            Tweet.content.contains(User.username))
+
+        for expr in expressions:
+            query = (Tweet
+                     .select(Tweet, User)
+                     .join(User)
+                     .where(expr)
+                     .order_by(Tweet.id))
+
+            self.assertEqual([(t.user.username, t.content) for t in query], [
+                ('u1', 'i am u1'),
+                ('u1', 'u1 is my name'),
+                ('u3', 'hey u3 is me')])
+
+
+class TestUnionParenthesesRegression(ModelTestCase):
+    requires = [User]
+
+    def test_union_parentheses_regression(self):
+        ua, ub, uc = [User.create(username=u) for u in 'abc']
+        lhs = User.select(User.id).where(User.username == 'a')
+        rhs = User.select(User.id).where(User.username == 'c')
+        union = lhs.union_all(rhs)
+        self.assertEqual(sorted([u.id for u in union]), [ua.id, uc.id])
+
+        query = User.select().where(User.id.in_(union)).order_by(User.id)
+        self.assertEqual([u.username for u in query], ['a', 'c'])
+
+
+class Site(TestModel):
+    url = TextField()
+
+class Page(TestModel):
+    site = ForeignKeyField(Site, backref='pages')
+    title = TextField()
+
+class PageItem(TestModel):
+    page = ForeignKeyField(Page, backref='items')
+    content = TextField()
+
+
+class TestNoPKHashRegression(ModelTestCase):
+    requires = [NoPK]
+
+    def test_no_pk_hash_regression(self):
+        npk = NoPK.create(data=1)
+        npk_db = NoPK.get(NoPK.data == 1)
+        # When a model does not define a primary key, we cannot test equality.
+        self.assertTrue(npk != npk_db)
+
+        # Their hash is the same, though they are not equal.
+        self.assertEqual(hash(npk), hash(npk_db))
+
+
+class TestModelFilterJoinOrdering(ModelTestCase):
+    requires = [Site, Page, PageItem]
+
+    def setUp(self):
+        super(TestModelFilterJoinOrdering, self).setUp()
+        with self.database.atomic():
+            s1, s2 = [Site.create(url=s) for s in ('s1', 's2')]
+            p11, p12, p21 = [Page.create(site=s, title=t) for s, t in
+                             ((s1, 'p1-1'), (s1, 'p1-2'), (s2, 'p2-1'))]
+            items = (
+                (p11, 's1p1i1'),
+                (p11, 's1p1i2'),
+                (p11, 's1p1i3'),
+                (p12, 's1p2i1'),
+                (p21, 's2p1i1'))
+            PageItem.insert_many(items).execute()
+
+    def test_model_filter_join_ordering(self):
+        q = PageItem.filter(page__site__url='s1').order_by(PageItem.content)
+        self.assertSQL(q, (
+            'SELECT "t1"."id", "t1"."page_id", "t1"."content" '
+            'FROM "page_item" AS "t1" '
+            'INNER JOIN "page" AS "t2" ON ("t1"."page_id" = "t2"."id") '
+            'INNER JOIN "site" AS "t3" ON ("t2"."site_id" = "t3"."id") '
+            'WHERE ("t3"."url" = ?) ORDER BY "t1"."content"'), ['s1'])
+
+        def assertQ(q):
+            with self.assertQueryCount(1):
+                self.assertEqual([pi.content for pi in q],
+                                 ['s1p1i1', 's1p1i2', 's1p1i3', 's1p2i1'])
+
+        assertQ(q)
+
+        sid = Site.get(Site.url == 's1').id
+        q = (PageItem
+             .filter(page__site__url='s1', page__site__id=sid)
+             .order_by(PageItem.content))
+        assertQ(q)
+
+        q = (PageItem
+             .filter(page__site__id=sid)
+             .filter(page__site__url='s1')
+             .order_by(PageItem.content))
+        assertQ(q)
+
+        q = (PageItem
+             .filter(page__site__id=sid)
+             .filter(DQ(page__title='p1-1') | DQ(page__title='p1-2'))
+             .filter(page__site__url='s1')
+             .order_by(PageItem.content))
+        assertQ(q)
+
+
+class TestCountSubqueryEquals(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_count_subquery_equals(self):
+        a, b, c = [User.create(username=u) for u in 'abc']
+        Tweet.insert_many([(a, 'a1'), (b, 'b1')]).execute()
+
+        subq = (Tweet
+                .select(fn.COUNT(Tweet.id))
+                .where(Tweet.user == User.id))
+        query = User.select().where(subq == 0)
+        self.assertEqual([u.username for u in query], ['c'])
+
+
+class TestChainWhere(ModelTestCase):
+    requires = [User]
+
+    def test_chain_where(self):
+        for username in 'abcd':
+            User.create(username=username)
+
+        q = (User.select()
+             .where(User.username != 'a')
+             .where(User.username != 'd')
+             .order_by(User.username))
+        self.assertEqual([u.username for u in q], ['b', 'c'])
+
+        q = (User.select()
+             .where(User.username != 'a')
+             .where(User.username != 'd')
+             .where(User.username == 'b'))
+        self.assertEqual([u.username for u in q], ['b'])
+
+
+class TestSaveClearingPK(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_save_clear_pk(self):
+        u = User.create(username='u1')
+        t1 = Tweet.create(content='t1', user=u)
+        orig_id, t1.id = t1.id, None
+        t1.content = 't2'
+        t1.save()
+        self.assertTrue(t1.id is not None)
+        self.assertTrue(t1.id != orig_id)
+        tweets = [t.content for t in u.tweets.order_by(Tweet.id)]
+        self.assertEqual(tweets, ['t1', 't2'])
+
+
+class TestWeirdAliases(ModelTestCase):
+    requires = [User]
+
+    @skip_if(IS_MYSQL)  # mysql can't do anything normally.
+    def test_weird_aliases(self):
+        User.create(username='huey')
+        def assertAlias(s, expected):
+            query = User.select(s).dicts()
+            row = query[0]
+            self.assertEqual(list(row)[0], expected)
+
+        # When we explicitly provide an alias, use that.
+        assertAlias(User.username.alias('"username"'), '"username"')
+        assertAlias(User.username.alias('(username)'), '(username)')
+        assertAlias(User.username.alias('user(name)'), 'user(name)')
+        assertAlias(User.username.alias('(username"'), '(username"')
+        assertAlias(User.username.alias('"username)'), '"username)')
+        assertAlias(fn.LOWER(User.username).alias('user (name)'), 'user (name)')
+
+        # Here peewee cannot tell that an alias was given, so it will attempt
+        # to clean-up the column name returned by the cursor description.
+        assertAlias(SQL('"t1"."username" AS "user name"'), 'user name')
+        assertAlias(SQL('"t1"."username" AS "user (name)"'), 'user (name')
+        assertAlias(SQL('"t1"."username" AS "(username)"'), 'username')
+        assertAlias(SQL('"t1"."username" AS "x.y.(username)"'), 'username')
         if IS_SQLITE:
-            self.database.pragma('foreign_keys', 1)
+            assertAlias(SQL('LOWER("t1"."username")'), 'username')
 
-    def test_cascade_delete(self):
-        p1 = CascadeParent.create(name='p1')
-        p2 = CascadeParent.create(name='p2')
-        CascadeChild.create(parent=p1, data='c1')
-        CascadeChild.create(parent=p1, data='c2')
-        CascadeChild.create(parent=p2, data='c3')
 
-        self.assertEqual(CascadeChild.select().count(), 3)
-        p1.delete_instance()
-        self.assertEqual(CascadeChild.select().count(), 1)
-        self.assertEqual(CascadeChild.get().data, 'c3')
+class CQA(TestModel):
+    a = TextField()
+    b = TextField()
+
+
+class TestSelectFromUnion(ModelTestCase):
+    requires = [CQA]
+
+    def test_select_from_union(self):
+        CQA.insert_many([('a%d' % i, 'b%d' % i) for i in range(10)]).execute()
+
+        q1 = CQA.select(CQA.a).order_by(CQA.id).limit(3)
+        q2 = CQA.select(CQA.b).order_by(CQA.id).limit(3)
+
+        wq1 = q1.select_from(SQL('*'))
+        wq2 = q2.select_from(SQL('*'))
+        union = wq1 | wq2
+        data = [val for val, in union.tuples()]
+        self.assertEqual(sorted(data), ['a0', 'a1', 'a2', 'b0', 'b1', 'b2'])
+
+
+class DF(TestModel):
+    name = TextField()
+    value = IntegerField()
+class DFC(TestModel):
+    df = ForeignKeyField(DF)
+    name = TextField()
+    value = IntegerField()
+class DFGC(TestModel):
+    dfc = ForeignKeyField(DFC)
+    name = TextField()
+    value = IntegerField()
+
+
+class TestDjangoFilterRegression(ModelTestCase):
+    requires = [DF, DFC, DFGC]
+
+    def test_django_filter_regression(self):
+        a, b, c = [DF.create(name=n, value=i) for i, n in enumerate('abc')]
+        ca1 = DFC.create(df=a, name='a1', value=11)
+        ca2 = DFC.create(df=a, name='a2', value=12)
+        cb1 = DFC.create(df=b, name='b1', value=21)
+
+        gca1_1 = DFGC.create(dfc=ca1, name='a1-1', value=101)
+        gca1_2 = DFGC.create(dfc=ca1, name='a1-2', value=101)
+        gca2_1 = DFGC.create(dfc=ca2, name='a2-1', value=111)
+
+        def assertNames(q, expected):
+            self.assertEqual(sorted([n.name for n in q]), expected)
+
+        assertNames(DF.filter(name='a'), ['a'])
+        assertNames(DF.filter(name='a', id=a.id), ['a'])
+        assertNames(DF.filter(name__in=['a', 'c']), ['a', 'c'])
+        assertNames(DF.filter(name__in=['a', 'c'], id=a.id), ['a'])
+        assertNames(DF.filter(dfc_set__name='a1'), ['a'])
+        assertNames(DF.filter(dfc_set__name__in=['a1', 'b1']), ['a', 'b'])
+        assertNames(DF.filter(DQ(dfc_set__name='a1') | DQ(dfc_set__name='b1')),
+                    ['a', 'b'])
+        assertNames(DF.filter(dfc_set__dfgc_set__name='a1-1'), ['a'])
+        assertNames(DF.filter(
+            DQ(dfc_set__dfgc_set__name='a1-1') |
+            DQ(dfc_set__dfgc_set__name__in=['x', 'y'])), ['a'])
+
+        assertNames(DFC.filter(df__name='a'), ['a1', 'a2'])
+        assertNames(DFC.filter(df__name='a', value=11), ['a1'])
+        assertNames(DFC.filter(DQ(df__name='a') | DQ(df__name='b')),
+                    ['a1', 'a2', 'b1'])
+        assertNames(DFC.filter(
+            DQ(df__name='a') | DQ(dfgc_set__name='a1-1')).distinct(),
+            ['a1', 'a2'])
+
+        assertNames(DFGC.filter(dfc__df__name='a'), ['a1-1', 'a1-2', 'a2-1'])
+        assertNames(DFGC.filter(dfc__df__name='a', dfc__name='a2'), ['a2-1'])
+        assertNames(DFGC.filter(
+            DQ(dfc__df__value__lte=0) |
+            DQ(dfc__df__name='a', dfc__name='a1') |
+            DQ(dfc__name='a2')), ['a1-1', 'a1-2', 'a2-1'])
+
+        assertNames(
+            (DFGC.filter(DQ(dfc__df__value__lte=10) | DQ(dfc__value__lte=101))
+             .filter(DQ(name__ilike='a1%') | DQ(dfc__value=101))),
+            ['a1-1', 'a1-2'])
+
+        assertNames(DFGC.filter(dfc__df=a), ['a1-1', 'a1-2', 'a2-1'])
+        assertNames(DFGC.filter(dfc__df=a.id), ['a1-1', 'a1-2', 'a2-1'])
+
+        q = DFC.select().join(DF)
+        assertNames(q.filter(df=a), ['a1', 'a2'])
+        assertNames(q.filter(df__name='a'), ['a1', 'a2'])
+
+        DFA = DF.alias()
+        DFCA = DFC.alias()
+        DFGCA = DFGC.alias()
+        q = DFCA.select().join(DFA)
+        assertNames(q.filter(df=a), ['a1', 'a2'])
+        assertNames(q.filter(df__name='a'), ['a1', 'a2'])
+
+        q = DFGC.select().join(DFC).join(DF)
+        assertNames(q.filter(dfc__df=a), ['a1-1', 'a1-2', 'a2-1'])
+
+        q = DFGCA.select().join(DFCA).join(DFA)
+        assertNames(q.filter(dfc__df=a), ['a1-1', 'a1-2', 'a2-1'])
+
+        q = DF.select().join(DFC).join(DFGC)
+        assertNames(q.filter(dfc_set__dfgc_set__name='a1-1'), ['a'])
+
+
+class I(TestModel):
+    name = TextField()
+class S(TestModel):
+    i = ForeignKeyField(I)
+class P(TestModel):
+    i = ForeignKeyField(I)
+class PS(TestModel):
+    p = ForeignKeyField(P)
+    s = ForeignKeyField(S)
+class PP(TestModel):
+    ps = ForeignKeyField(PS)
+class O(TestModel):
+    ps = ForeignKeyField(PS)
+    s = ForeignKeyField(S)
+class OX(TestModel):
+    o = ForeignKeyField(O, null=True)
+
+class Character(TestModel):
+    name = TextField()
+class Shape(TestModel):
+    character = ForeignKeyField(Character, null=True)
+class ShapeDetail(TestModel):
+    shape = ForeignKeyField(Shape)
+
+
+class TestSumCaseSubquery(ModelTestCase):
+    requires = [Sample]
+
+    def test_sum_case_subquery(self):
+        Sample.insert_many([(i, i) for i in range(5)]).execute()
+
+        subq = Sample.select().where(Sample.counter.in_([1, 3, 5]))
+        case = Case(None, [(Sample.id.in_(subq), Sample.value)], 0)
+        q = Sample.select(fn.SUM(case))
+        self.assertEqual(q.scalar(), 4.0)
+
+
+class TestDeleteInstanceDFS(ModelTestCase):
+    @requires_models(Character, Shape, ShapeDetail)
+    def test_delete_instance_dfs_nullable(self):
+        c1, c2 = [Character.create(name=name) for name in ('c1', 'c2')]
+        for c in (c1, c2):
+            s = Shape.create(character=c)
+            ShapeDetail.create(shape=s)
+
+        # Update nullables.
+        with self.assertQueryCount(2):
+            c1.delete_instance(True)
+
+        self.assertHistory(2, [
+            ('UPDATE "shape" SET "character_id" = ? WHERE '
+             '("shape"."character_id" = ?)', [None, c1.id]),
+            ('DELETE FROM "character" WHERE ("character"."id" = ?)', [c1.id])])
+
+        self.assertEqual(Shape.select().count(), 2)
+
+        # Delete nullables as well.
+        with self.assertQueryCount(3):
+            c2.delete_instance(True, True)
+
+        self.assertHistory(3, [
+            ('DELETE FROM "shape_detail" WHERE '
+             '("shape_detail"."shape_id" IN '
+             '(SELECT "t1"."id" FROM "shape" AS "t1" WHERE '
+             '("t1"."character_id" = ?)))', [c2.id]),
+            ('DELETE FROM "shape" WHERE ("shape"."character_id" = ?)', [c2.id]),
+            ('DELETE FROM "character" WHERE ("character"."id" = ?)', [c2.id])])
+
+        self.assertEqual(Shape.select().count(), 1)
+
+    @requires_models(I, S, P, PS, PP, O, OX)
+    def test_delete_instance_dfs(self):
+        i1, i2 = [I.create(name=n) for n in ('i1', 'i2')]
+        for i in (i1, i2):
+            s = S.create(i=i)
+            p = P.create(i=i)
+            ps = PS.create(p=p, s=s)
+            pp = PP.create(ps=ps)
+            o = O.create(ps=ps, s=s)
+            ox = OX.create(o=o)
+
+        with self.assertQueryCount(9):
+            i1.delete_instance(recursive=True)
+
+        self.assertHistory(9, [
+            ('DELETE FROM "pp" WHERE ('
+             '"pp"."ps_id" IN (SELECT "t1"."id" FROM "ps" AS "t1" WHERE ('
+             '"t1"."p_id" IN (SELECT "t2"."id" FROM "p" AS "t2" WHERE ('
+             '"t2"."i_id" = ?)))))', [i1.id]),
+            ('UPDATE "ox" SET "o_id" = ? WHERE ('
+             '"ox"."o_id" IN (SELECT "t1"."id" FROM "o" AS "t1" WHERE ('
+             '"t1"."ps_id" IN (SELECT "t2"."id" FROM "ps" AS "t2" WHERE ('
+             '"t2"."p_id" IN (SELECT "t3"."id" FROM "p" AS "t3" WHERE ('
+             '"t3"."i_id" = ?)))))))', [None, i1.id]),
+            ('DELETE FROM "o" WHERE ('
+             '"o"."ps_id" IN (SELECT "t1"."id" FROM "ps" AS "t1" WHERE ('
+             '"t1"."p_id" IN (SELECT "t2"."id" FROM "p" AS "t2" WHERE ('
+             '"t2"."i_id" = ?)))))', [i1.id]),
+            ('DELETE FROM "o" WHERE ('
+             '"o"."s_id" IN (SELECT "t1"."id" FROM "s" AS "t1" WHERE ('
+             '"t1"."i_id" = ?)))', [i1.id]),
+            ('DELETE FROM "ps" WHERE ('
+             '"ps"."p_id" IN (SELECT "t1"."id" FROM "p" AS "t1" WHERE ('
+             '"t1"."i_id" = ?)))', [i1.id]),
+            ('DELETE FROM "ps" WHERE ('
+             '"ps"."s_id" IN (SELECT "t1"."id" FROM "s" AS "t1" WHERE ('
+             '"t1"."i_id" = ?)))', [i1.id]),
+            ('DELETE FROM "s" WHERE ("s"."i_id" = ?)', [i1.id]),
+            ('DELETE FROM "p" WHERE ("p"."i_id" = ?)', [i1.id]),
+            ('DELETE FROM "i" WHERE ("i"."id" = ?)', [i1.id]),
+        ])
+
+        models = [I, S, P, PS, PP, O, OX]
+        counts = {OX: 2}
+        for m in models:
+            self.assertEqual(m.select().count(), counts.get(m, 1))
+
+
+class TestQueryCountList(ModelTestCase):
+    requires = [User]
+
+    def test_iteration_single_query(self):
+        with self.assertQueryCount(1):
+            sq = User.select()
+            for i in range(3):
+                self.assertEqual(list(sq), [])
+                self.assertFalse(bool(sq))
+        with self.assertQueryCount(1):
+            sq = User.select().tuples()
+            for i in range(3):
+                self.assertEqual(list(sq), [])
+                self.assertFalse(bool(sq))
+        with self.assertQueryCount(1):
+            self.assertEqual(User.select().count(), 0)
+
+
+class TestModelSelectFromSubquery(ModelTestCase):
+    requires = [User]
+
+    def test_model_select_from_subquery(self):
+        for i in range(5):
+            User.create(username='u%s' % i)
+
+        UA = User.alias()
+        subquery = (UA.select()
+                    .where(UA.username.in_(('u0', 'u2', 'u4'))))
+
+        cte = (ValuesList([('u0',), ('u4',)], columns=['username'])
+               .cte('user_cte', columns=['username']))
+
+        query = (User
+                 .select(subquery.c.id, subquery.c.username)
+                 .from_(subquery)
+                 .join(cte, on=(subquery.c.username == cte.c.username))
+                 .with_cte(cte)
+                 .order_by(subquery.c.username.desc()))
+        self.assertEqual([u.username for u in query], ['u4', 'u0'])
+        self.assertTrue(isinstance(query[0], User))
+
+
+class TestModelAliasEdgeCases(BaseTestCase):
+    def test_setattr_raises(self):
+        UA = User.alias()
+        with self.assertRaisesCtx(AttributeError):
+            UA.custom_attr = 42
+
+    def test_call_creates_instance(self):
+        UA = User.alias()
+        inst = UA(username='huey')
+        self.assertIsInstance(inst, User)
+        self.assertEqual(inst.username, 'huey')
+
+    def test_get_field_aliases(self):
+        UA = User.alias()
+        aliases = UA.get_field_aliases()
+        field_names = [fa.field.name for fa in aliases]
+        self.assertIn('id', field_names)
+        self.assertIn('username', field_names)
+
+
+class TestSafePythonValueFailure(ModelTestCase):
+    requires = [Sample]
+
+    def test_safe_python_value_catches_error(self):
+        from peewee import safe_python_value
+        def bad_converter(value):
+            raise ValueError('bad')
+        safe = safe_python_value(bad_converter)
+        # Should NOT raise — returns the raw value instead.
+        result = safe('hello')
+        self.assertEqual(result, 'hello')
+
+    def test_safe_python_value_passes_through_success(self):
+        from peewee import safe_python_value
+        safe = safe_python_value(int)
+        self.assertEqual(safe('42'), 42)
+
+
+class TestBoundModelsContextUsage(ModelTestCase):
+    requires = [User]
+
+    def test_bound_models_context_restores_db(self):
+        alt_db = get_in_memory_db()
+        original_db = User._meta.database
+
+        with alt_db.bind_ctx([User]):
+            self.assertIs(User._meta.database, alt_db)
+
+        # After the context manager exits, original database is restored.
+        self.assertIs(User._meta.database, original_db)
+
+
+class TestModelSaveNoDataError(ModelTestCase):
+    requires = [User]
+
+    def test_save_raises_when_no_fields_to_update(self):
+        u = User.create(username='huey')
+        # Clear the data so only the PK remains.
+        u.__data__ = {'id': u.id}
+        u._dirty = set()
+        with self.assertRaisesCtx(ValueError):
+            u.save()
+
+
+class TestMetadataEdgeCases(BaseTestCase):
+    def test_model_graph_no_refs_no_backrefs_error(self):
+        self.assertRaises(ValueError, User._meta.model_graph,
+                          refs=False, backrefs=False)
+
+    def test_metadata_table_setter_error(self):
+        with self.assertRaisesCtx(AttributeError):
+            User._meta.table = 'something'
+
+    def test_metadata_table_deleter_resets(self):
+        t1 = User._meta.table
+        del User._meta.table
+        t2 = User._meta.table
+        # After delete and re-access, we get a fresh Table.
+        self.assertIsNotNone(t2)
+        self.assertIsNot(t1, t2)
+
+
+class DepParent(TestModel):
+    name = CharField()
+
+class DepChild(TestModel):
+    parent = ForeignKeyField(DepParent, backref='children')
+    value = IntegerField()
+
+class DepGrandChild(TestModel):
+    child = ForeignKeyField(DepChild, backref='grandchildren')
+    data = CharField()
+
+
+class TestModelDependencies(ModelTestCase):
+    requires = [DepParent, DepChild, DepGrandChild]
+
+    def test_dependencies_produces_correct_graph(self):
+        p = DepParent.create(name='p1')
+        c1 = DepChild.create(parent=p, value=1)
+        c2 = DepChild.create(parent=p, value=2)
+        gc = DepGrandChild.create(child=c1, data='gc1')
+
+        deps = list(p.dependencies())
+        # Should include grandchildren and children.
+        dep_models = [fk.model for _, fk in deps]
+        self.assertIn(DepChild, dep_models)
+        self.assertIn(DepGrandChild, dep_models)
+        # Grandchild should come before child (reverse topo order).
+        gc_idx = dep_models.index(DepGrandChild)
+        c_idx = dep_models.index(DepChild)
+        self.assertTrue(gc_idx < c_idx)
