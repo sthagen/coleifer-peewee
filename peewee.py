@@ -69,7 +69,7 @@ except ImportError:
         mysql = None
 
 
-__version__ = '4.0.5'
+__version__ = '4.0.6'
 __all__ = [
     'AnyField',
     'AsIs',
@@ -5209,7 +5209,7 @@ class FixedCharField(CharField):
     def adapt(self, value):
         value = super(FixedCharField, self).adapt(value)
         if value:
-            value = value[:self.max_length]
+            value = value.strip()[:self.max_length].strip()
         return value
 
 
