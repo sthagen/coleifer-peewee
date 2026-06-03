@@ -3854,18 +3854,19 @@ class SqliteDatabase(Database):
             return self.execute_sql('ROLLBACK')
 
     def get_tables(self, schema=None):
-        schema = schema or 'main'
+        schema = (schema or 'main').replace('"', '""')
         cursor = self.execute_sql('SELECT name FROM "%s".sqlite_master WHERE '
                                   'type=? ORDER BY name' % schema, ('table',))
         return [row for row, in cursor.fetchall()]
 
     def get_views(self, schema=None):
+        schema = (schema or 'main').replace('"', '""')
         sql = ('SELECT name, sql FROM "%s".sqlite_master WHERE type=? '
-               'ORDER BY name') % (schema or 'main')
+               'ORDER BY name') % schema
         return [ViewMetadata(*row) for row in self.execute_sql(sql, ('view',))]
 
     def get_indexes(self, table, schema=None):
-        schema = schema or 'main'
+        schema = (schema or 'main').replace('"', '""')
         query = ('SELECT name, sql FROM "%s".sqlite_master '
                  'WHERE tbl_name = ? AND type = ? ORDER BY name') % schema
         cursor = self.execute_sql(query, (table, 'index'))
@@ -3898,19 +3899,22 @@ class SqliteDatabase(Database):
             for name in sorted(index_to_sql)]
 
     def get_columns(self, table, schema=None):
+        schema = (schema or 'main').replace('"', '""')
         cursor = self.execute_sql('PRAGMA "%s".table_info("%s")' %
-                                  (schema or 'main', table))
+                                  (schema, table))
         return [ColumnMetadata(r[1], r[2], not r[3], bool(r[5]), table, r[4])
                 for r in cursor.fetchall()]
 
     def get_primary_keys(self, table, schema=None):
+        schema = (schema or 'main').replace('"', '""')
         cursor = self.execute_sql('PRAGMA "%s".table_info("%s")' %
-                                  (schema or 'main', table))
+                                  (schema, table))
         return [row[1] for row in filter(lambda r: r[-1], cursor.fetchall())]
 
     def get_foreign_keys(self, table, schema=None):
+        schema = (schema or 'main').replace('"', '""')
         cursor = self.execute_sql('PRAGMA "%s".foreign_key_list("%s")' %
-                                  (schema or 'main', table))
+                                  (schema, table))
         return [ForeignKeyMetadata(row[3], row[2], row[4], table)
                 for row in cursor.fetchall()]
 
@@ -4450,6 +4454,7 @@ class MySQLDatabase(Database):
         return [ViewMetadata(*row) for row in cursor.fetchall()]
 
     def get_indexes(self, table, schema=None):
+        table = table.replace('`', '``')
         cursor = self.execute_sql('SHOW INDEX FROM `%s`' % table)
         unique = set()
         indexes = {}
@@ -4473,6 +4478,7 @@ class MySQLDatabase(Database):
                 for name, null, dt, df in cursor.fetchall()]
 
     def get_primary_keys(self, table, schema=None):
+        table = table.replace('`', '``')
         cursor = self.execute_sql('SHOW INDEX FROM `%s`' % table)
         return [row[4] for row in
                 filter(lambda row: row[2] == 'PRIMARY', cursor.fetchall())]
