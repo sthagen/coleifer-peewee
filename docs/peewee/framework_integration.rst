@@ -154,15 +154,13 @@ style hooks, fully :ref:`async query execution <pwasyncio>`, and
 
    db = AsyncPostgresqlDatabase('peewee_test')
 
-   class User(Model):
+   class User(db.Model):
        name = CharField(verbose_name='Full Name', help_text='Display name')
        email = CharField(unique=True)
        status = IntegerField(default=1, choices=(
            (1, 'Active'),
            (2, 'Inactive'),
            (3, 'Deleted')))
-       class Meta:
-           database = db
 
    # Generate pydantic schemas suitable for create and responses.
    # Schemas will include metadata from verbose_name, help_text, choices, and
@@ -171,6 +169,7 @@ style hooks, fully :ref:`async query execution <pwasyncio>`, and
    UserResponse = to_pydantic(User, exclude_autofield=False, model_name='UserResponse')
 
    async def get_db():
+       # Hold a pooled connection open for the duration of the request.
        async with db:
            yield db
 
@@ -186,12 +185,12 @@ style hooks, fully :ref:`async query execution <pwasyncio>`, and
 
    @app.get('/users', response_model=list[UserResponse])
    async def list_users(db=Depends(get_db)):
-       rows = await db.list(User.select().dicts())
+       rows = await User.select().dicts().aexecute()
        return [UserResponse(**row) for row in rows]
 
    @app.post('/users', response_model=UserResponse)
    async def create_user(data: UserCreate, db=Depends(get_db)):
-       user = await db.run(User.create, **data.model_dump())
+       user = await User.acreate(**data.model_dump())
        return UserResponse.model_validate(user)
 
    @app.get('/users/{user_id}', response_model=UserResponse)
@@ -279,8 +278,6 @@ The following is a minimal example demonstrating:
    from playhouse.pwasyncio import *
 
 
-   app = FastAPI()
-
    db = AsyncPostgresqlDatabase('peewee_test', host='10.8.0.1', user='postgres')
 
    async def get_db():
@@ -343,7 +340,7 @@ instead of dependency injection.
 
    @app.post('/users')
    async def create_user(name: str):
-       user = await db.run(User.create, name=name)
+       user = await User.acreate(name=name)
        return {'id': user.id, 'name': user.name}
 
 Synchronous FastAPI

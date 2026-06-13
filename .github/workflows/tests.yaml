@@ -13,6 +13,13 @@ jobs:
           MYSQL_DATABASE: peewee_test
         ports:
           - 3306:3306
+      mysql8:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: peewee
+          MYSQL_DATABASE: peewee_test
+        ports:
+          - 3307:3306
       postgres:
         image: postgres
         env:
@@ -44,6 +51,8 @@ jobs:
             peewee-backend: cysqlite
           - python-version: "3.13"
             peewee-backend: cockroachdb
+          - python-version: "3.13"
+            peewee-backend: mysql8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -56,7 +65,7 @@ jobs:
           PGPASSWORD: peewee
         run: |
           sudo apt-get install libsqlite3-dev
-          pip install setuptools psycopg2-binary cython pymysql 'apsw' mysql-connector sqlcipher3 pysqlite3 'psycopg[binary]' gevent
+          pip install setuptools psycopg2-binary cython pymysql 'apsw' mysql-connector-python sqlcipher3 pysqlite3 'psycopg[binary]' gevent
           pip install greenlet aiosqlite aiomysql asyncpg pydantic
           python setup.py build_ext -i
           psql peewee_test -c 'CREATE EXTENSION hstore;'
@@ -73,8 +82,16 @@ jobs:
       - name: runtests ${{ matrix.peewee-backend }} - ${{ matrix.python-version }}
         env:
           PEEWEE_TEST_BACKEND: ${{ matrix.peewee-backend }}
+          PEEWEE_MYSQL_PORT: ${{ matrix.peewee-backend == 'mysql8' && '3307' || '3306' }}
           PGUSER: postgres
           PGHOST: 127.0.0.1
           PGPASSWORD: peewee
           CI: 1
         run: python runtests.py --mysql-user=root --mysql-password=peewee -s -v2
+      - name: asyncio stress
+        if: matrix.peewee-backend == 'postgresql' && matrix.python-version == '3.13'
+        env:
+          PGUSER: postgres
+          PGHOST: 127.0.0.1
+          PGPASSWORD: peewee
+        run: python runtests.py -A

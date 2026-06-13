@@ -7,6 +7,65 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add `BaseQuery.aexecute()` - an async twin of `execute()` available on all
+  query types, executing through the query's bound async database:
+  `await User.select().aexecute()`, `await user.tweets.aexecute()`. Returns
+  exactly what `execute()` returns, including result rows for DML with
+  `RETURNING`. Queries remain non-awaitable; this is an ordinary coroutine
+  method and the only async method on queries.
+* Add async model methods to `playhouse.pwasyncio` using "a"-prefixed coroutine
+  counterparts of the row-level `Model` methods (`acreate`, `aget`,
+  `aget_or_none`, `aget_by_id`, `aget_or_create`, `aset_by_id`,
+  `adelete_by_id`, `abulk_create`, `abulk_update`, `asave`,
+  `adelete_instance`), available via the new `AsyncModel` /
+  `AsyncModelMixin` classes. Each is a thin delegation through the greenlet
+  bridge, so behavior is identical to the synchronous implementation.
+  Note: the `Model` property of async databases now returns a base class
+  that includes these methods - relevant only if you introspect the base
+  class of `db.Model` subclasses.
+* Add `afetch()` for explicit, awaitable lazy foreign-key resolution:
+  `user = await tweet.afetch(Tweet.user)`. Already-loaded relations (via
+  join or prefetch) return immediately without a query.
+* Add `db.first(query, n=1)` async helper.
+* `MissingGreenletBridge` errors now include a hint describing the async
+  APIs to use.
+* The asyncio extension is no longer considered preliminary - the async
+  APIs documented in [the docs](https://docs.peewee-orm.com/en/latest/peewee/asyncio.html)
+  are stable. The asyncio stress test now also runs in CI.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.7...master)
+
+## 4.0.7
+
+* Fixes for `playhouse.pwasyncio`: report correct UPDATE / DELETE rowcounts on
+  asyncpg, roll back open transactions when connections are returned to the
+  pool, raise instead of deadlocking when querying during `iterate()`, and
+  detect the MySQL / MariaDB server version.
+* Additional `playhouse.pwasyncio` fixes: a second `iterate()` on a busy
+  connection raises instead of deadlocking, asyncpg exceptions are translated
+  to peewee exception types, registered aggregates / collations / window
+  functions / extensions and `timeout` are applied to async SQLite
+  connections, `:memory:` databases use a single connection, `atomic()`
+  accepts transaction arguments (e.g. `lock_type`), postgres connection URLs
+  and `isolation_level` are supported, `%%` in raw SQL is unescaped, and
+  attempting a query outside the greenlet bridge no longer emits "never
+  awaited" warnings.
+* Fixes for `playhouse.pydantic_utils`: JSON fields validate as `Any` (now
+  including the sqlite_ext `JSONField`), foreign keys may be included /
+  excluded by field name or column name, server-side defaults like
+  `SQL('CURRENT_TIMESTAMP')` are no longer emitted as schema defaults, and
+  `relationships` keys are validated.
+* Add a new cross-backend `JSONField` to core that provides basic operations
+  and also more consistent behavior when reading data. By default the new core
+  JSONField treats extracted values as JSON, which is generally the correct
+  thing, but "text-mode" is available as a chained `.as_text()` method. See
+  [docs](https://docs.peewee-orm.com/en/latest/peewee/models.html#json-field).
+  May eventually replace the backend-specific implementations with subclasses
+  that inherit semantics of this new field.
+  Note: `playhouse.mysql_ext.JSONField` is now the core field. The old
+  `json_dumps` / `json_loads` arguments are renamed `dumps` / `loads`, the
+  `extract()` method is removed (use item-access or `path()`), and MySQL
+  tables are now created with `JSON` columns rather than `TEXT`.
 * Eliminate use of deprecated params when connecting to MySQL databases, thanks
   to @abulgher, #3050.
 * Using `fromisoformat()` ended up causing previously-unconverted strings (Ymd)
@@ -15,7 +74,7 @@ https://github.com/coleifer/peewee/releases
   not attempt any heuristic python-value conversion. This makes it more natural
   to call `fn.whatever().cast('text')` and you predictably get text out.
 
-[View commits](https://github.com/coleifer/peewee/compare/4.0.6...master)
+[View commits](https://github.com/coleifer/peewee/compare/4.0.6...4.0.7)
 
 ## 4.0.6
 
