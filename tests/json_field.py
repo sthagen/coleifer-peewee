@@ -8,6 +8,7 @@ from .base import IS_MYSQL
 from .base import IS_ORACLE_MYSQL
 from .base import IS_POSTGRESQL
 from .base import IS_SQLITE
+from .base import BaseTestCase
 from .base import ModelTestCase
 from .base import TestModel
 from .base import db
@@ -459,6 +460,39 @@ class TestDeferredDatabase(ModelTestCase):
 
 
 @skip_if(SKIP_PATHS, 'requires SQLite 3.38 or non-SQLite backend')
+class TestInheritedJSONField(ModelTestCase):
+    requires = []
+
+    def test_inherit_json_field(self):
+        # JSONField stores a db-specific helper instance w/a db ref. Attempting
+        # to deepcopy (during inheritance) travels the graph down to the
+        # database instance's locks and connection local, which failed.
+        class JIBase(TestModel):
+            data = JSONField(null=True)
+
+        class JIChild(JIBase):
+            extra = JSONField(null=True)
+
+        # The inherited field is an independent copy, re-bound to the child.
+        self.assertIsNot(JIChild.data, JIBase.data)
+        self.assertIsNotNone(JIChild.data._helper)
+        self.assertIs(JIChild._meta.database, db)
+
+        JIChild.create_table()
+        try:
+            JIChild.create(data={'a': 1}, extra=[1, 2])
+            row = JIChild.select().first()
+            self.assertEqual(row.data, {'a': 1})
+            self.assertEqual(row.extra, [1, 2])
+        finally:
+            JIChild.drop_table()
+
+    def test_database_not_deepcopied(self):
+        from copy import deepcopy
+        self.assertIs(deepcopy(db), db)
+
+
+@skip_if(SKIP_PATHS, 'requires SQLite 3.38 or non-SQLite backend')
 class TestNullSemantics(ModelTestCase):
     requires = [JM]
 
@@ -684,6 +718,38 @@ class TestSQLShapes(ModelTestCase):
             lower = sql.lower()
             self.assertIn('json_unquote', lower)
             self.assertIn('json_extract', lower)
+
+
+class TestMySQLJSONStaticFlavor(BaseTestCase):
+    def _select_sql(self, mariadb, build):
+        flavor_db = MySQLDatabase('peewee_test', mariadb=mariadb)
+
+        class M(TestModel):
+            data = JSONField()
+            class Meta:
+                database = flavor_db
+
+        self.assertIsNone(flavor_db.server_version)  # Never connected.
+        sql, _ = M.select().where(build(M)).sql()
+        return sql
+
+    def test_value_marking_is_static(self):
+        path_eq = lambda M: M.data['k'] == 'v'
+        mysql_sql = self._select_sql(False, path_eq)
+        self.assertIn('CAST(', mysql_sql)
+        self.assertNotIn('JSON_COMPACT', mysql_sql)
+
+        maria_sql = self._select_sql(True, path_eq)
+        self.assertIn('JSON_COMPACT(', maria_sql)
+        self.assertNotIn('CAST(', maria_sql)
+
+    def test_contains_needs_no_marker(self):
+        contains = lambda M: M.data.contains({'k': 'v'})
+        shapes = set(self._select_sql(m, contains) for m in (False, True))
+        self.assertEqual(len(shapes), 1)
+        only = shapes.pop()
+        self.assertNotIn('JSON_COMPACT', only)
+        self.assertNotIn('CAST(', only)
 
 
 class TestBulkUpdate(ModelTestCase):

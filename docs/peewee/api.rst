@@ -1184,9 +1184,13 @@ Database
       isolation level (if unspecified, the connection default will be used).
 
 
-.. class:: MySQLDatabase(database, **kwargs)
+.. class:: MySQLDatabase(database, mariadb=None, **kwargs)
 
    MySQL database implementation.
+
+   :param bool mariadb: Ensure proper SQL generation on MariaDB, which has some
+       quirks (notably :class:`JSONField`). Default behavior is to use
+       MySQL-flavor.
 
    Example:
 
@@ -3386,9 +3390,9 @@ Fields
 .. class:: JSONField(dumps=None, loads=None, **kwargs)
 
    :param dumps: Custom JSON serializer. Defaults to ``json.dumps``.
-   :param loads: Custom JSON deserializer. Defaults to ``json.loads``. Not
-       applied on Postgresql, where the driver deserializes json values
-       itself.
+   :param loads: Custom JSON deserializer. Defaults to ``json.loads``.
+       **Silently ignored on Postgresql**, where the driver (psycopg2 /
+       psycopg3) deserializes JSON values before peewee sees them.
 
    Stores Python ``dict``, ``list``, scalar (``str``/``int``/``float``/``bool``),
    or ``None`` values as JSON. The column type used by ``CREATE TABLE`` is
