@@ -278,7 +278,7 @@ The following is a minimal example demonstrating:
    from playhouse.pwasyncio import *
 
 
-   db = AsyncPostgresqlDatabase('peewee_test', host='10.8.0.1', user='postgres')
+   db = AsyncPostgresqlDatabase('peewee_test')
 
    async def get_db():
        async with db:
@@ -297,41 +297,54 @@ The following is a minimal example demonstrating:
    async def list_users(db=Depends(get_db)):
        return await db.list(User.select().dicts())
 
-Middleware and startup hooks
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Middleware
+^^^^^^^^^^
 
-The following example demonstrates how to use middleware and startup hooks
-instead of dependency injection.
+Connections can also be managed with middleware instead of a dependency. Use a
+plain ASGI middleware (a class implementing ``__call__``) and not
+``@app.middleware('http')``. The latter uses Starlette's ``BaseHTTPMiddleware``,
+which runs the endpoint in a *separate task* from the middleware task. Because
+peewee's async connections are task-local, a connection opened there would not
+be the one the endpoint uses.
 
-* Ensure connection is opened and closed for each request.
-* Create tables/resources when app server starts.
-* Shut-down connection pool when app server exits.
+Use a plain ASGI middleware shares the request task, so the db connection
+opened in the middleware is the same one the endpoint sees.
+
+Startup and shutdown are handled by ``lifespan`` (create tables when the server
+starts, shut the pool down on exit).
 
 .. code-block:: python
 
+   from contextlib import asynccontextmanager
    from fastapi import FastAPI
    from peewee import *
-   from playhouse.pwasyncio import *
+   from playhouse.pwasyncio import AsyncPostgresqlDatabase
 
 
-   app = FastAPI()
+   db = AsyncPostgresqlDatabase('peewee_test')
 
-   db = AsyncPostgresqlDatabase('peewee_test', host='10.8.0.1', user='postgres')
+   class PeeweeConnectionMiddleware:
+       def __init__(self, app, database):
+           self.app = app
+           self.database = database
 
-   @app.middleware('http')
-   async def database_connection(request, call_next):
-       async with db:  # Obtain connection from connection pool.
-           response = await call_next(request)
-       return response
+       async def __call__(self, scope, receive, send):
+           if scope['type'] != 'http':
+               # Pass lifespan / websocket scopes through untouched.
+               await self.app(scope, receive, send)
+               return
+           async with self.database:  # Acquire a pooled connection for the task.
+               await self.app(scope, receive, send)
 
-   @app.on_event('startup')
-   async def on_startup():
+   @asynccontextmanager
+   async def lifespan(app):
        async with db:
-           await db.acreate_tables([Model1, Model2, Model3, ...])
-
-   @app.on_event('shutdown')
-   async def on_shutdown():
+           await db.acreate_tables([User])
+       yield
        await db.close_pool()
+
+   app = FastAPI(lifespan=lifespan)
+   app.add_middleware(PeeweeConnectionMiddleware, database=db)
 
    # Async queries.
    @app.get('/users')
@@ -339,72 +352,190 @@ instead of dependency injection.
        return await db.list(User.select().dicts())
 
    @app.post('/users')
-   async def create_user(name: str):
-       user = await User.acreate(name=name)
+   async def create_user(name: str, email: str):
+       user = await User.acreate(name=name, email=email)
        return {'id': user.id, 'name': user.name}
 
-Synchronous FastAPI
-^^^^^^^^^^^^^^^^^^^
 
-If you are using synchronous endpoints with FastAPI, you can use the
-synchronous Peewee database implementations. Here is the above "Full Example"
-implemented using sync Peewee:
+.. seealso:: :ref:`pydantic`
+
+.. _starlette:
+
+Starlette
+---------
+
+Starlette is the ASGI toolkit FastAPI is built on. Connections are managed with
+a plain ASGI middleware (which shares the request task) plus a ``lifespan``
+handler for startup and shutdown. Do not use ``BaseHTTPMiddleware`` for this as
+it runs the endpoint in a separate task, and peewee's async connections are
+task-local (so the connection would not be used in the endpoint).
 
 .. code-block:: python
 
-   from fastapi import Depends, FastAPI, HTTPException
    from contextlib import asynccontextmanager
+   from starlette.applications import Starlette
+   from starlette.middleware import Middleware
    from peewee import *
-   from playhouse.pydantic_utils import to_pydantic
+   from playhouse.pwasyncio import AsyncPostgresqlDatabase
 
-   db = PostgresqlDatabase('peewee_test')
 
-   class User(Model):
-       name = CharField(verbose_name='Full Name', help_text='Display name')
-       email = CharField(unique=True)
-       status = IntegerField(default=1, choices=(
-           (1, 'Active'),
-           (2, 'Inactive'),
-           (3, 'Deleted')))
+   db = AsyncPostgresqlDatabase('peewee_test')
 
-       class Meta:
-           database = db
+   class PeeweeConnectionMiddleware:
+       def __init__(self, app, database):
+           self.app = app
+           self.database = database
 
-   # Generate pydantic schemas suitable for create and responses.
-   UserCreate = to_pydantic(User, model_name='UserCreate')
-   UserResponse = to_pydantic(User, exclude_autofield=False, model_name='UserResponse')
-
-   def get_db():
-       with db.connection_context():
-           yield db
+       async def __call__(self, scope, receive, send):
+           if scope['type'] != 'http':
+               # Pass lifespan / websocket scopes through untouched.
+               await self.app(scope, receive, send)
+               return
+           async with self.database:  # Acquire a pooled connection for the task.
+               await self.app(scope, receive, send)
 
    @asynccontextmanager
    async def lifespan(app):
-       with db:
-           db.create_tables([User])
+       # Optionally create tables idempotently at startup.
+       async with db:
+           await db.acreate_tables([...])
+
        yield
+       await db.close_pool()
 
-   app = FastAPI(lifespan=lifespan)
+   app = Starlette(
+       lifespan=lifespan,
+       routes=[
+           ...  # Your routes, etc.
+       ],
+       middleware=[Middleware(PeeweeConnectionMiddleware, database=db)])
 
-   @app.get('/users', response_model=list[UserResponse])
-   def list_users(database=Depends(get_db)):
-       rows = User.select().dicts()
-       return [UserResponse(**row) for row in rows]
+.. seealso:: :ref:`pwasyncio`
 
-   @app.post('/users', response_model=UserResponse)
-   def create_user(data: UserCreate, database=Depends(get_db)):
-       user = User.create(**data.model_dump())
-       return UserResponse.model_validate(user)
+.. _quart:
 
-   @app.get('/users/{user_id}', response_model=UserResponse)
-   def get_user(user_id: int, database=Depends(get_db)):
-       try:
-           user = User.get(User.id == user_id)
-       except User.DoesNotExist:
-           raise HTTPException(status_code=404, detail='User not found')
-       return UserResponse.model_validate(user)
+Quart
+-----
 
-.. seealso:: :ref:`pydantic`
+Quart is an async, Flask-compatible framework. Use the same request hooks as
+:ref:`flask`, but ``async`` and with the async connection methods.
+
+.. code-block:: python
+
+   from quart import Quart
+   from peewee import *
+   from playhouse.pwasyncio import AsyncPostgresqlDatabase
+
+
+   db = AsyncPostgresqlDatabase('peewee_test')
+
+   app = Quart(__name__)
+
+   @app.before_serving
+   async def _create_tables():
+       # Optionally create tables idempotently at startup.
+       async with db:
+           await db.acreate_tables([...])
+
+   @app.after_serving
+   async def _close_pool():
+       await db.close_pool()
+
+   @app.before_request
+   async def _db_connect():
+       await db.aconnect()
+
+   @app.teardown_request
+   async def _db_close(exc):
+       if not db.is_closed():
+           await db.aclose()
+
+.. seealso:: :ref:`pwasyncio`
+
+.. _litestar:
+
+Litestar
+--------
+
+Litestar is an ASGI framework. The same plain ASGI middleware used for
+:ref:`starlette` applies (register it with ``DefineMiddleware``):
+
+.. code-block:: python
+
+   from contextlib import asynccontextmanager
+   from litestar import Litestar
+   from litestar.middleware import DefineMiddleware
+   from peewee import *
+   from playhouse.pwasyncio import AsyncPostgresqlDatabase
+
+
+   db = AsyncPostgresqlDatabase('peewee_test')
+
+   class PeeweeConnectionMiddleware:
+       def __init__(self, app, database):
+           self.app = app
+           self.database = database
+
+       async def __call__(self, scope, receive, send):
+           if scope['type'] != 'http':
+               # Pass lifespan / websocket scopes through untouched.
+               await self.app(scope, receive, send)
+               return
+           async with self.database:  # Acquire a pooled connection for the task.
+               await self.app(scope, receive, send)
+
+   @asynccontextmanager
+   async def lifespan(app):
+       # Optionally create tables idempotently at startup.
+       async with db:
+           await db.acreate_tables([...])
+
+       yield
+       await db.close_pool()
+
+   app = Litestar(
+       route_handlers=[...],  # Your handlers, etc.
+       middleware=[DefineMiddleware(PeeweeConnectionMiddleware, database=db)],
+       lifespan=[lifespan])
+
+.. seealso:: :ref:`pwasyncio`
+
+.. _aiohttp:
+
+aiohttp
+-------
+
+aiohttp has its own server (neither WSGI nor ASGI). Use ``@web.middleware`` to
+open the connection per-task.
+
+.. code-block:: python
+
+   from aiohttp import web
+   from peewee import *
+   from playhouse.pwasyncio import AsyncPostgresqlDatabase
+
+
+   db = AsyncPostgresqlDatabase('peewee_test')
+
+   @web.middleware
+   async def db_middleware(request, handler):
+       async with db:  # Acquire a pooled connection for the task.
+           return await handler(request)
+
+   async def on_startup(app):
+       # Optionally create tables idempotently at startup.
+       async with db:
+           await db.acreate_tables([...])
+
+   async def on_cleanup(app):
+       await db.close_pool()
+
+   app = web.Application(middlewares=[db_middleware])
+   app.on_startup.append(on_startup)
+   app.on_cleanup.append(on_cleanup)
+   app.add_routes([...])  # Your routes, etc.
+
+.. seealso:: :ref:`pwasyncio`
 
 Django
 ------
@@ -589,8 +720,7 @@ structure:
 3. Find the hook that runs after every request (success and error both).
 4. Call ``db.close()`` there if the connection is open.
 
-Any WSGI or ASGI middleware that wraps the application callable can also
-manage this:
+Any WSGI middleware that wraps the application callable can also manage this:
 
 .. code-block:: python
 
@@ -609,3 +739,8 @@ manage this:
 
    # Wrap your WSGI app:
    application = PeeweeMiddleware(application, db)
+
+This is a synchronous pattern. An async (:ref:`pwasyncio`) database is driven by
+an ASGI middleware instead - ``db.connect()`` and ``db.close()`` only work inside
+the async bridge. See the ``PeeweeConnectionMiddleware`` in the :ref:`fastapi`
+and :ref:`starlette` sections for examples.
