@@ -190,7 +190,6 @@ Field Type              Sqlite              Postgresql          MySQL
 .. seealso::
    * SQLite fields for JSON, Full-Text Search: :ref:`sqlite`
    * Postgresql fields for Arrays, JSON, Full-Text Search, HStore: :ref:`postgresql`
-   * MySQL fields for JSON: :ref:`mysql`
    * Extra fields (extension): :ref:`extra-fields`
    * :ref:`custom-fields`
 
@@ -594,7 +593,7 @@ to extract sub-elements. The result is a :class:`JSONPath` you can use in
 
    # Pull out a sub-document.
    for doc in Doc.select(Doc.data['profile'].alias('profile')):
-       print(doc.profile['fb'])  # 'huey.cat'
+       print(doc.profile['social']['fb'])  # 'huey.cat'
 
 Equality on a path is structural where the backend supports it (Postgresql
 ``jsonb``, MySQL ``JSON``) and canonical-text byte-compare on SQLite and
@@ -674,8 +673,8 @@ the backend's ``JSON_TYPE`` / ``jsonb_typeof`` function:
    # SQLite
    Doc.select().where(fn.json_type(Doc.data, '$.k') == 'null')
 
-   # MySQL (not MariaDB, whose JSON_EXTRACT does not preserve the null
-   # type - there, use has_key() to test for the key's presence instead).
+   # MySQL. On MariaDB prefer has_key() - comparing JSON_TYPE() output
+   # against a parameter can raise a collation error.
    Doc.select().where(fn.json_type(Doc.data['k']) == 'NULL')
 
 .. _json-field-text-mode:
@@ -816,6 +815,10 @@ This table collects every documented divergence in one place.
      - Silent no-op.
      - Silent no-op.
      - Wraps the scalar into an array, then appends.
+   * - ``append()`` on a missing path
+     - Creates a single-element array.
+     - Silent no-op.
+     - MySQL: silent no-op. **MariaDB: nulls the entire column.**
    * - ``length()`` on a non-array
      - Returns ``0``.
      - Raises an error.
@@ -824,10 +827,14 @@ This table collects every documented divergence in one place.
      - Lexicographic (text compare).
      - Typed (numeric values compare numerically).
      - MySQL: typed. MariaDB: lexicographic.
-   * - ``contains()`` / ``has_key()`` / etc.
-     - ``NotImplementedError``.
-     - Supported (``@>``, ``?``, ``?&``, ``?|``).
-     - Supported (``JSON_CONTAINS``, ``JSON_CONTAINS_PATH``).
+   * - ``has_key()`` / ``has_keys()`` / ``has_any_keys()``
+     - Supported (``json_type() IS NOT NULL`` per key).
+     - Supported (``?`` / ``?&`` / ``?|``).
+     - Supported (``JSON_CONTAINS_PATH``).
+   * - ``contains()`` / ``contained_by()``
+     - Emulated by a UDF (full scan, no index).
+     - Supported (``@>`` / ``<@``).
+     - Supported (``JSON_CONTAINS``).
    * - ``is_null()`` on a stored JSON ``null``
      - Matches (treated as absent).
      - Matches (treated as absent).
@@ -835,7 +842,8 @@ This table collects every documented divergence in one place.
 
 Use :meth:`~JSONPath.as_int` / :meth:`~JSONPath.as_float` for portable
 numeric ordering, and only call ``append()`` / ``length()`` on values you
-know are arrays.
+know are arrays. On MariaDB, initialize an array with ``set()`` before the
+first ``append()`` - appending at a missing path nulls the column there.
 
 .. _json-field-backend-specific:
 
@@ -862,7 +870,7 @@ is suitable for storing a bitmap for a large data-set, e.g. expressing
 membership or bitmap-type data.
 
 As an example of using :class:`BitField`, let's say we have a *Post* model
-and we wish to store certain True/False flags about how the post. We could
+and we wish to store certain True/False flags about the post. We could
 store all these feature toggles in their own :class:`BooleanField` objects,
 or we could use a single :class:`BitField` instead:
 
@@ -1208,16 +1216,12 @@ Partial indexes, indexes with expressions, and more complex indexes can use the
    Article.add_index(idx)
 
 .. note::
-   SQLite does not support parameterized ``CREATE INDEX`` queries. Partial
-   indexes and expression indexes on SQLite must be written using
-   :class:`SQL`:
+   SQLite prohibits bound parameters in ``CREATE INDEX``, so peewee inlines
+   any values used by a partial or expression index as literals when
+   generating the index SQL for SQLite.
 
-   .. code-block:: python
-
-      Article.add_index(SQL('CREATE INDEX ... WHERE status = 1'))
-
-If the above is cumbersome, you can also pass a :class:`SQL` instance to
-``Meta.indexes``:
+For full control, you can also declare an index as a raw :class:`SQL`
+instance in ``Meta.indexes``:
 
 .. code-block:: python
 

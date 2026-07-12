@@ -81,6 +81,19 @@ Database
       Type of quotation-mark(s) to use to denote entities such as tables or
       columns, specified as ``'<open quote><close quote>'``.
 
+   .. attribute:: Model
+
+      Property which returns a base :class:`Model` class bound to this
+      database, created on first access. Subclassing ``db.Model`` removes
+      the need to declare ``Meta.database`` on each model:
+
+      .. code-block:: python
+
+         db = SqliteDatabase('app.db')
+
+         class User(db.Model):
+             username = TextField()
+
    .. method:: init(database, **kwargs)
 
       :param str database: Database name or filename for SQLite.
@@ -541,6 +554,11 @@ Database
 
       Return a list of :class:`ColumnMetadata` tuples.
 
+      The ``full_type`` attribute carries the parameterized column type,
+      e.g. ``character varying(50)``, where ``data_type`` retains the
+      backend's bare type name. ``identity`` indicates auto-incrementing
+      columns (serial / identity / auto_increment / sqlite rowid alias).
+
       Example:
 
       .. code-block:: python
@@ -552,14 +570,18 @@ Database
               null=False,
               primary_key=True,
               table='entry',
-              default=None),
+              default=None,
+              full_type='INTEGER',
+              identity=True),
           ColumnMetadata(
               name='title',
               data_type='TEXT',
               null=False,
               primary_key=False,
               table='entry',
-              default=None),
+              default=None,
+              full_type='TEXT',
+              identity=False),
           ...]
 
    .. method:: get_primary_keys(table, schema=None)
@@ -584,6 +606,11 @@ Database
       Return a list of :class:`ForeignKeyMetadata` tuples for keys present
       on the table.
 
+      The ``name`` attribute is the constraint name (``None`` on SQLite). The
+      ``on_delete`` and ``on_update`` are the referential actions, with
+      undeclared actions reported as the backend's no-op default (``NO ACTION``
+      or ``RESTRICT``).
+
       Example:
 
       .. code-block:: python
@@ -593,7 +620,10 @@ Database
               column='entry_id',
               dest_table='entry',
               dest_column='id',
-              table='entrytag'),
+              table='entrytag',
+              name='entrytag_entry_id_fkey',
+              on_delete='NO ACTION',
+              on_update='NO ACTION'),
           ...]
 
    .. method:: get_views(schema=None)
@@ -2688,10 +2718,15 @@ Model
       * ``ne`` - not equals
       * ``lt``, ``lte`` - less-than, less-than or equal-to
       * ``gt``, ``gte`` - greater-than, greater-than or equal-to
-      * ``in`` - IN set of values
-      * ``is`` - IS (e.g. IS NULL).
+      * ``in``, ``not_in`` - IN and NOT IN set of values
+      * ``is``, ``is_not`` - IS and IS NOT (e.g. IS NULL)
+      * ``is_null`` - IS NULL if value is True, IS NOT NULL if False
       * ``like``, ``ilike`` - LIKE and ILIKE (case-insensitive)
-      * ``regexp`` - regular expression match
+      * ``regexp``, ``iregexp`` - regular expression match
+      * ``contains``, ``startswith``, ``endswith`` - case-insensitive
+        substring, prefix or suffix search. Wildcards in the value are
+        escaped, matching the corresponding :py:class:`ColumnBase` methods.
+      * ``between`` - BETWEEN low AND high, value must be a 2-tuple
 
       Examples:
 
@@ -2699,6 +2734,10 @@ Model
 
          # Get all tweets by user with username="peewee".
          q = Tweet.filter(user__username='peewee')
+
+         # Case-insensitive search of tweet content. Special characters in
+         # the search string ("%", "_") are escaped automatically.
+         q = Tweet.filter(content__contains='sql')
 
          # Get all posts that are draft or published, and written after 2023.
          q = Post.filter(
@@ -2764,8 +2803,9 @@ Model
 
    .. method:: with_related(*loads)
 
-      :param loads: One or more :class:`Load` nodes describing the
-          relationships to eagerly load.
+      :param loads: One or more :class:`Load` nodes, or foreign-key /
+          back-reference fields (wrapped in a :class:`Load` implicitly),
+          describing the relationships to eagerly load.
       :return: the query. Related rows are loaded when it is executed.
 
       Eagerly load related objects described by a tree of :class:`Load` nodes.
@@ -2797,6 +2837,7 @@ Model
 
       The related rows are loaded once, when the query is first executed -
       whether by iteration, :py:meth:`get`, ``first()``, indexing or ``len()``.
+      The relation queries run against the same database as the parent query.
 
       See :class:`Load` for the per-relation options, and :ref:`relationships` for
       a fuller discussion of joins and prefetching.
@@ -3493,8 +3534,10 @@ Fields
       Equality on the full document. The right-hand side is serialized
       through ``dumps`` and compared structurally on Postgresql (``jsonb =
       jsonb``) and MySQL (native ``JSON`` comparison). On SQLite and
-      MariaDB the comparison is a byte-compare of the stored JSON text
-      (SQLite canonicalizes both sides via ``json()``).
+      MariaDB the comparison is a byte-compare of the stored JSON text.
+      On SQLite, peewee canonicalizes values it writes and the right-hand
+      side via ``json()`` - JSON written to the table by other tools is
+      compared as stored.
 
       .. code-block:: python
 
@@ -3535,27 +3578,41 @@ Fields
 
          Doc.update(data=Doc.data.update({'new_field': 1})).execute()
 
-   .. method:: contains(value)
-               contained_by(value)
-               has_key(key)
+   .. method:: has_key(key)
                has_keys(key_list)
                has_any_keys(key_list)
 
-      JSON structural containment and key-existence predicates. Postgresql
-      uses ``@>`` / ``<@`` / ``?`` / ``?&`` / ``?|``. MySQL / MariaDB use
-      ``JSON_CONTAINS`` / ``JSON_CONTAINS_PATH``. **Not supported on
-      SQLite** - calling any of these on a SQLite-backed model raises
-      :class:`peewee.NotSupportedError`.
+      Key-existence predicates, supported on **every** backend. Postgresql
+      uses ``?`` / ``?&`` / ``?|``, MySQL / MariaDB use ``JSON_CONTAINS_PATH``,
+      and SQLite tests ``json_type(field, path) IS NOT NULL`` per key. These
+      check for object-key existence; note that Postgresql's ``?`` *also*
+      matches a string against the elements of a top-level array, which the
+      MySQL and SQLite emulations do not.
+
+      .. code-block:: python
+
+         Doc.select().where(Doc.data.has_key('email'))
+         Doc.select().where(Doc.data.has_keys(['env', 'region']))
+         Doc.select().where(Doc.data.has_any_keys(['admin', 'staff']))
+
+   .. method:: contains(value)
+               contained_by(value)
+
+      JSON structural containment. Postgresql uses ``@>`` / ``<@``, MySQL /
+      MariaDB use ``JSON_CONTAINS``. SQLite's JSON1 has no containment
+      operator, so it is emulated with a registered UDF
+      (``_pw_json_contains``) that deserializes and compares each candidate
+      row. That means **no index can be used - it is a full table scan**, so
+      prefer Postgresql or MySQL for containment queries over large tables.
 
       .. code-block:: python
 
          Doc.select().where(Doc.data.contains({'env': 'prod'}))
-         Doc.select().where(Doc.data.has_key('email'))
-         Doc.select().where(Doc.data.has_keys(['env', 'region']))
 
 .. warning::
 
-   :meth:`update` has intentionally **divergent semantics across backends**:
+   :meth:`JSONField.update` has intentionally **divergent semantics across
+   backends**:
 
    * **SQLite, MySQL, MariaDB** - RFC-7396 deep merge via ``json_patch`` /
      ``JSON_MERGE_PATCH``. Nested objects are merged recursively.
@@ -3622,8 +3679,9 @@ Fields
       :meth:`startswith`, :meth:`endswith`, :meth:`regexp`,
       :meth:`iregexp`) automatically apply ``as_text()`` so calling them on
       a path does the right thing without needing ``.as_text()`` explicitly.
-      :meth:`contains` is **not** among them - on a path it performs JSON
-      structural containment. For a substring test use ``.as_text().contains(...)``.
+      :meth:`contains` is **not** among them - on a default-mode path it
+      performs JSON structural containment. In text mode it is a substring
+      match, so for a substring test use ``.as_text().contains(...)``.
 
    .. _json-field-typed-access:
 
@@ -3742,7 +3800,9 @@ Fields
                iregexp(rhs)
 
       Pattern-matching operators. Each automatically applies ``as_text()``
-      to the path before comparing.
+      to the path before comparing. On SQLite, ``regexp()`` and
+      ``iregexp()`` require the database be created with
+      ``regexp_function=True``.
 
       .. code-block:: python
 
@@ -3762,7 +3822,8 @@ Fields
    .. method:: contains(rhs)
 
       JSON structural containment - ``@>`` on Postgresql, ``JSON_CONTAINS``
-      on MySQL / MariaDB. Raises :class:`NotImplementedError` on SQLite.
+      on MySQL / MariaDB, and a full-scan ``_pw_json_contains`` UDF on SQLite.
+      On a text-mode path (``.as_text()``) it is a substring ``LIKE`` instead.
 
       .. code-block:: python
 
@@ -3844,6 +3905,15 @@ Fields
 
          Use only on values you know are arrays.
 
+      .. warning::
+
+         Appending at a path that does not exist at all also diverges.
+         SQLite creates a new single-element array. Postgresql and MySQL
+         leave the document unchanged. On MariaDB ``JSON_ARRAY_APPEND``
+         returns SQL NULL for a missing path, so the update **overwrites
+         the entire column with NULL**. If the key may be missing,
+         initialize the array with :meth:`set` first.
+
    .. method:: remove()
 
       Return an UPDATE-clause expression that removes the value at this path.
@@ -3874,7 +3944,8 @@ Fields
 
       Inverse of :meth:`contains` - test whether the value at this path is a
       subset of ``value``. Postgresql ``<@``, MySQL / MariaDB
-      ``JSON_CONTAINS(value, lhs)``. Not supported on SQLite.
+      ``JSON_CONTAINS(value, lhs)``, SQLite the ``_pw_json_contains`` UDF
+      (full scan).
 
       .. code-block:: python
 
@@ -3886,8 +3957,9 @@ Fields
                has_any_keys(key_list)
 
       Test whether the value at this path is an object containing the given
-      key(s). Postgresql uses the ``?`` / ``?&`` / ``?|`` operators, MySQL /
-      MariaDB use ``JSON_CONTAINS_PATH``. Not supported on SQLite.
+      key(s). Supported on all backends: Postgresql uses the ``?`` / ``?&`` /
+      ``?|`` operators, MySQL / MariaDB use ``JSON_CONTAINS_PATH``, and SQLite
+      tests ``json_type()`` per key.
 
       .. code-block:: python
 
@@ -6492,7 +6564,7 @@ Queries
    :param rel: A foreign-key field (``Load(Tweet.user)``) or a back-reference
        (``Load(User.tweets)``) naming the relationship to load.
    :param query: An ordinary query used to fetch this relation's rows. It must
-       select from the related model. Defaults to a bare select over the related
+       select from the related model. Defaults to a select over the related
        model.
    :param strategy: How each relation is filtered against the parents already
        fetched. ``PREFETCH_TYPE.WHERE`` (the default) embeds the parent query as
@@ -6511,7 +6583,8 @@ Queries
 
    .. method:: then(*loads)
 
-      Nest one or more child :class:`Load` nodes beneath this relation.
+      Nest one or more child :class:`Load` nodes (or foreign-key / back-reference
+      fields) beneath this relation.
 
    .. code-block:: python
 
@@ -6536,8 +6609,8 @@ Queries
       # bob bob-1 0
 
    ``strategy`` controls how a relation restricts itself to the parents already
-   fetched. Under the default ``WHERE`` strategy the parent query is embedded as
-   a subquery, so a ``LIMIT`` on the parent lands *inside* the ``IN`` clause:
+   fetched. The default ``WHERE`` strategy embeds the parent query in an ``IN``
+   subquery (a limited or paginated parent is wrapped as a derived table):
 
    .. code-block:: python
 
@@ -6546,24 +6619,23 @@ Queries
    .. code-block:: sql
 
       SELECT * FROM "tweet"
-      WHERE "user_id" IN (SELECT "id" FROM "user" LIMIT 20 OFFSET 0)
+      WHERE "user_id" IN (
+          SELECT "_limited"."id"
+          FROM (SELECT "id" FROM "user" LIMIT 20 OFFSET 0) AS "_limited")
 
-   MySQL and MariaDB reject ``LIMIT`` inside an ``IN`` subquery. ``JOIN`` puts
-   the parent query in the FROM-clause as a derived table, which they accept:
+   ``JOIN`` instead joins the relation against the parent query as a derived
+   table. It returns the same rows and only the query shape differs:
 
    .. code-block:: python
 
       tweets = Load(User.tweets, strategy=PREFETCH_TYPE.JOIN)
-      query = User.select().paginate(1, 20).with_related(tweets)
+      query = User.select().with_related(tweets)
 
    .. code-block:: sql
 
       SELECT DISTINCT "tweet".* FROM "tweet"
-      INNER JOIN (SELECT "id" FROM "user" LIMIT 20 OFFSET 0) AS "u"
+      INNER JOIN (SELECT "id" FROM "user") AS "u"
           ON ("u"."id" = "tweet"."user_id")
-
-   On SQLite and PostgreSQL both forms run, so the default is fine. ``JOIN`` is
-   needed when paginating a parent query on MySQL or MariaDB.
 
    ``PREFETCH_TYPE.MATERIALIZE`` takes a third approach: it skips the parent
    subquery and reuses the parent keys already in memory, sending them inline.
@@ -6600,6 +6672,12 @@ Queries
       # alice ['alice-3', 'alice-2']
       # bob ['bob-2', 'bob-1']
       # carol []
+
+   The relation query may filter, order and join as usual. Its ``order_by``
+   defines the ranking. Ordering by a column reached through a to-many join
+   ranks each child by its lowest (ascending) or highest (descending) matching
+   value. A custom query is preserved (joins included), so instances
+   selected from a to-one join hydrate without extra queries.
 
 
 Query-builder Internals

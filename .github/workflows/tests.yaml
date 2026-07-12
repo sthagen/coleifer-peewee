@@ -95,3 +95,25 @@ jobs:
           PGHOST: 127.0.0.1
           PGPASSWORD: peewee
         run: python runtests.py -A
+
+  stubs:
+    name: stub checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: NO_SQLITE=1 pip install . mypy pyright ty typing_extensions
+      # Fail loudly if a packaging change ever drops the stub from the wheel.
+      - name: verify stub is packaged
+        run: python -c "import os,sysconfig;p=os.path.join(sysconfig.get_path('purelib'),'peewee-stubs','__init__.pyi');assert os.path.exists(p),p;print('stub installed at',p)"
+      - name: stubtest
+        working-directory: typecheck
+        run: python -m mypy.stubtest peewee --allowlist stubtest_allowlist.txt
+      - name: mypy
+        working-directory: typecheck
+        run: mypy check_stub.py
+      - name: pyright
+        working-directory: typecheck
+        run: pyright check_stub.py

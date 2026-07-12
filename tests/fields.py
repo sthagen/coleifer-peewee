@@ -519,6 +519,13 @@ class TSR(TestModel):
 class TestTimestampField(ModelTestCase):
     requires = [TSModel]
 
+    def local_to_utc(self, dt):
+        return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+    def test_formats_not_shared(self):
+        self.assertIsNot(TimestampField.formats, DateTimeField.formats)
+        self.assertEqual(TimestampField.formats, DateTimeField.formats)
+
     @requires_models(TSR)
     def test_timestamp_field_resolutions(self):
         dt = datetime.datetime(2018, 3, 1, 3, 3, 7).replace(microsecond=123456)
@@ -576,7 +583,7 @@ class TestTimestampField(ModelTestCase):
         self.assertEqual(ts_db.ts_ms, dt.replace(microsecond=31000))
         self.assertEqual(ts_db.ts_us, dt)
 
-        utc_dt = TimestampField().local_to_utc(dt)
+        utc_dt = self.local_to_utc(dt).replace(microsecond=0)
         self.assertEqual(ts_db.ts_u, utc_dt)
 
         # Verify we can query using a timestamp.
@@ -610,7 +617,7 @@ class TestTimestampField(ModelTestCase):
 
     def test_timestamp_field_parts(self):
         dt = datetime.datetime(2019, 1, 2, 3, 4, 5)
-        dt_utc = TimestampField().local_to_utc(dt)
+        dt_utc = self.local_to_utc(dt)
         ts = TSModel.create(ts_s=dt, ts_us=dt, ts_ms=dt, ts_u=dt_utc)
 
         fields = (TSModel.ts_s, TSModel.ts_us, TSModel.ts_ms, TSModel.ts_u)
@@ -640,7 +647,7 @@ class TestTimestampField(ModelTestCase):
 
     def test_timestamp_field_from_ts(self):
         dt = datetime.datetime(2019, 1, 2, 3, 4, 5)
-        dt_utc = TimestampField().local_to_utc(dt)
+        dt_utc = self.local_to_utc(dt)
 
         ts = TSModel.create(ts_s=dt, ts_us=dt, ts_ms=dt, ts_u=dt_utc)
         query = TSModel.select(
@@ -664,6 +671,45 @@ class TestTimestampField(ModelTestCase):
             # Postgres returns an aware UTC datetime. Strip this to compare
             # against our naive UTC datetime.
             self.assertEqual(dt_s.replace(tzinfo=None), dt_utc)
+
+    def test_timestamp_field_string(self):
+        dt = datetime.datetime(2018, 3, 1, 3, 3, 7)
+
+        # Strings are parsed and stored identically to the equivalent datetime,
+        # honoring each field's resolution.
+        ts = TSModel.create(ts_s='2018-03-01 03:03:07',
+                            ts_us='2018-03-01 03:03:07.031337',
+                            ts_ms='2018-03-01 03:03:07.031',
+                            ts_u='2018-03-01 03:03:07')
+        ts_db = TSModel[ts.id]
+        self.assertEqual(ts_db.ts_s, dt)
+        self.assertEqual(ts_db.ts_us, dt.replace(microsecond=31337))
+        self.assertEqual(ts_db.ts_ms, dt.replace(microsecond=31000))
+        self.assertEqual(ts_db.ts_u, dt)
+
+        # String and datetime inputs produce the same integer, and a date-only
+        # string is accepted.
+        f = TimestampField()
+        self.assertEqual(f.db_value('2018-03-01 03:03:07'), f.db_value(dt))
+        self.assertEqual(f.db_value('2018-03-01'),
+                         f.db_value(datetime.datetime(2018, 3, 1)))
+
+    def test_timestamp_field_aware(self):
+        # An aware datetime denotes an unambiguous instant, so its offset is
+        # honored regardless of the field's utc setting.
+        tz = datetime.timezone(datetime.timedelta(hours=2))
+        aware = datetime.datetime(2019, 1, 1, 12, tzinfo=tz)
+        expected = calendar.timegm(aware.utctimetuple())  # 10:00 UTC.
+
+        local_field = TimestampField()
+        utc_field = TimestampField(utc=True)
+        self.assertEqual(local_field.db_value(aware), expected)
+        self.assertEqual(utc_field.db_value(aware), expected)
+
+        # The same instant expressed as a string with an explicit offset.
+        s = '2019-01-01 12:00:00+02:00'
+        self.assertEqual(local_field.db_value(s), expected)
+        self.assertEqual(utc_field.db_value(s), expected)
 
     def test_invalid_resolution(self):
         self.assertRaises(ValueError, TimestampField, resolution=7)

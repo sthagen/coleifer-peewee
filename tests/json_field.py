@@ -4,6 +4,7 @@ from peewee import *
 from peewee import sqlite3
 
 from .base import IS_CRDB
+from .base import IS_MARIADB
 from .base import IS_MYSQL
 from .base import IS_ORACLE_MYSQL
 from .base import IS_POSTGRESQL
@@ -674,6 +675,13 @@ class TestAsTextDeep(ModelTestCase):
             q = JM.select().where(JM.data['name'].contains('apple'))
             self.assertEqual(q.count(), 1)
 
+    def test_as_text_contains_substring(self):
+        # Text-mode contains is a substring LIKE on every backend.
+        q = JM.select().where(JM.data['name'].as_text().contains('err'))
+        self.assertEqual(q.count(), 1)  # cherry.
+        q = JM.select().where(JM.data['name'].as_text().contains('errr'))
+        self.assertEqual(q.count(), 0)
+
 
 class TestSQLShapes(ModelTestCase):
     requires = [JM]
@@ -999,6 +1007,19 @@ class TestDocumentedDivergences(ModelTestCase):
         else:
             self.assertEqual(data, {'a': 1})  # No-op on SQLite and PG.
 
+    def test_append_missing_path(self):
+        JM.create(data={})
+        JM.update(data=JM.data['tags'].append('x')).execute()
+        data = JM.select().get().data
+        if IS_SQLITE:
+            self.assertEqual(data, {'tags': ['x']})  # Array is created.
+        elif IS_MARIADB:
+            # JSON_ARRAY_APPEND returns SQL NULL for a missing path, which
+            # nulls the whole column. Documented footgun.
+            self.assertIsNone(data)
+        else:
+            self.assertEqual(data, {})  # Ignored on PG and MySQL.
+
     def test_length_non_array(self):
         JM.create(data={'k': {'a': 1, 'b': 2}})
         query = JM.select(JM.data['k'].length())
@@ -1028,14 +1049,13 @@ class TestDocumentedDivergences(ModelTestCase):
         self.assertEqual(n, 1)
 
 
-# JSON containment / key checks. Native operators on PG and MySQL/MariaDB;
-# NotSupportedError on SQLite.
-@skip_if(IS_SQLITE, 'no native JSON containment/key operators on SQLite')
-class TestContainmentAndKeys(ModelTestCase):
+# JSON structural containment (@> / <@). Native on PG and MySQL/MariaDB;
+# emulated on SQLite via the _pw_json_contains() UDF.
+class TestContainment(ModelTestCase):
     requires = [JM]
 
     def setUp(self):
-        super(TestContainmentAndKeys, self).setUp()
+        super(TestContainment, self).setUp()
         JM.create(data={'k': 'v', 'tags': ['python', 'orm'],
                         'meta': {'env': 'prod', 'region': 'us'}})
         JM.create(data={'k': 'v', 'tags': ['rust']})
@@ -1062,6 +1082,50 @@ class TestContainmentAndKeys(ModelTestCase):
         # Row 1 fits inside `bigger`; rows 2 and 3 don't.
         self.assertEqual(q.count(), 1)
 
+    def test_contained_by_on_path(self):
+        q = JM.select().where(
+            JM.data['tags'].contained_by(['python', 'orm', 'sql']))
+        self.assertEqual(q.count(), 1)
+
+    def test_contains_scalar_in_array(self):
+        # Array containment matches a bare scalar element (PG/MySQL parity).
+        q = JM.select().where(JM.data['tags'].contains('python'))
+        self.assertEqual(q.count(), 1)
+
+    def test_contains_bool_not_int(self):
+        # JSON true/false must not be matched by 1/0, or vice versa.
+        JM.create(data={'flag': True, 'n': 1})
+        self.assertEqual(
+            JM.select().where(JM.data.contains({'flag': True})).count(), 1)
+        self.assertEqual(
+            JM.select().where(JM.data.contains({'flag': 1})).count(), 0)
+        self.assertEqual(
+            JM.select().where(JM.data.contains({'n': True})).count(), 0)
+
+    @skip_if(IS_MYSQL, 'MySQL/MariaDB use looser recursive containment')
+    def test_contains_level_aligned(self):
+        # PG and SQLite match containment level-by-level: a scalar in the
+        # needle only matches a top-level array element, so a value buried in
+        # a nested array does not count (recursive descent would flip these).
+        JM.create(data={'nested': [1, 2, [1, 3]]})
+        self.assertEqual(
+            JM.select().where(JM.data['nested'].contains([3])).count(), 0)
+        self.assertEqual(
+            JM.select().where(JM.data['nested'].contains([[1, 3]])).count(), 1)
+
+
+# Key-existence predicates are portable to every backend: PG (?/?&/?|),
+# MySQL/MariaDB (JSON_CONTAINS_PATH), and SQLite (json_type() IS NOT NULL).
+class TestKeyExistence(ModelTestCase):
+    requires = [JM]
+
+    def setUp(self):
+        super(TestKeyExistence, self).setUp()
+        JM.create(data={'k': 'v', 'tags': ['python', 'orm'],
+                        'meta': {'env': 'prod', 'region': 'us'}})
+        JM.create(data={'k': 'v', 'tags': ['rust']})
+        JM.create(data={'k': 'other'})
+
     def test_has_key(self):
         q = JM.select().where(JM.data.has_key('meta'))
         self.assertEqual(q.count(), 1)
@@ -1087,22 +1151,3 @@ class TestContainmentAndKeys(ModelTestCase):
     def test_has_any_keys_on_path(self):
         q = JM.select().where(JM.data['meta'].has_any_keys(['nope', 'env']))
         self.assertEqual(q.count(), 1)
-
-    def test_contained_by_on_path(self):
-        q = JM.select().where(
-            JM.data['tags'].contained_by(['python', 'orm', 'sql']))
-        self.assertEqual(q.count(), 1)
-
-
-# SQLite users get a loud error on the non-portable ops.
-@skip_if(not IS_SQLITE, 'SQLite-only')
-class TestSqliteNotSupported(ModelTestCase):
-    requires = [JM]
-
-    def test_contains_raises(self):
-        with self.assertRaisesCtx(NotImplementedError):
-            JM.data.contains({'k': 'v'})
-
-    def test_has_key_raises(self):
-        with self.assertRaisesCtx(NotImplementedError):
-            JM.data.has_key('k')

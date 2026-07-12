@@ -114,11 +114,75 @@ This is real asyncio, NOT gevent-style concurrency. Nothing is
 monkey-patched, no sockets are wrapped, and the event loop is the ordinary
 asyncio loop running the rest of your application.
 
-Execution Methods
------------------
+To show how this works I'll walk through the following example, which uses two
+internal primitives ``greenlet_spawn`` (run sync code in a greenlet) and ``await_``
+(suspend the sync greenlet, passing control and a coroutine to the async
+parent).
+
+.. code-block:: python
+
+   import asyncio
+   from playhouse.pwasyncio import *
+
+   # Synchronous function that awaits a coroutine on the event loop.
+   def synchronous():
+       return await_(a_add(1, 2))
+
+   # Normal async function.
+   async def a_add(x, y):
+       await asyncio.sleep(1)
+       return x + y
+
+   async def main():
+       result = await greenlet_spawn(synchronous)
+       print(result)
+
+   asyncio.run(main())  # After 1 second, prints 3
+
+When this runs:
+
+1. The ``greenlet_spawn`` helper is called with a sync callable as its argument.
+2. Inside ``greenlet_spawn`` we create a new greenlet to run the synchronous
+   callable. The new greenlet's parent lives in the async world. This link is
+   the bridge between sync and async python. Inside the new greenlet everything
+   is synchronous, but it can yield coroutines to the async-world parent, which
+   then awaits them on the loop.
+3. Inside the new greenlet we begin executing ``synchronous()`` (it does NOT know
+   anything about asyncio). ``a_add(1, 2)`` creates a coroutine, which gets passed
+   to ``await_()``.
+4. Inside ``await_()``, we *switch contexts* back to the parent (async world),
+   passing the ``a_add()`` coroutine.
+5. From the async world, we ``await`` the coroutine. The event loop runs ``a_add()``
+   and gives us back the result.
+6. The async ``greenlet_spawn()`` helper then passes that result back into the
+   greenlet running ``synchronous()`` as the return value of our ``await_()`` call.
+   Synchronous execution resumes and returns the result.
+7. At this point the greenlet running our synchronous code has finished. ``greenlet_spawn()``
+   now finishes and returns the result (3) to ``main()``, which gets printed.
+
+The skeptical can verify that our synchronous callable is running
+asynchronously:
+
+.. code-block:: python
+
+   async def run_several():
+       tasks = [greenlet_spawn(synchronous) for i in range(100)]
+       print(await asyncio.gather(*tasks))
+
+   import time
+   start = time.perf_counter()
+   asyncio.run(run_several())
+   print(time.perf_counter() - start)  # 1.01...
+
+In your code you should never need to use ``greenlet_spawn()`` or ``await_()``
+directly. Peewee wraps all this in ``a``-prefixed methods and helpers so that the
+greenlet machinery remains an implementation detail, but it's worth taking a
+look at to understand what's going on. In short, Peewee uses greenlets to pass
+coroutines out of synchronous code, so they can be ``await``-ed, at the cost of
+two lightweight context switches.
 
 Async Model Methods
-^^^^^^^^^^^^^^^^^^^
+-------------------
 
 Models bound to an async database have ``a``-prefixed counterparts of the
 :class:`Model` methods that read or write rows:
@@ -142,7 +206,7 @@ take an ``a`` prefix:
 * :meth:`~AsyncModelMixin.acreate`
 * :meth:`~AsyncModelMixin.aget` / :meth:`~AsyncModelMixin.aget_or_none` / :meth:`~AsyncModelMixin.aget_by_id`
 * :meth:`~AsyncModelMixin.aget_or_create`
-* :meth:`~AsyncModelMixin.adelete_by_id`
+* :meth:`~AsyncModelMixin.adelete_by_id` / :meth:`~AsyncModelMixin.aset_by_id`
 * :meth:`~AsyncModelMixin.abulk_create` / :meth:`~AsyncModelMixin.abulk_update`
 * :meth:`~AsyncModelMixin.afetch` (for fetching lazy-load foreign-keys)
 
@@ -192,8 +256,8 @@ Related objects follow three rules:
 3. Back-references are not relation attributes but ordinary select queries -
    execute them like any query: ``await user.tweets.aexecute()``.
 
-Executing queries: ``aexecute()``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Executing queries
+-----------------
 
 Queries provide :meth:`~BaseQuery.aexecute` as the async counterpart of
 :meth:`~BaseQuery.execute`. It executes the query on its bound async
@@ -229,15 +293,15 @@ For selects, ``await query.aexecute()`` is interchangeable with
 ``await db.list(query)`` for iteration - ``aexecute()`` returns the
 buffered result wrapper while ``list()`` returns a plain list. When in
 doubt, prefer ``query.aexecute()`` and use ``db.list()`` when you want a
-plain list. The ``db.iterate()`` provides streaming results using server-side
+plain list. ``db.iterate()`` provides streaming results using server-side
 cursors where available.
 
 ``aexecute()`` is the only async method on queries. Aggregates and other
 conveniences remain database helpers (``await db.count(query)``,
 ``await db.exists(query)``, and so on).
 
-``db.run()`` - general-purpose entry point
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+General purpose wrapper
+-----------------------
 
 :meth:`~AsyncDatabaseMixin.run` accepts any callable and runs it inside a
 greenlet bridge. The callable can contain arbitrary synchronous Peewee code,
@@ -264,7 +328,7 @@ Use ``db.run()`` when:
 * A single operation involves multiple queries (e.g. a transaction).
 
 Async Helper Methods
-^^^^^^^^^^^^^^^^^^^^^
+--------------------
 
 For single-query operations, the async helpers are more direct:
 
@@ -313,7 +377,7 @@ For single-query operations, the async helpers are more direct:
    opens a transaction for the duration of the server-side cursor.
 
 Transactions
-^^^^^^^^^^^^^
+------------
 
 Use ``async with db.atomic()`` for async-aware transactions:
 
@@ -437,18 +501,17 @@ single writer:
 
 .. note::
    In-memory databases (``':memory:'``) always use a single connection
-   regardless of ``pool_size`` - pooled in-memory connections would each be
-   a separate, empty database.
-
+   regardless of ``pool_size``, as in-memory connections each have their
+   own isolated database.
 
 Sharp Corners
 -------------
 
-Lazy foreign key access outside ``db.run()``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Lazy foreign key access
+^^^^^^^^^^^^^^^^^^^^^^^
 
-Accessing a lazy foreign key attribute triggers a synchronous query if the
-object has not been populated. Outside a greenlet context, this raises ``MissingGreenletBridge``:
+Accessing a lazy foreign key attribute triggers a query if the object has not
+been populated. Outside a greenlet context, this raises ``MissingGreenletBridge``:
 
 .. code-block:: python
 
@@ -494,10 +557,10 @@ guessing.
        ...
 
 
-Iterating back-references outside ``db.run()``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Iterating back-references
+^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Iterating a back-reference outside a greenlet context also fails for the same
+Iterating a back-reference without using an ``await`` also fails for the same
 reason as above.
 
 .. code-block:: python
@@ -715,17 +778,8 @@ API Reference
       :async:
 
       Async database context, acquiring a connection for the current task for
-      the duration of the wrapped block.
-
-      .. code-block:: python
-
-         db = AsyncSqliteDatabase(':memory:')
-
-         async with db:
-             # Connection is obtained from the pool and used for this task.
-             await db.acreate_tables([User, Tweet])
-
-         # Context block exits, connection is released back to pool.
+      the duration of the wrapped block. See the example under
+      :meth:`~AsyncDatabaseMixin.aconnect`.
 
    .. method:: aexecute(query)
       :async:
@@ -896,7 +950,7 @@ API Reference
       The declarative :meth:`~ModelSelect.with_related` form should be
       preferred for all new code, and needs no separate async method - it
       resolves when the query is materialized, so run it over the bridge with
-      :meth:`~AsyncDatabaseMixin.list` or :meth:`~ModelSelect.aexecute`:
+      :meth:`~AsyncDatabaseMixin.list` or :meth:`~BaseQuery.aexecute`:
 
       .. code-block:: python
 
@@ -1005,7 +1059,7 @@ API Reference
 
       :param str sql: SQL query to execute.
       :param tuple params: Optional query parameters.
-      :returns: A :class:`CursorAdapter` instance.
+      :returns: A ``CursorAdapter`` instance.
 
       Execute SQL asynchronously. Returns a cursor-like object whose rows are
       already fetched (call ``.fetchall()`` synchronously). For result
@@ -1077,6 +1131,12 @@ API Reference
       :classmethod:
 
       See :meth:`Model.delete_by_id`
+
+   .. method:: aset_by_id(key, value)
+      :async:
+      :classmethod:
+
+      See :meth:`Model.set_by_id`
 
    .. method:: abulk_create(model_list, batch_size=None)
       :async:

@@ -629,6 +629,9 @@ class FetchManyCursor(object):
 
 class ServerSideQuery(Node):
     def __init__(self, query, array_size=None):
+        if getattr(query, '_load_tree', None):
+            raise ValueError('with_related() is incompatible with '
+                             'ServerSide().')
         self.query = query
         self.array_size = array_size
         self._cursor_wrapper = None
@@ -669,9 +672,8 @@ def ServerSide(query, array_size=None):
 
 class _empty_object(object):
     __slots__ = ()
-    def __nonzero__(self):
+    def __bool__(self):
         return False
-    __bool__ = __nonzero__
 
 
 class Psycopg2ExtAdapter(Psycopg2Adapter):

@@ -143,8 +143,6 @@ The ``db.atomic()`` wrapper is important: it ensures that the rollback on
 ``IntegrityError`` affects only this operation, not any surrounding transaction.
 
 
-.. _top-item-per-group:
-
 .. _eager-loading:
 
 Eager-loading for a list view
@@ -168,10 +166,8 @@ page, whatever the page size:
             .order_by(User.username)
             .paginate(1, 20)
             .with_related(
-                Load(User.tweets, recent,
-                     strategy=PREFETCH_TYPE.JOIN, per_parent=2)
-                .then(Load(Tweet.favorites, favorites,
-                           strategy=PREFETCH_TYPE.JOIN))))
+                Load(User.tweets, recent, per_parent=2)
+                .then(Load(Tweet.favorites, favorites))))
 
    for user in query:
        print(user.username)
@@ -188,12 +184,12 @@ page, whatever the page size:
    #   bob-1 - favorited by: nobody
    # carol
 
-The ``JOIN`` strategy matters once the parent is paginated: MySQL cannot put a
-``LIMIT`` inside an ``IN`` subquery, so the child is joined against the parent
-query instead. The load fires on first execution - iteration, ``get()``,
-``first()``, indexing or ``len()``. See :ref:`relationships` for the building
-blocks (nesting, per-relation queries, ``per_parent``, strategies).
+The load fires on first execution - iteration, ``get()``, ``first()``,
+indexing or ``len()``. See :ref:`relationships` for the building blocks
+(nesting, per-relation queries, ``per_parent``, strategies).
 
+
+.. _top-item-per-group:
 
 Top Item Per Group
 ------------------

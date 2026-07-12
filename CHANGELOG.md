@@ -7,6 +7,38 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add django-style filter lookups: `contains`, `startswith`, `endswith`,
+  `between`, `is_null`, `not_in` and `iregexp`.
+* Fix SQLite index value inlining to apply when the database is bound via
+  model `Meta` or a `DatabaseProxy`, gated by the new
+  `Database.index_value_literals` feature toggle.
+* Fix `Ordering.collate()` dropping the `nulls=` ordering.
+* Fix double-escaping of backticks in MySQL `get_indexes()`.
+* Honor the `windows=` parameter of the `Select` constructor.
+* Remove vestigial Python 2 compat (`reraise()`, `__div__`, `__nonzero__`)
+  and assorted dead internal code.
+* Remove `TimestampField.local_to_utc()` and `TimestampField.utc_to_local()`.
+* `Select.columns()` no longer accepts and ignores keyword arguments.
+* Remove unused `Metadata.get_rel_for_model()`.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.1.2...master)
+
+## 4.1.2
+
+* Ensure quotes escaped in SQLite introspection methods, thanks @greymoth-jp
+  for reporting and the initial patch.
+* Allow TimestampField to accept an iso-formatted str.
+* Add key-existence predicates (`has_key`, `has_keys`, `has_any_keys`) to the
+  core `JSONField` on SQLite, implemented with `json_type()`.
+* Add containment predicates (`contains`, `contained_by`) to the core
+  `JSONField` on SQLite via a registered `_pw_json_contains` UDF that emulates
+  Postgres' `@>` semantics (structural, level-aligned). The core `JSONField`
+  now has full predicate parity across SQLite, Postgres, and MySQL/MariaDB.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.1.1...4.1.2)
+
+## 4.1.1
+
 * New declarative API for pre-fetching related instances (`Load()`). See
   [documentation](https://docs.peewee-orm.com/en/latest/peewee/relationships.html#avoiding-n-1-with-eager-loading).
   This replaces `prefetch()`, is more flexible and also supports options for
@@ -16,8 +48,9 @@ https://github.com/coleifer/peewee/releases
   `JSON_OVERLAPS`/"match any" counterpart to `contains` for JSON arrays.
 * Do not traverse foreign-key fields where `lazy_load=False` when serializing
   recursively with `model_to_dict()`, #3055.
+* Add vendored typeshed stub with improvements.
 
-[View commits](https://github.com/coleifer/peewee/compare/4.1.0...master)
+[View commits](https://github.com/coleifer/peewee/compare/4.1.0...4.1.1)
 
 ## 4.1.0
 
