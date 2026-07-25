@@ -446,6 +446,9 @@ class TestManyToManyBackrefBehavior(ModelTestCase):
         engl.students2.add([huey, zaizee])
 
     def test_manytomanyfield_disabled_backref(self):
+        # backref='+' adds no reverse M2M accessor on Student.
+        self.assertNotIn('+', Student._meta.manytomany)
+
         math = Course.get(name='math')
         query = math.students.order_by(Student.name)
         self.assertEqual([s.name for s in query], ['huey', 'zaizee'])
@@ -754,3 +757,27 @@ class TestManyToManyEmptyOperations(ModelTestCase):
         self.assertIsNone(result)
         # The relationship should still exist.
         self.assertEqual(len(list(n.users)), 1)
+
+
+BangThroughDeferred = DeferredThroughModel()
+
+class BangNote(TestModel):
+    text = TextField()
+    users = ManyToManyField(User, through_model=BangThroughDeferred)
+
+class BangThroughModel(TestModel):
+    user = ForeignKeyField(User, backref='!')
+    note = ForeignKeyField(BangNote, backref='!')
+
+BangThroughDeferred.set_model(BangThroughModel)
+
+
+class TestM2MBangBackref(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [User, BangNote, BangThroughModel]
+
+    def test_backref_bang_sentinel(self):
+        user = User.create(username='u1')
+        note = BangNote.create(text='n1')
+        BangThroughModel.create(user=user, note=note)
+        self.assertEqual([u.username for u in note.users], ['u1'])

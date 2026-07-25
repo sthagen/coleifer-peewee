@@ -70,6 +70,17 @@ PostgresqlExtDatabase
 JSON Support
 ------------
 
+.. attention::
+   **For new code, prefer peewee's built-in** ``JSONField``
+   (``from peewee import JSONField``) over the ``playhouse.postgres_ext`` JSON
+   fields documented here. The built-in field maps to ``JSONB`` on Postgres,
+   presents a single API across SQLite / Postgres / MySQL, and avoids a number
+   of sharp edges in these older implementations. In particular, **avoid**
+   ``postgres_ext.JSONField`` (the text ``json`` variant): its mutation and
+   concatenation builders emit ``jsonb``-only SQL that a ``json`` column
+   rejects, and its path/key handling is weaker than the built-in field's. The
+   ``postgres_ext`` fields below are retained for backwards compatibility.
+
 Peewee provides two JSON field types for Postgresql:
 
 - :class:`BinaryJSONField` - stores JSON in the efficient binary ``jsonb``
@@ -199,7 +210,7 @@ BinaryJSONField and JSONField
          # Search array by individual item:
          Event.select().where(Event.data['tags'].contains('t1'))
 
-      To test whether a **key** simply exists, use :meth:`~BinaryJSONField.has_key`:
+      To test whether a **key** exists, use :meth:`~BinaryJSONField.has_key`:
 
       .. code-block:: python
 
@@ -277,7 +288,7 @@ BinaryJSONField and JSONField
          # error=False:
          Event.select().where(Event.data['result'].contained_by({
              'success': True,
-             'error': False})
+             'error': False}))
 
          # Check that tags are subset of the popular tags (matches rename row).
          popular_tags = ['t3', 't2', 't1', 'tx', 'ty']
@@ -338,11 +349,11 @@ BinaryJSONField and JSONField
       .. code-block:: python
 
          # Replace an existing key (or create it if missing).
-         Event.update(data=Event.data['result'].set({'success': True})) \\
+         Event.update(data=Event.data['result'].set({'success': True})) \
               .execute()
 
          # Set a deeply nested key.
-         Event.update(data=Event.data['metadata']['author'].set('alice')) \\
+         Event.update(data=Event.data['metadata']['author'].set('alice')) \
               .execute()
 
    .. method:: replace(value)
@@ -354,7 +365,7 @@ BinaryJSONField and JSONField
       .. code-block:: python
 
          # Updates only rows where data['result'] already exists.
-         Event.update(data=Event.data['result'].replace({'ok': True})) \\
+         Event.update(data=Event.data['result'].replace({'ok': True})) \
               .execute()
 
    .. method:: insert(value)
@@ -366,7 +377,7 @@ BinaryJSONField and JSONField
       .. code-block:: python
 
          # Add a "created_at" timestamp only on rows that don't already have one.
-         Event.update(data=Event.data['created_at'].insert(timestamp)) \\
+         Event.update(data=Event.data['created_at'].insert(timestamp)) \
               .execute()
 
    .. method:: append(value)
@@ -394,7 +405,7 @@ BinaryJSONField and JSONField
 
          # Merge new keys into a nested object, existing 'success' is
          # overwritten if present in `value`.
-         Event.update(data=Event.data['result'].update({'ok': True})) \\
+         Event.update(data=Event.data['result'].update({'ok': True})) \
               .execute()
 
          # Field-level form: merge into the root object.
@@ -469,22 +480,21 @@ BinaryJSONField and JSONField
 
    :param dumps: custom implementation of ``json.dumps``
 
-   Field that stores and retrieves JSON data. Supports ``__getitem__`` key
-   access for filtering and sub-object retrieval.
+   Field that stores and retrieves JSON data using the Postgres ``json`` type.
+   Supports ``__getitem__`` key access for filtering and sub-object retrieval.
 
-   Consider using the :class:`BinaryJSONField` instead as it
-   offers better performance and more powerful querying options.
+   .. warning::
+      This field is **strongly discouraged**. Prefer peewee's built-in
+      ``JSONField`` (``from peewee import JSONField``), which maps to ``JSONB``
+      on Postgres and supports the full path and mutation API correctly. If you
+      must use a ``playhouse.postgres_ext`` field, use :class:`BinaryJSONField`.
+
+      A ``json`` column supports only the read/query builders here: key and
+      ``path`` access, ``as_json``, ``length`` and ``extract``.
 
    .. method:: as_json()
 
       Deserialize and return the JSON value at the given path.
-
-   .. method:: concat(data)
-
-      Concatenate the field value with ``data``. Note this is a shallow
-      operation and does not deep-merge nested objects.
-
-      See :meth:`BinaryJSONField.concat` for example usage.
 
    .. method:: length()
 
@@ -497,27 +507,6 @@ BinaryJSONField and JSONField
       Extract the JSON data at the given path.
 
       See :meth:`BinaryJSONField.extract` for example usage.
-
-   .. method:: append(value)
-
-      Append ``value`` to the array at the document root. The lookup form
-      ``field['arr'].append(value)`` works as well for nested arrays.
-
-      See :meth:`BinaryJSONField.append` for example usage.
-
-   .. method:: update(value)
-
-      Shallow-merge ``value`` into the root object.
-
-      See :meth:`BinaryJSONField.update` for example usage and a note on
-      shallow-vs-deep merge semantics.
-
-   The lookup-level mutation builders (``set``, ``replace``, ``insert``,
-   ``append``, ``update``) are also available via ``__getitem__``, e.g.
-   ``MyModel.data['key'].set(value)``. They emit ``jsonb_set`` /
-   ``jsonb_insert`` SQL; for ``json`` columns Postgres casts implicitly on
-   ``UPDATE``. See the corresponding methods on :class:`BinaryJSONField` for
-   details.
 
 
 .. _postgres-hstore:
@@ -571,7 +560,7 @@ Example:
    Event.select().where(Event.data['type'] == 'login')
 
    # Filter by a key/value pair:
-   Event.select().where(Event.data.contains({'result': 'success'})
+   Event.select().where(Event.data.contains({'result': 'success'}))
 
    # Filter by key existence:
    Event.select().where(Event.data.exists('referrer'))
@@ -800,7 +789,18 @@ Arrays
 
       .. code-block:: python
 
-         Post.select().where(Post.tags.contains('postgresql', 'python'))
+         Post.select().where(Post.tags.contains_any('postgresql', 'sqlite'))
+
+   .. method:: contained_by(*items)
+
+      Filter rows where every element of the array is present in the given
+      values (the array is a subset).
+
+      :param items: The set of values the array must be contained by.
+
+      .. code-block:: python
+
+         Post.select().where(Post.tags.contained_by('postgresql', 'python', 'sqlite'))
 
 .. _postgres-interval:
 
@@ -979,7 +979,7 @@ For more granular control or to close the cursor explicitly:
        large_query = PageView.select().order_by(PageView.id.desc())
 
        # Rows will be fetched 1000 at-a-time, but iteration is transparent.
-       query = ServerSideQuery(query, array_size=1000)
+       query = ServerSideQuery(large_query, array_size=1000)
 
        # Read 9500 rows then close server-side cursor.
        accum = []
@@ -996,13 +996,16 @@ For more granular control or to close the cursor explicitly:
    (not psycopg3), cursors are declared ``WITH HOLD`` and must be fully
    exhausted or explicitly closed to release server resources.
 
-.. function:: ServerSide(select_query)
+.. function:: ServerSide(select_query, array_size=None)
 
    :param select_query: a :class:`SelectQuery` instance.
+   :param array_size: rows to fetch per batch (defaults to the cursor's
+       ``itersize``).
    :rtype generator:
 
-   Wrap ``select_query`` in a transaction and iterate using :meth:`~BaseQuery.iterator`
-   (disables row caching).
+   Iterate ``select_query`` using a named server-side cursor via
+   :meth:`~BaseQuery.iterator` (disables row caching). Must be run inside a
+   transaction, e.g. ``with db.atomic():``.
 
 .. _crdb:
 

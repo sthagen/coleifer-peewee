@@ -650,6 +650,29 @@ class TestBinaryJsonField(BaseBinaryJsonFieldTestCase, ModelTestCase):
         assertData(['kx'], data)
         assertData(['k1', 'zz'], data)
 
+    def test_lookup_path_chain(self):
+        BJson.delete().execute()
+        BJson.create(data={'k1': {'x1': {'y1': 'z1'}, 'x2': [0, 1]}})
+
+        base = BJson.data['k1']
+        def select(expr):
+            return BJson.select(expr).tuples()[:][0][0]
+
+        # .path() chained onto a lookup resolves to the full path, rather than
+        # crashing (contains/contained_by/concat) or clobbering the whole
+        # column (remove).
+        self.assertEqual(select(base.path('x1', 'y1').remove()),
+                         {'k1': {'x1': {}, 'x2': [0, 1]}})
+        self.assertEqual(
+            BJson.select().where(base.path('x1').contains({'y1': 'z1'})).count(),
+            1)
+        self.assertEqual(
+            BJson.select().where(
+                base.path('x1').contained_by({'y1': 'z1', 'y2': 'z2'})).count(),
+            1)
+        self.assertEqual(select(base.path('x1').concat({'y2': 'z2'})),
+                         {'y1': 'z1', 'y2': 'z2'})
+
     def test_lookup_set(self):
         BJson.delete().execute()
         BJson.create(data={'a': 1, 'b': {'x': 1}})
@@ -1200,19 +1223,98 @@ class TestAutocommitIntegration(ModelTestCase):
         self.assertEqual(KX.select().count(), 1)
 
 
+class JDoc(TestModel):
+    data = JSONField()
+
+class JBDoc(TestModel):
+    data = BinaryJSONField()
+
+
+class TestJsonColumnTypes(ModelTestCase):
+    database = db_loader('postgres')
+    requires = [JDoc, JBDoc]
+
+    def test_json_column_types(self):
+        jdoc, jbdoc = JDoc._meta.table_name, JBDoc._meta.table_name
+        curs = self.database.execute_sql(
+            'select table_name, data_type from information_schema.columns '
+            'where column_name = %s and table_name in (%s, %s)',
+            ('data', jdoc, jbdoc))
+        self.assertEqual(dict(curs.fetchall()),
+                         {jdoc: 'json', jbdoc: 'jsonb'})
+
+    def test_json_function_flavors(self):
+        JDoc.create(data=[1, 2, 3])
+        JBDoc.create(data=[1, 2, 3])
+        self.assertEqual(JDoc.select(JDoc.data.length()).scalar(), 3)
+        self.assertEqual(JBDoc.select(JBDoc.data.length()).scalar(), 3)
+
+    def test_json_lookup_flavor(self):
+        JDoc.create(data={'items': [1, 2]})
+        self.assertEqual(
+            JDoc.select(JDoc.data['items'].length()).scalar(), 2)
+        JBDoc.create(data={'items': [1, 2, 3]})
+        self.assertEqual(
+            JBDoc.select(JBDoc.data['items'].length()).scalar(), 3)
+
+
+class KVC(TestModel):
+    key = TextField()
+    value = IntegerField()
+    class Meta:
+        primary_key = CompositeKey('key', 'value')
+
+
+class TestPostgresReturning(ModelTestCase):
+    database = db_loader('postgres')
+    requires = [KVC]
+
+    def test_insert_composite_pk(self):
+        iq = KVC.insert({'key': 'k1', 'value': 1})
+        self.assertEqual(iq.execute(), ('k1', 1))
+
+        iq = KVC.insert_many([('k2', 2), ('k3', 3)])
+        self.assertEqual(list(iq.execute()), [('k2', 2), ('k3', 3)])
+
+        iq = KVC.insert_many([('k4', 4), ('k5', 5)]).as_rowcount()
+        self.assertEqual(iq.execute(), 2)
+
+
+class TestTableInsertReturning(DatabaseTestCase):
+    database = db_loader('postgres')
+
+    def test_plain_table_insert_returning_pk(self):
+        self.database.execute_sql('drop table if exists t_pkstr')
+        self.database.execute_sql(
+            'create table t_pkstr (id serial primary key, x text)')
+        tbl = (Table('t_pkstr', ('id', 'x'), primary_key='id')
+               .bind(self.database))
+        self.assertEqual(tbl.insert({tbl.x: 'foo'}).execute(), 1)
+        self.assertEqual(tbl.insert({tbl.x: 'bar'}).execute(), 2)
+        self.database.execute_sql('drop table t_pkstr')
+
+
 class TestPostgresIsolationLevel(DatabaseTestCase):
-    database = db_loader('postgres', isolation_level=3)  # SERIALIZABLE.
+    # The integer constants differ between psycopg2 and psycopg3, so specify
+    # the level as a string and resolve via the adapter.
+    database = db_loader('postgres', isolation_level='SERIALIZABLE')
 
     def test_isolation_level(self):
+        serializable = self.database._isolation_level
         conn = self.database.connection()
-        self.assertEqual(conn.isolation_level, 3)
+        self.assertEqual(conn.isolation_level, serializable)
+
+        with self.database.atomic():
+            curs = self.database.execute_sql(
+                'show transaction isolation level')
+            self.assertEqual(curs.fetchone()[0], 'serializable')
 
         conn.set_isolation_level(2)
         self.assertEqual(conn.isolation_level, 2)
         self.database.close()
 
         conn = self.database.connection()
-        self.assertEqual(conn.isolation_level, 3)
+        self.assertEqual(conn.isolation_level, serializable)
         self.database.close()
 
         self.database.set_isolation_level(2)
@@ -1319,6 +1421,35 @@ class TestPostgresLateralJoin(ModelTestCase):
             ('b', 'b7'),
             ('c', None)])
 
+        # A user-supplied on= is honored rather than replaced with true. It
+        # filters the lateral's top-2 output, a1 was already cut by LIMIT.
+        query = (User
+                 .select(User.username, subq.c.content)
+                 .join(subq, JOIN.LEFT_LATERAL, on=(subq.c.content != 'a10'))
+                 .order_by(User.username, subq.c.timestamp))
+        results = [(u.username, u.content) for u in query]
+        self.assertEqual(results, [
+            ('a', 'a2'),
+            ('b', 'b4'),
+            ('b', 'b7'),
+            ('c', None)])
+
+    @requires_models(User, Tweet)
+    def test_full_join_no_related(self):
+        self.create_data()
+
+        query = (User
+                 .select(User, Tweet)
+                 .join(Tweet, JOIN.FULL, on=(Tweet.user == User.id))
+                 .order_by(User.username, Tweet.content))
+        # "FULL JOIN" nulls the tweet side for the tweet-less user ("c").
+        accum = [(u.username, u.tweet.content if u.tweet is not None else None)
+                 for u in query]
+        self.assertEqual(accum, [
+            ('a', 'a1'), ('a', 'a10'), ('a', 'a2'),
+            ('b', 'b3'), ('b', 'b4'), ('b', 'b7'),
+            ('c', None)])
+
     @requires_models(User, Tweet)
     def test_lateral_helper(self):
         self.create_data()
@@ -1333,6 +1464,19 @@ class TestPostgresLateralJoin(ModelTestCase):
         query = (User
                  .select(User, subq.c.content)
                  .join(subq, on=True)
+                 .order_by(subq.c.timestamp.desc(nulls='last')))
+        with self.assertQueryCount(1):
+            results = [(u.username, u.tweet.content) for u in query]
+            self.assertEqual(results, [
+                ('a', 'a10'),
+                ('b', 'b7'),
+                ('b', 'b4'),
+                ('a', 'a2')])
+
+        # on= may be omitted, it defaults to ON true.
+        query = (User
+                 .select(User, subq.c.content)
+                 .join(subq)
                  .order_by(subq.c.timestamp.desc(nulls='last')))
         with self.assertQueryCount(1):
             results = [(u.username, u.tweet.content) for u in query]

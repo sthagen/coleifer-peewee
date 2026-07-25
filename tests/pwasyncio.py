@@ -729,9 +729,8 @@ class TestTaskLifecycle(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.create_task(acquire_and_abandon())
 
-        # The done-callback should have moved the connection to orphaned
-        # connections, which are handled either via done callback or during
-        # pool shutdown.
+        # The done-callback releases the abandoned connection, close_pool
+        # reaps any release still in flight.
         await asyncio.wait_for(self.db.close_pool(), timeout=2.0)
 
 
@@ -859,6 +858,77 @@ class IntegrationTests(object):
                 for i in range(n):
                     TestModel.create(name=f'item{i:02d}', value=i * 10)
         await self.db.run(_seed)
+
+    async def test_task_done_releases_to_waiters(self):
+        # Tasks that exit without aclose() must return their connections
+        # promptly so waiters blocked in the pool are not starved.
+        db = type(self.db)(self.db.database, pool_size=2, acquire_timeout=5,
+                           **self.db.connect_params)
+        try:
+            async def worker():
+                await db.aexecute_sql('SELECT 1')
+                await asyncio.sleep(0.2)
+
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            await asyncio.wait_for(
+                asyncio.gather(*[worker() for _ in range(4)]), timeout=4.0)
+            elapsed = loop.time() - start
+            self.assertTrue(elapsed < 2.0, 'workers starved: %.2fs' % elapsed)
+        finally:
+            await db.close_pool()
+
+    async def test_release_after_pool_swap(self):
+        # A conn released after its pool was closed or replaced is closed,
+        # not cross-released into the new pool.
+        db = type(self.db)(self.db.database, pool_size=2, acquire_timeout=1,
+                           **self.db.connect_params)
+        try:
+            conn = await db.aconnect()
+            old_pool = db._pool
+            db._state.reset()  # Detach so close_pool leaves it checked out.
+            await asyncio.wait_for(db.close_pool(), timeout=5)
+
+            curs = await db.aexecute_sql('SELECT 1')  # Recreates the pool.
+            self.assertIsNot(db._pool, old_pool)
+            await db._release_conn(conn)
+            self.assertIsNone(conn.conn)  # Closed, not requeued.
+            curs = await db.aexecute_sql('SELECT 1')
+            self.assertEqual(curs.fetchone()[0], 1)
+        finally:
+            await db.close_pool()
+
+    async def test_close_pool_releases_caller_conn(self):
+        # Deferring the caller's conn to task-end release strands it, the
+        # release task dies with the loop (hangs interpreter exit on 3.8).
+        db = type(self.db)(self.db.database, pool_size=2,
+                           **self.db.connect_params)
+        conn = await db.aconnect()
+        await db.close_pool()
+        self.assertIsNone(db._state.conn)
+        self.assertTrue(conn.stale())
+
+    async def test_close_pool_under_load(self):
+        # close_pool with queries in flight must not hang. Workers may die
+        # with pool-shutdown errors, nothing else.
+        db = type(self.db)(self.db.database, pool_size=2, acquire_timeout=2,
+                           **self.db.connect_params)
+
+        async def worker():
+            try:
+                for _ in range(5):
+                    await db.aexecute_sql('SELECT 1')
+                    await asyncio.sleep(0.01)
+            except (InterfaceError, OperationalError, ProgrammingError,
+                    InternalError):
+                pass
+
+        tasks = [asyncio.ensure_future(worker()) for _ in range(6)]
+        await asyncio.sleep(0.02)
+        await asyncio.wait_for(db.close_pool(), timeout=10)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=15)
+        # Surviving workers may have lazily recreated the pool.
+        await asyncio.wait_for(db.close_pool(), timeout=10)
 
     async def test_amodel_create_get(self):
         u = await AUser.acreate(username='u1')
@@ -2071,11 +2141,10 @@ class IntegrationTests(object):
             # Task ends without commit/rollback or close().
 
         await asyncio.ensure_future(dirty())
-        for _ in range(10):  # Allow the done-callback to orphan the conn.
+        for _ in range(50):  # Wait for the scheduled release to roll back.
             await asyncio.sleep(0.01)
-            if self.db._state._orphaned_conns:
+            if not self.db._state._release_tasks:
                 break
-        await self.db.aconnect()  # Drains the orphan: rolls back, releases.
         await self.assertCount(1)
         await self.create_record('after')
         await self.assertCount(2)
@@ -2242,6 +2311,19 @@ class TestSqliteIntegration(IntegrationTests, unittest.IsolatedAsyncioTestCase):
         await self.db.aexecute_sql(
             'INSERT INTO ut (v) VALUES (?)', ('y',))
 
+    async def test_pool_close_leaves_checked_out(self):
+        db = AsyncSqliteDatabase(':memory:')
+        try:
+            conn = await db.aconnect()
+            await db._pool.close()
+            # A checked-out conn survives close and works until released.
+            curs = await conn.execute('SELECT 1')
+            self.assertEqual(curs.fetchone(), (1,))
+            await db._pool.release(conn)  # Closed on release, pool is closed.
+            self.assertIsNone(conn.conn)
+        finally:
+            await db.close_pool()
+
 
 @unittest.skipIf(not IS_POSTGRESQL, 'skipping postgres test')
 @unittest.skipUnless(asyncpg, 'asyncpg not installed')
@@ -2325,3 +2407,13 @@ class TestMySQLIntegration(IntegrationTests, unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestConnectErrorTranslation(unittest.IsolatedAsyncioTestCase):
+    async def test_sqlite_connect_error_translated(self):
+        db = AsyncSqliteDatabase('/peewee-nonexistent/foo.db')
+        try:
+            with self.assertRaises(OperationalError):
+                await db.aconnect()
+        finally:
+            await db.close_pool()

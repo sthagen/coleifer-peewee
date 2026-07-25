@@ -178,10 +178,12 @@ class TestPathExtract(ModelTestCase):
         self.assertEqual(JM.select(JM.data['tags'][2]).scalar(), 'fluffy')
         self.assertEqual(JM.select(JM.data['matrix'][1][0]).scalar(), 3)
 
-    @skip_if(IS_MYSQL)
     def test_negative_index(self):
         self.assertEqual(JM.select(JM.data['tags'][-1]).scalar(), 'fluffy')
+        self.assertEqual(JM.select(JM.data['tags'][-2]).scalar(), 'white')
         self.assertEqual(JM.select(JM.data['matrix'][-1][-1]).scalar(), 6)
+        JM.update(data=JM.data['tags'][-1].set('spotted')).execute()
+        self.assertEqual(JM.select(JM.data['tags'][-1]).scalar(), 'spotted')
 
     def test_special_char_key(self):
         self.assertEqual(self._val('a.b'), 'dotted key')
@@ -638,7 +640,7 @@ class TestAsTextDeep(ModelTestCase):
         self.assertEqual(n, 2)
 
     def test_text_then_cast(self):
-        # MySQL spells the integer cast-type SIGNED (MariaDB accepts both).
+        # MySQL names the integer cast-type SIGNED (MariaDB accepts both).
         cast_type = 'signed' if IS_MYSQL else 'integer'
         n = (JM.select()
              .where(JM.data['count'].as_text().cast(cast_type) > 10).count())
@@ -856,6 +858,27 @@ class TestMutation(ModelTestCase):
         m = JM.create(data={'k': 'v'})
         JM.update(data=JM.data['k'].set(None)).where(JM.id == m.id).execute()
         self.assertEqual(JM.get_by_id(m.id).data, {'k': None})
+
+    def test_set_bool(self):
+        # Bools must land as json true/false, not the driver's 0/1. Dict
+        # equality cannot discriminate (True == 1), so check identity.
+        m = JM.create(data={'k': 'v'})
+        JM.update(data=JM.data['k'].set(True)).where(JM.id == m.id).execute()
+        self.assertIs(JM.get_by_id(m.id).data['k'], True)
+        self.assertEqual(JM.select().where(JM.data['k'] == True).count(), 1)
+        self.assertEqual(JM.select().where(JM.data['k'] == False).count(), 0)
+
+        JM.update(data=JM.data['k'].set(False)).where(JM.id == m.id).execute()
+        self.assertIs(JM.get_by_id(m.id).data['k'], False)
+        self.assertEqual(JM.select().where(JM.data['k'] == False).count(), 1)
+
+    def test_set_float(self):
+        # Mariadb reformats driver floats and compares json textually, so a
+        # set() value must round-trip through dumps to stay findable.
+        m = JM.create(data={'k': 0})
+        JM.update(data=JM.data['k'].set(1e10)).where(JM.id == m.id).execute()
+        self.assertEqual(JM.get_by_id(m.id).data['k'], 1e10)
+        self.assertEqual(JM.select().where(JM.data['k'] == 1e10).count(), 1)
 
     def test_remove(self):
         m = JM.create(data={'k': 'v', 'n': 5})

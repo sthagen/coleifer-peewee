@@ -53,6 +53,14 @@ class Session(TestModel):
     user = ForeignKeyField(User, unique=True, backref='sessions')
     updated_at = DateField(null=True)
 
+class FKPage(TestModel):
+    user = ForeignKeyField(User, null=True, backref='fk_pages',
+                           on_delete='CASCADE', on_update='CASCADE')
+    name = CharField(null=True)
+
+    class Meta:
+        table_name = 'fk_page'
+
 class IndexModel(TestModel):
     first_name = CharField()
     last_name = CharField()
@@ -642,6 +650,27 @@ class TestSchemaMigration(ModelTestCase):
         self.assertEqual(foreign_key.dest_column, 'id')
         self.assertEqual(foreign_key.dest_table, 'users')
 
+    @skip_unless(IS_MYSQL, 'FK ON DELETE/UPDATE reconstruction is MySQL-only')
+    @requires_models(FKPage)
+    def test_fk_actions_preserved(self):
+        def fk():
+            fks = self.database.get_foreign_keys('fk_page')
+            self.assertEqual(len(fks), 1)
+            return fks[0]
+
+        self.assertEqual((fk().on_delete, fk().on_update),
+                         ('CASCADE', 'CASCADE'))
+
+        migrate(self.migrator.add_not_null('fk_page', 'user_id'))
+        self.assertEqual((fk().on_delete, fk().on_update),
+                         ('CASCADE', 'CASCADE'))
+
+        migrate(self.migrator.rename_column('fk_page', 'user_id', 'owner_id'))
+        renamed = fk()
+        self.assertEqual(renamed.column, 'owner_id')
+        self.assertEqual((renamed.on_delete, renamed.on_update),
+                         ('CASCADE', 'CASCADE'))
+
     @requires_pglike
     @requires_models(Tag)
     def test_add_column_with_index_type(self):
@@ -780,6 +809,38 @@ class TestSchemaMigration(ModelTestCase):
             ('CREATE INDEX "category_parent_id" ON "category" ("parent_id")',
              []),
         ])
+
+    @requires_sqlite
+    def test_rebuild_preserves_bare_unique(self):
+        db = self.database
+        db.execute_sql('DROP TABLE IF EXISTS "uc"')
+        db.execute_sql('CREATE TABLE "uc" ("id" INTEGER PRIMARY KEY, '
+                       '"a" TEXT, "b" TEXT, UNIQUE (a, b))')
+        try:
+            # Without the 'unique ' constraint term, the rebuild treats the
+            # bare UNIQUE (a, b) as a column and raises OperationalError.
+            migrate(self.migrator.add_not_null('uc', 'a'))
+            row = db.execute_sql('SELECT sql FROM sqlite_master '
+                                 "WHERE type='table' AND name='uc'").fetchone()
+            self.assertIn('UNIQUE', row[0].upper())
+        finally:
+            db.execute_sql('DROP TABLE IF EXISTS "uc"')
+
+    @requires_sqlite
+    def test_rebuild_substring_table_name(self):
+        db = self.database
+        db.execute_sql('DROP TABLE IF EXISTS "ab"')
+        db.execute_sql('CREATE TABLE "ab" ("id" INTEGER PRIMARY KEY, '
+                       '"x" INTEGER)')
+        try:
+            db.execute_sql('INSERT INTO "ab" ("id", "x") VALUES (1, 10)')
+            # 'ab' is a substring of "CREATE TABLE"; an unanchored rename
+            # rewrites the keyword and produces a syntax error.
+            migrate(self.migrator.add_not_null('ab', 'x'))
+            self.assertEqual(
+                db.execute_sql('SELECT "x" FROM "ab"').fetchall(), [(10,)])
+        finally:
+            db.execute_sql('DROP TABLE IF EXISTS "ab"')
 
     @requires_sqlite
     @requires_models(IndexModel)

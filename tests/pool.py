@@ -17,6 +17,8 @@ from .base import IS_POSTGRESQL
 from .base import IS_SQLITE
 from .base import ModelTestCase
 from .base import db_loader
+from .base import requires_mysql
+from .base import requires_postgresql
 from .base_models import Register
 
 
@@ -689,6 +691,16 @@ class TestPooledDatabase(BaseTestCase):
         self.assertEqual(db._connections, [])
         self.assertEqual(list(db._in_use.keys()), [3])
 
+    def test_mysql_is_closed_version_gate(self):
+        # MariaDB-style drivers have an argument-less ping().
+        class NoArgPing(object):
+            def ping(self): pass
+
+        db = PooledMySQLDatabase(None)
+        for version in ((8, 0, 0), (11, 8, 0)):
+            db.server_version = version
+            self.assertFalse(db._is_closed(NoArgPing()))
+
     def test_init_updates_pool_parameters(self):
         # The init() method should allow updating pool parameters after
         # initial construction.
@@ -870,4 +882,58 @@ class TestPooledDatabaseIntegration(ModelTestCase):
             self.assertConnections(4 - i)
 
         self.assertConnections(0)
+
+    def test_checkin_open_transaction(self):
+        # A conn checked in mid-transaction (opened outside peewee's txn
+        # stack, so close() does not complain) is rolled back so the next
+        # checkout starts clean.
+        self.database.execute_sql('begin')
+        Register.create(value=1)
+        self.database.close()
+
+        self.assertTrue(self.database.connect())
+        self.assertEqual(Register.select().count(), 0)
+
+        # The connection is usable and no longer inside a transaction.
+        Register.create(value=2)
+        self.database.close()
+        self.assertTrue(self.database.connect())
+        self.assertEqual(Register.select().count(), 1)
+
+    @requires_mysql
+    def test_dead_conn_discarded(self):
+        conn = self.database.connection()
+        curs = self.database.execute_sql('SELECT CONNECTION_ID()')
+        conn_id = curs.fetchone()[0]
+        self.database.close()
+
+        killer = db_loader(BACKEND)
+        killer.execute_sql('KILL %s' % conn_id)
+        killer.close()
+
+        # The killed conn is discarded at checkout, not silently revived.
+        self.assertTrue(self.database.connect())
+        self.assertIsNot(self.database.connection(), conn)
+        curs = self.database.execute_sql('SELECT 1')
+        self.assertEqual(curs.fetchone()[0], 1)
+        self.database.close()
+        self.assertEqual(len(self.database._in_use), 0)
+
+    @requires_postgresql
+    def test_dead_conn_discarded_pg(self):
+        conn = self.database.connection()
+        curs = self.database.execute_sql('select pg_backend_pid()')
+        pid = curs.fetchone()[0]
+        self.database.close()
+
+        killer = db_loader(BACKEND)
+        killer.execute_sql('select pg_terminate_backend(%s)', (pid,))
+        killer.close()
+
+        # The killed conn is discarded at checkout, not handed back dead.
+        self.assertTrue(self.database.connect())
+        self.assertIsNot(self.database.connection(), conn)
+        curs = self.database.execute_sql('SELECT 1')
+        self.assertEqual(curs.fetchone()[0], 1)
+        self.database.close()
         self.assertEqual(len(self.database._in_use), 0)

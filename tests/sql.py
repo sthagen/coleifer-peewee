@@ -264,6 +264,25 @@ class TestSelectQuery(BaseTestCase):
         self.assertSQL(query, (
             'SELECT "t1"."id" FROM "users" AS "t1" WHERE (1 = 1)'))
 
+        # An empty generator is one-shot; materialize it so it is caught too.
+        query = User.select(User.c.id).where(User.c.id.in_(i for i in []))
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "users" AS "t1" WHERE (0 = 1)'))
+
+        query = User.select(User.c.id).where(User.c.id.not_in(i for i in []))
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "users" AS "t1" WHERE (1 = 1)'))
+
+    def test_generator_in_reused(self):
+        # A generator rhs is materialized at build time: it is one-shot, so
+        # rendering the query twice used to exhaust it and collapse to IN ().
+        query = User.select(User.c.id).where(
+            User.c.id.in_(i for i in (1, 2, 3)))
+        expected = ('SELECT "t1"."id" FROM "users" AS "t1" '
+                    'WHERE ("t1"."id" IN (?, ?, ?))')
+        self.assertSQL(query, expected, [1, 2, 3])
+        self.assertSQL(query, expected, [1, 2, 3])  # Second render survives.
+
     def test_between_via_slice(self):
         query = User.select(User.c.id).where(User.c.age[18:65])
         self.assertSQL(query, (
@@ -581,6 +600,58 @@ class TestSelectQuery(BaseTestCase):
             'FROM "point" AS "t1" '
             'ORDER BY "t1"."x", "t1"."y"'), [])
 
+    def test_subquery_column_no_alias(self):
+        # A subquery or compound used as a bare selected column must not be
+        # given a "AS tN" name. That naming is only for a table in a FROM or
+        # JOIN. An explicit alias is still emitted. See
+        # test_subquery_in_select_expression_sql.
+        subq = Tweet.select(fn.COUNT(SQL('1'))).where(
+            Tweet.c.user_id == User.c.id)
+        query = User.select(User.c.username, subq)
+        self.assertSQL(query, (
+            'SELECT "t1"."username", (SELECT COUNT(1) FROM "tweets" AS "t2" '
+            'WHERE ("t2"."user_id" = "t1"."id")) FROM "users" AS "t1"'), [])
+
+        A = User.select(User.c.id).where(User.c.username == 'a')
+        B = User.select(User.c.id).where(User.c.username == 'b')
+        query = User.select(User.c.username, A | B)
+        self.assertSQL(query, (
+            'SELECT "t1"."username", (SELECT "t1"."id" FROM "users" AS "t1" '
+            'WHERE ("t1"."username" = ?) UNION SELECT "t1"."id" '
+            'FROM "users" AS "t1" WHERE ("t1"."username" = ?)) '
+            'FROM "users" AS "t1"'), ['a', 'b'])
+
+    def test_subquery_source_retains_alias(self):
+        # A subquery used in a FROM or JOIN does need its name. The no-name
+        # rule for columns must not reach it.
+        subq = User.select(User.c.id, User.c.username)
+        query = (Tweet
+                 .select(Tweet.c.content)
+                 .join(subq, on=(Tweet.c.user_id == subq.c.id)))
+        self.assertSQL(query, (
+            'SELECT "t1"."content" FROM "tweets" AS "t1" '
+            'INNER JOIN (SELECT "t2"."id", "t2"."username" '
+            'FROM "users" AS "t2") AS "t3" ON ("t1"."user_id" = "t3"."id")'),
+            [])
+
+    def test_derived_table_alias_in_expression(self):
+        # A query that joins an unnamed subquery and is then used inside an
+        # IN(...) must keep that subquery's "AS tN". The enclosing expression
+        # must not change how the inner query names its own tables.
+        Comment = Table('comment')
+        usub = User.select(User.c.id)
+        posts = Tweet.select(Tweet.c.id).join(
+            usub, on=(usub.c.id == Tweet.c.user_id))
+        query = (Comment
+                 .select(Comment.c.id)
+                 .where(Comment.c.tweet_id.in_(posts)))
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "comment" AS "t1" '
+            'WHERE ("t1"."tweet_id" IN ('
+            'SELECT "t2"."id" FROM "tweets" AS "t2" '
+            'INNER JOIN (SELECT "t3"."id" FROM "users" AS "t3") AS "t4" '
+            'ON ("t4"."id" = "t2"."user_id")))'), [])
+
     def test_select_from_subquery(self):
         subq = (User
                 .select(User.c.username,
@@ -729,6 +800,18 @@ class TestSelectQuery(BaseTestCase):
                 'SELECT "user_ids"."id" FROM "user_ids" '
                 'WHERE ("user_ids"."id" < ?)') % clause, [10])
 
+    def test_materialize_cte_union(self):
+        for method, clause in (('union_all', 'UNION ALL'), ('union', 'UNION')):
+            base = User.select(User.c.id).cte('u', materialized=True)
+            cte = getattr(base, method)(User.select(User.c.id))
+            query = cte.select_from(cte.c.id)
+            self.assertSQL(query, (
+                'WITH "u" AS MATERIALIZED ('
+                'SELECT "t1"."id" FROM "users" AS "t1" '
+                '%s '
+                'SELECT "t2"."id" FROM "users" AS "t2") '
+                'SELECT "u"."id" FROM "u"') % clause, [])
+
     def test_cte_union_distinct(self):
         # CTE.union() produces UNION (distinct) instead of UNION ALL.
         base = User.select(User.c.id).where(User.c.id == 1)
@@ -821,6 +904,15 @@ class TestSelectQuery(BaseTestCase):
             'FROM "order" AS "t3" '
             'INNER JOIN "max_order" '
             'ON ("t3"."id" = "max_order"."max_id")))'), [])
+
+    def test_cte_does_not_mutate_source(self):
+        cte = User.select(User.c.username).cte('foo')
+        query = cte.select(cte.c.username).with_cte(cte)
+        expected = ('WITH "foo" AS (SELECT "t1"."username" FROM "users" AS "t1") '
+                    'SELECT "foo"."username" FROM "foo"')
+        self.assertSQL(query, expected, [])
+        query.cte('bar')
+        self.assertSQL(query, expected, [])
 
     def test_multi_update_cte(self):
         data = [(i, 'u%sx' % i) for i in range(1, 3)]
@@ -998,6 +1090,34 @@ class TestSelectQuery(BaseTestCase):
             'FROM "users" AS "t2" '
             'WHERE ("t2"."is_admin" = ?)'), ['editor', 1, 'admin', 1])
 
+    def test_compound_as_lone_function_argument(self):
+        UA = User.alias('u2')
+        A = User.select(User.c.id).where(User.c.admin == True)
+        B = UA.select(UA.c.id).where(UA.c.superuser == True)
+
+        # A compound as the only argument of a function must not add its own
+        # parentheses on top of the function's. It used to emit EXISTS((...)).
+        self.assertSQL(User.select(User.c.id).where(fn.EXISTS(A | B)), (
+            'SELECT "t1"."id" FROM "users" AS "t1" WHERE EXISTS('
+            'SELECT "t1"."id" FROM "users" AS "t1" WHERE ("t1"."admin" = ?) '
+            'UNION '
+            'SELECT "u2"."id" FROM "users" AS "u2" '
+            'WHERE ("u2"."superuser" = ?))'), [True, True])
+
+        # A plain select in the same spot already rendered single parens.
+        self.assertSQL(User.select(User.c.id).where(fn.EXISTS(A)), (
+            'SELECT "t1"."id" FROM "users" AS "t1" WHERE EXISTS('
+            'SELECT "t1"."id" FROM "users" AS "t1" '
+            'WHERE ("t1"."admin" = ?))'), [True])
+
+        # With a second argument the compound is not the lone arg, so it keeps
+        # its own parentheses as a distinct argument.
+        self.assertSQL(User.select(fn.COALESCE(A | B, 0)), (
+            'SELECT COALESCE((SELECT "t1"."id" FROM "users" AS "t1" '
+            'WHERE ("t1"."admin" = ?) UNION SELECT "u2"."id" FROM "users" '
+            'AS "u2" WHERE ("u2"."superuser" = ?)), ?) FROM "users" AS "t1"'),
+            [True, True, 0])
+
     def test_compound_parentheses_handling(self):
         admin = (User
                  .select(User.c.username, Value('admin').alias('role'))
@@ -1059,6 +1179,271 @@ class TestSelectQuery(BaseTestCase):
             'WHERE ("t3"."value" = ?))'),
             [2, 7, 5], compound_select_parentheses=2)  # Un-nested.
 
+    def test_nested_compound_grouping(self):
+        Reg = Table('register', ('value',))
+        a = Reg.select().where(Reg.value < 5)
+        b = Reg.select().where(Reg.value > 2)
+        c = Reg.select().where(Reg.value == 4)
+        d = Reg.select().where(Reg.value != 9)
+        ordered = (a | b).order_by(Reg.value.desc()).limit(2)
+
+        # CSQ never (sqlite): the nested rhs is wrapped as a subquery,
+        # written flat it would run left to right and lose its grouping.
+        self.assertSQL(a - (b - c), (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'EXCEPT '
+            'SELECT * FROM ('
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?) '
+            'EXCEPT '
+            'SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?))'), [5, 2, 4],
+            compound_select_parentheses=0)  # Never.
+
+        # A bare compound lhs stays flat, ops run left to right anyway.
+        self.assertSQL((a | b) - c, (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'UNION '
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?) '
+            'EXCEPT '
+            'SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?)'), [5, 2, 4],
+            compound_select_parentheses=0)  # Never.
+
+        # Unions of unions group the same either way, they stay flat.
+        self.assertSQL(a | (b | c), (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'UNION '
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?) '
+            'UNION '
+            'SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?)'), [5, 2, 4],
+            compound_select_parentheses=0)  # Never.
+
+        # An lhs with its own ORDER BY / LIMIT must be wrapped, written
+        # flat those would apply to the whole statement.
+        self.assertSQL(ordered - c, (
+            'SELECT * FROM ('
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'UNION '
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?) '
+            'ORDER BY "value" DESC LIMIT ?) '
+            'EXCEPT '
+            'SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?)'), [5, 2, 2, 4],
+            compound_select_parentheses=0)  # Never.
+
+        # CSQ unnested (mysql before the version gate): nested compounds
+        # stay flat, each plain member gets parens.
+        self.assertSQL(a - (b - c), (
+            '(SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?)) '
+            'EXCEPT '
+            '(SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?)) '
+            'EXCEPT '
+            '(SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?))'), [5, 2, 4],
+            compound_select_parentheses=2)  # Un-nested.
+
+        self.assertSQL((a | b) - c, (
+            '(SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?)) '
+            'UNION '
+            '(SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?)) '
+            'EXCEPT '
+            '(SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?))'), [5, 2, 4],
+            compound_select_parentheses=2)  # Un-nested.
+
+        # CSQ always (postgres): parens everywhere.
+        self.assertSQL(a - (b - c), (
+            '(SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?)) '
+            'EXCEPT '
+            '((SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?)) '
+            'EXCEPT '
+            '(SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?)))'), [5, 2, 4],
+            compound_select_parentheses=1)  # Always.
+
+        # CSQ grouped (mysql past the version gate): parens only where
+        # needed to keep the meaning.
+        self.assertSQL(a - (b - c), (
+            '(SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?)) '
+            'EXCEPT '
+            '((SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?)) '
+            'EXCEPT '
+            '(SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?)))'), [5, 2, 4],
+            compound_select_parentheses=3)  # Grouped.
+
+        # Union chains stay flat so outer column refs keep working,
+        # mysql cannot see them through two levels of parens.
+        self.assertSQL(a | (b | c), (
+            '(SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?)) '
+            'UNION '
+            '(SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?)) '
+            'UNION '
+            '(SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?))'), [5, 2, 4],
+            compound_select_parentheses=3)  # Grouped.
+
+        # INTERSECT runs first on mysql, so an lhs built from another op
+        # needs parens even though ops otherwise run left to right.
+        self.assertSQL((a | b) & c, (
+            '((SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?)) '
+            'UNION '
+            '(SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?))) '
+            'INTERSECT '
+            '(SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?))'), [5, 2, 4],
+            compound_select_parentheses=3)  # Grouped.
+
+        # A same-op rhs must not expose a different op through its
+        # flattened left spine, ops there join the outer chain.
+        self.assertSQL(a + ((b | c) + d), (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'UNION ALL '
+            'SELECT * FROM ('
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?) '
+            'UNION '
+            'SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?) '
+            'UNION ALL '
+            'SELECT "t4"."value" FROM "register" AS "t4" '
+            'WHERE ("t4"."value" != ?))'), [5, 2, 4, 9],
+            compound_select_parentheses=0)  # Never.
+
+        self.assertSQL(a | ((b - c) | d), (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'UNION '
+            'SELECT * FROM ('
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?) '
+            'EXCEPT '
+            'SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?) '
+            'UNION '
+            'SELECT "t4"."value" FROM "register" AS "t4" '
+            'WHERE ("t4"."value" != ?))'), [5, 2, 4, 9],
+            compound_select_parentheses=0)  # Never.
+
+        self.assertSQL(a + ((b | c) + d), (
+            '(SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?)) '
+            'UNION ALL '
+            '((SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?)) '
+            'UNION '
+            '(SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?)) '
+            'UNION ALL '
+            '(SELECT "t4"."value" FROM "register" AS "t4" '
+            'WHERE ("t4"."value" != ?)))'), [5, 2, 4, 9],
+            compound_select_parentheses=3)  # Grouped.
+
+        # Inside IN / EXISTS only the distinct set matters, so a pure
+        # union chain stays flat and correlated refs keep resolving.
+        self.assertSQL(
+            Reg.select(Reg.value).where(Reg.value.in_(a | (b + c))), (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" IN ('
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'UNION '
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" > ?) '
+            'UNION ALL '
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" = ?)))'), [5, 2, 4],
+            compound_select_parentheses=3)  # Grouped.
+
+        self.assertSQL(
+            Reg.select(Reg.value).where(Reg.value.in_(a | (b - c))), (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" IN ('
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'UNION '
+            '(SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" > ?) '
+            'EXCEPT '
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" = ?))))'), [5, 2, 4],
+            compound_select_parentheses=3)  # Grouped.
+
+    def test_compound_member_order_limit(self):
+        # A plain (non-compound) member with its own ORDER BY / LIMIT must be
+        # grouped, exactly like a nested compound member: written flat under
+        # CSQ never (sqlite) an lhs is a syntax error and an rhs silently
+        # rebinds the ORDER BY / LIMIT to the whole statement.
+        Reg = Table('register', ('value',))
+        a = Reg.select().where(Reg.value < 5).order_by(Reg.value.desc()).limit(2)
+        b = Reg.select().where(Reg.value > 2)
+
+        # CSQ never (sqlite): wrap the ordered/limited member as a subquery.
+        self.assertSQL(a | b, (
+            'SELECT * FROM ('
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'ORDER BY "t1"."value" DESC LIMIT ?) '
+            'UNION '
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?)'), [5, 2, 2],
+            compound_select_parentheses=0)  # Never.
+
+        self.assertSQL(b | a, (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" > ?) '
+            'UNION '
+            'SELECT * FROM ('
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" < ?) '
+            'ORDER BY "t2"."value" DESC LIMIT ?)'), [2, 5, 2],
+            compound_select_parentheses=0)  # Never.
+
+        # CSQ always (postgres): the member gets ordinary parentheses.
+        self.assertSQL(a | b, (
+            '(SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'ORDER BY "t1"."value" DESC LIMIT ?) '
+            'UNION '
+            '(SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?))'), [5, 2, 2],
+            compound_select_parentheses=1)  # Always.
+
+        # An offset-only member wraps too, limit_max supplies the LIMIT
+        # that sqlite requires before OFFSET.
+        c = Reg.select().where(Reg.value < 5).offset(1)
+        self.assertSQL(b | c, (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" > ?) '
+            'UNION '
+            'SELECT * FROM ('
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" < ?) '
+            'LIMIT ? OFFSET ?)'), [2, 5, -1, 1],
+            compound_select_parentheses=0, limit_max=-1)  # Never.
+
     def test_compound_select_order_limit(self):
         A = Table('a', ('col_a',))
         B = Table('b', ('col_b',))
@@ -1098,6 +1483,97 @@ class TestSelectQuery(BaseTestCase):
             'SELECT "t2"."col_a" AS "foo" FROM "a" AS "t2" UNION '
             'SELECT "t3"."col_b" AS "foo" FROM "b" AS "t3") AS "t1" '
             'GROUP BY "t1"."foo"'), [])
+
+    def test_compound_self_union_aliases(self):
+        # A source used independently in multiple branches of a compound gets a
+        # fresh alias per branch (the branches are not correlated).
+        Reg = Table('register', ('id', 'value'))
+        q1 = Reg.select(Reg.value).where(Reg.value < 2)
+        q2 = Reg.select(Reg.value).where(Reg.value > 8)
+        q3 = Reg.select(Reg.value).where(Reg.value == 5)
+        self.assertSQL((q1 | q2), (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'UNION '
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?)'), [2, 8])
+        self.assertSQL((q1 | q2 | q3), (
+            'SELECT "t1"."value" FROM "register" AS "t1" '
+            'WHERE ("t1"."value" < ?) '
+            'UNION '
+            'SELECT "t2"."value" FROM "register" AS "t2" '
+            'WHERE ("t2"."value" > ?) '
+            'UNION '
+            'SELECT "t3"."value" FROM "register" AS "t3" '
+            'WHERE ("t3"."value" = ?)'), [2, 8, 5])
+
+    def test_correlated_compound_subquery(self):
+        # A compound (UNION/INTERSECT/EXCEPT) used as a correlated subquery
+        # must reference the outer table by its existing alias in *every*
+        # branch. The right-hand branch renders in a fresh alias scope;
+        # regression test for it assigning the correlated outer source a
+        # phantom new alias instead of reusing the outer "t1".
+        Product = Table('product', ('id', 'name'))
+        SaleA = Table('sale_a', ('id', 'pid', 'amt'))
+        SaleB = Table('sale_b', ('id', 'pid', 'amt'))
+        lhs = SaleA.select(SaleA.pid).where(SaleA.pid == Product.id)
+        rhs = SaleB.select(SaleB.pid).where(SaleB.pid == Product.id)
+
+        for combine, keyword in (
+                (lambda a, b: a | b, 'UNION'),
+                (lambda a, b: a.union_all(b), 'UNION ALL'),
+                (lambda a, b: a & b, 'INTERSECT'),
+                (lambda a, b: a - b, 'EXCEPT')):
+            query = Product.select(Product.name).where(
+                Product.id.in_(combine(lhs, rhs)))
+            self.assertSQL(query, (
+                'SELECT "t1"."name" FROM "product" AS "t1" '
+                'WHERE ("t1"."id" IN ('
+                'SELECT "t2"."pid" FROM "sale_a" AS "t2" '
+                'WHERE ("t2"."pid" = "t1"."id") '
+                '%s '
+                'SELECT "t3"."pid" FROM "sale_b" AS "t3" '
+                'WHERE ("t3"."pid" = "t1"."id")))' % keyword), [])
+
+    def test_correlated_compound_subquery_nested(self):
+        Product = Table('product', ('id', 'name'))
+        SaleA = Table('sale_a', ('id', 'pid', 'amt'))
+        SaleB = Table('sale_b', ('id', 'pid', 'amt'))
+        SaleC = Table('sale_c', ('id', 'pid', 'amt'))
+        a = SaleA.select(SaleA.pid).where(SaleA.pid == Product.id)
+        b = SaleB.select(SaleB.pid).where(SaleB.pid == Product.id)
+        c = SaleC.select(SaleC.pid).where(SaleC.pid == Product.id)
+
+        # Left- and right-associative nesting correlate identically: the outer
+        # alias "t1" is reused in all three branches.
+        expected = (
+            'SELECT "t1"."name" FROM "product" AS "t1" '
+            'WHERE ("t1"."id" IN ('
+            'SELECT "t2"."pid" FROM "sale_a" AS "t2" '
+            'WHERE ("t2"."pid" = "t1"."id") UNION '
+            'SELECT "t3"."pid" FROM "sale_b" AS "t3" '
+            'WHERE ("t3"."pid" = "t1"."id") UNION '
+            'SELECT "t4"."pid" FROM "sale_c" AS "t4" '
+            'WHERE ("t4"."pid" = "t1"."id")))')
+        self.assertSQL(
+            Product.select(Product.name).where(Product.id.in_((a | b) | c)),
+            expected, [])
+        self.assertSQL(
+            Product.select(Product.name).where(Product.id.in_(a | (b | c))),
+            expected, [])
+
+        # Non-correlated left branch, correlated right branch: the right branch
+        # still resolves the outer alias while the left keeps its own.
+        plain = SaleA.select(SaleA.amt)
+        corr = SaleB.select(SaleB.amt).where(SaleB.pid == Product.id)
+        self.assertSQL(
+            Product.select(Product.name).where(Product.id.in_(plain | corr)), (
+                'SELECT "t1"."name" FROM "product" AS "t1" '
+                'WHERE ("t1"."id" IN ('
+                'SELECT "t2"."amt" FROM "sale_a" AS "t2" '
+                'UNION '
+                'SELECT "t3"."amt" FROM "sale_b" AS "t3" '
+                'WHERE ("t3"."pid" = "t1"."id")))'), [])
 
     def test_union_with_order_and_limit(self):
         q1 = User.select(User.c.username).where(User.c.id < 5)
@@ -1205,6 +1681,84 @@ class TestSelectQuery(BaseTestCase):
             'ORDER BY "t3"."timestamp" DESC LIMIT ?) AS "t2" ON ?'),
             [1, True])
 
+    def test_lateral_helper(self):
+        # The .lateral() helper prefixes LATERAL on the source; the join type
+        # comes from .join(). Mirrors the execution test in tests/postgres.py.
+        inner = (Tweet
+                 .select(Tweet.c.content)
+                 .where(Tweet.c.user_id == User.c.id)
+                 .order_by(Tweet.c.timestamp.desc())
+                 .limit(1)
+                 .lateral())
+
+        # Default INNER join -> INNER JOIN LATERAL (...) ON true.
+        query = (User
+                 .select(User.c.username, inner.c.content)
+                 .join(inner, on=True))
+        self.assertSQL(query, (
+            'SELECT "t1"."username", "t2"."content" '
+            'FROM "users" AS "t1" '
+            'INNER JOIN LATERAL ('
+            'SELECT "t3"."content" FROM "tweets" AS "t3" '
+            'WHERE ("t3"."user_id" = "t1"."id") '
+            'ORDER BY "t3"."timestamp" DESC LIMIT ?) AS "t2" ON ?'),
+            [1, True])
+
+        # Omitting on= for a lateral source defaults to ON true.
+        query = (User
+                 .select(User.c.username, inner.c.content)
+                 .join(inner))
+        self.assertSQL(query, (
+            'SELECT "t1"."username", "t2"."content" '
+            'FROM "users" AS "t1" '
+            'INNER JOIN LATERAL ('
+            'SELECT "t3"."content" FROM "tweets" AS "t3" '
+            'WHERE ("t3"."user_id" = "t1"."id") '
+            'ORDER BY "t3"."timestamp" DESC LIMIT ?) AS "t2" ON ?'),
+            [1, True])
+
+        # CROSS JOIN LATERAL takes no ON clause.
+        query = (User
+                 .select(User.c.username, inner.c.content)
+                 .join(inner, JOIN.CROSS))
+        self.assertSQL(query, (
+            'SELECT "t1"."username", "t2"."content" '
+            'FROM "users" AS "t1" '
+            'CROSS JOIN LATERAL ('
+            'SELECT "t3"."content" FROM "tweets" AS "t3" '
+            'WHERE ("t3"."user_id" = "t1"."id") '
+            'ORDER BY "t3"."timestamp" DESC LIMIT ?) AS "t2"'),
+            [1])
+
+    def test_lateral_join_predicate(self):
+        inner = (Tweet
+                 .select(Tweet.c.content)
+                 .where(Tweet.c.user_id == User.c.id)
+                 .limit(1))
+        # A user-supplied on= is honored rather than replaced with true.
+        query = (User
+                 .select(User.c.username, inner.c.content)
+                 .join(inner, JOIN.LEFT_LATERAL, on=(inner.c.content != '')))
+        self.assertSQL(query, (
+            'SELECT "t1"."username", "t2"."content" '
+            'FROM "users" AS "t1" '
+            'LEFT JOIN LATERAL ('
+            'SELECT "t3"."content" FROM "tweets" AS "t3" '
+            'WHERE ("t3"."user_id" = "t1"."id") LIMIT ?) AS "t2" '
+            'ON ("t2"."content" != ?)'), [1, ''])
+
+        # Omitting on= still defaults to ON true.
+        query = (User
+                 .select(User.c.username, inner.c.content)
+                 .join(inner, JOIN.LEFT_LATERAL))
+        self.assertSQL(query, (
+            'SELECT "t1"."username", "t2"."content" '
+            'FROM "users" AS "t1" '
+            'LEFT JOIN LATERAL ('
+            'SELECT "t3"."content" FROM "tweets" AS "t3" '
+            'WHERE ("t3"."user_id" = "t1"."id") LIMIT ?) AS "t2" ON ?'),
+            [1, True])
+
     def test_all_clauses(self):
         count = fn.COUNT(Tweet.c.id).alias('ct')
         query = (User
@@ -1231,7 +1785,7 @@ class TestSelectQuery(BaseTestCase):
                  .order_by(User.c.username.asc(collation='binary')))
         self.assertSQL(query, (
             'SELECT "t1"."username" FROM "users" AS "t1" '
-            'ORDER BY "t1"."username" ASC COLLATE binary'), [])
+            'ORDER BY "t1"."username" COLLATE binary ASC'), [])
 
     def test_order_by_nulls(self):
         query = (User
@@ -1262,12 +1816,12 @@ class TestSelectQuery(BaseTestCase):
                  .order_by(User.c.ts.desc(nulls='LAST').collate('NOCASE')))
         self.assertSQL(query, (
             'SELECT "t1"."username" FROM "users" AS "t1" '
-            'ORDER BY "t1"."ts" DESC COLLATE NOCASE NULLS LAST'), [],
+            'ORDER BY "t1"."ts" COLLATE NOCASE DESC NULLS LAST'), [],
             nulls_ordering=True)
         self.assertSQL(query, (
             'SELECT "t1"."username" FROM "users" AS "t1" '
             'ORDER BY CASE WHEN ("t1"."ts" IS NULL) THEN ? ELSE ? END, '
-            '"t1"."ts" DESC COLLATE NOCASE'), [1, 0], nulls_ordering=False)
+            '"t1"."ts" COLLATE NOCASE DESC'), [1, 0], nulls_ordering=False)
 
     def test_ordering_invalid_nulls_error(self):
         self.assertRaises(ValueError, Ordering, User.c.id, 'ASC',
@@ -1288,6 +1842,15 @@ class TestSelectQuery(BaseTestCase):
             'SELECT "t1"."username" FROM "users" AS "t1" '
             'WHERE ((SELECT COUNT("t2"."id") FROM "tweets" AS "t2" '
             'WHERE ("t2"."user_id" = "t1"."id")) > ?)'), [2])
+
+    def test_case_subquery_in_function(self):
+        subq = User.select(fn.MAX(User.c.id))
+        query = User.select(
+            fn.SUM(Case(None, ((User.c.id > 0, subq),), 0)))
+        self.assertSQL(query, (
+            'SELECT SUM(CASE WHEN ("t1"."id" > ?) '
+            'THEN (SELECT MAX("t1"."id") FROM "users" AS "t1") '
+            'ELSE ? END) FROM "users" AS "t1"'), [0, 0])
 
     def test_coalesce(self):
         Sample = Table('sample', ('counter', 'value'))
@@ -1543,6 +2106,14 @@ class TestInsertQuery(BaseTestCase):
             'INSERT INTO "person" ("name") '
             'SELECT "foo"."username" FROM "foo"'), [])
 
+    def test_insert_query_no_columns(self):
+        source = User.select(User.c.username).where(User.c.admin == False)
+        query = Person.insert(source)
+        self.assertSQL(query, (
+            'INSERT INTO "person" '
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'WHERE ("t1"."admin" = ?)'), [False])
+
     def test_insert_single_value_query(self):
         query = Person.select(Person.id).where(Person.name == 'huey')
         insert = Note.insert({
@@ -1665,6 +2236,37 @@ class TestUpdateQuery(BaseTestCase):
             '"last_tweet_id" = (SELECT MAX("t1"."id") FROM "tweets" AS "t1" '
             'WHERE ("t1"."user_id" = "users"."id")) '
             'WHERE ("users"."last_tweet_id" IS NULL)'), [])
+
+    def test_update_value_subquery_in_function(self):
+        subquery = (Tweet
+                    .select(fn.MAX(Tweet.c.id))
+                    .where(Tweet.c.user_id == User.c.id))
+        query = User.update({User.c.last_tweet_id: fn.COALESCE(subquery, 0)})
+        self.assertSQL(query, (
+            'UPDATE "users" SET "last_tweet_id" = COALESCE('
+            '(SELECT MAX("t1"."id") FROM "tweets" AS "t1" '
+            'WHERE ("t1"."user_id" = "users"."id")), ?)'), [0])
+
+        query = User.update({User.c.last_tweet_id:
+                             Case(None, ((User.c.id > 0, subquery),), 0)})
+        self.assertSQL(query, (
+            'UPDATE "users" SET "last_tweet_id" = CASE '
+            'WHEN ("users"."id" > ?) THEN '
+            '(SELECT MAX("t1"."id") FROM "tweets" AS "t1" '
+            'WHERE ("t1"."user_id" = "users"."id")) ELSE ? END'), [0, 0])
+
+        query = User.update(
+            {User.c.last_tweet_id: fn.COALESCE(subquery, 0) + 1})
+        self.assertSQL(query, (
+            'UPDATE "users" SET "last_tweet_id" = (COALESCE('
+            '(SELECT MAX("t1"."id") FROM "tweets" AS "t1" '
+            'WHERE ("t1"."user_id" = "users"."id")), ?) + ?)'), [0, 1])
+
+        query = User.update({User.c.last_tweet_id: Cast(subquery, 'int')})
+        self.assertSQL(query, (
+            'UPDATE "users" SET "last_tweet_id" = CAST('
+            '(SELECT MAX("t1"."id") FROM "tweets" AS "t1" '
+            'WHERE ("t1"."user_id" = "users"."id")) AS int)'), [])
 
     def test_update_from_cte(self):
         cte = (Tweet
@@ -2016,6 +2618,20 @@ class TestWindowFunctions(BaseTestCase):
             'WINDOW "w" AS (ORDER BY "t1"."id" '
             'ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES)'))
 
+    def test_window_exclude_constructor_string(self):
+        # A raw string exclude= must render as literal SQL, not bind as a
+        # parameter (EXCLUDE ?). start/end and .exclude() already did this.
+        w = Window(order_by=[User.c.id],
+                   start=Window.preceding(),
+                   end=Window.CURRENT_ROW,
+                   exclude='TIES')
+        query = User.select(fn.SUM(User.c.val).over(window=w)).window(w)
+        self.assertSQL(query, (
+            'SELECT SUM("t1"."val") OVER "w" FROM "users" AS "t1" '
+            'WINDOW "w" AS (ORDER BY "t1"."id" '
+            'ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES)'),
+            [])
+
     def test_running_total(self):
         EventLog = Table('evtlog', ('id', 'timestamp', 'data'))
 
@@ -2334,6 +2950,21 @@ class TestValuesList(BaseTestCase):
             'ON ("t2"."username" = "t1"."username") '
             'ORDER BY "t1"."username" DESC'), ['huey', 'zaizee'])
 
+    def test_values_list_in_expression(self):
+        # As an IN operand the VALUES clause needs its own parentheses. It
+        # used to render "IN VALUES (?), (?)", a syntax error.
+        query = Person.select(Person.id).where(
+            Person.id.in_(ValuesList([(1,), (2,), (3,)])))
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "person" AS "t1" '
+            'WHERE ("t1"."id" IN (VALUES (?), (?), (?)))'), [1, 2, 3])
+
+        query = Person.select(Person.id).where(
+            Person.id.not_in(ValuesList([(1,)])))
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "person" AS "t1" '
+            'WHERE ("t1"."id" NOT IN (VALUES (?)))'), [1])
+
 
 class TestCaseFunction(BaseTestCase):
     def test_case_function(self):
@@ -2443,6 +3074,23 @@ class TestSelectFeatures(BaseTestCase):
         query = Person.select(Person.name).distinct()
         self.assertSQL(query,
                        'SELECT DISTINCT "t1"."name" FROM "person" AS "t1"', [])
+
+    def test_distinct_toggle(self):
+        base = Person.select(Person.name).distinct(Person.name)
+        on_sql = ('SELECT DISTINCT ON ("t1"."name") "t1"."name" '
+                  'FROM "person" AS "t1"')
+        self.assertSQL(base, on_sql, [])
+
+        # distinct(False) clears a prior distinct(cols).
+        self.assertSQL(base.distinct(False),
+                       'SELECT "t1"."name" FROM "person" AS "t1"', [])
+
+        # distinct(True) replaces DISTINCT ON with a plain DISTINCT.
+        self.assertSQL(base.distinct(True),
+                       'SELECT DISTINCT "t1"."name" FROM "person" AS "t1"', [])
+
+        # The receiver is left untouched.
+        self.assertSQL(base, on_sql, [])
 
     def test_distinct_count(self):
         query = Person.select(fn.COUNT(Person.name.distinct()))
@@ -2631,6 +3279,47 @@ class TestOnConflictSqlite(BaseTestCase):
         with self.assertRaisesCtx(ValueError):
             self.database.get_sql_context().parse(query)
 
+    def test_do_nothing_conflict_target(self):
+        KV = Table('kv', ('key', 'value', 'extra'), _database=self.database)
+
+        # No target stays a bare, catch-all clause.
+        self.assertSQL(
+            KV.insert(key='k1', value='v1', extra=1).on_conflict('nothing'),
+            ('INSERT INTO "kv" ("extra", "key", "value") VALUES (?, ?, ?) '
+             'ON CONFLICT DO NOTHING'), [1, 'k1', 'v1'])
+
+        # A target and its partial-index predicate used to be dropped for the
+        # nothing action, leaving a bare clause that ignores them.
+        self.assertSQL(
+            (KV.insert(key='k1', value='v1', extra=1)
+             .on_conflict(action='nothing',
+                          conflict_target=(KV.key, KV.value),
+                          conflict_where=(KV.extra > 1))),
+            ('INSERT INTO "kv" ("extra", "key", "value") VALUES (?, ?, ?) '
+             'ON CONFLICT ("key", "value") WHERE ("extra" > ?) DO NOTHING'),
+            [1, 'k1', 'v1', 1])
+
+        # SQLite has no named-constraint upsert, so it is rejected rather than
+        # silently ignored.
+        query = KV.insert(key='k1', value='v1', extra=1).on_conflict(
+            action='nothing', conflict_constraint='kv_uniq')
+        with self.assertRaisesCtx(ValueError):
+            self.database.get_sql_context().parse(query)
+
+    def test_conflict_update_subquery_in_function(self):
+        KV = Table('kv', ('key', 'value', 'extra'), _database=self.database)
+        Stat = Table('stat', _database=self.database)
+        subq = Stat.select(fn.MAX(Stat.c.n))
+        query = (KV.insert(key='k1', value='v1', extra=1)
+                 .on_conflict(conflict_target=(KV.key,),
+                              update={KV.extra: fn.COALESCE(subq, 0)}))
+        self.assertSQL(query, (
+            'INSERT INTO "kv" ("extra", "key", "value") VALUES (?, ?, ?) '
+            'ON CONFLICT ("key") DO UPDATE '
+            'SET "extra" = COALESCE('
+            '(SELECT MAX("t1"."n") FROM "stat" AS "t1"), ?)'),
+            [1, 'k1', 'v1', 0])
+
 
 class TestOnConflictMySQL(BaseTestCase):
     database = MySQLDatabase(None)
@@ -2705,6 +3394,31 @@ class TestOnConflictPostgresql(BaseTestCase):
             'INSERT INTO "person" ("name") VALUES (?) '
             'ON CONFLICT DO NOTHING'), ['huey'])
 
+    def test_ignore_conflict_where(self):
+        KV = Table('kv', ('key', 'value', 'extra'), _database=self.database)
+        query = (KV.insert(key='k1', value='v1', extra=9)
+                 .on_conflict(action='nothing',
+                              conflict_target=[KV.key],
+                              conflict_where=(KV.extra > 1)))
+        # The partial-index predicate used to be dropped, leaving
+        # ON CONFLICT ("key"), which Postgres rejects for a partial index.
+        self.assertSQL(query, (
+            'INSERT INTO "kv" ("extra", "key", "value") VALUES (?, ?, ?) '
+            'ON CONFLICT ("key") WHERE ("extra" > ?) DO NOTHING'),
+            [9, 'k1', 'v1', 1])
+
+    def test_ignore_conflict_constraint(self):
+        KV = Table('kv', ('key', 'value', 'extra'), _database=self.database)
+        query = (KV.insert(key='k1', value='v1', extra=9)
+                 .on_conflict(action='nothing',
+                              conflict_constraint='kv_key_value'))
+        # The named constraint used to be dropped, leaving a bare
+        # ON CONFLICT DO NOTHING that matches any conflict.
+        self.assertSQL(query, (
+            'INSERT INTO "kv" ("extra", "key", "value") VALUES (?, ?, ?) '
+            'ON CONFLICT ON CONSTRAINT "kv_key_value" DO NOTHING'),
+            [9, 'k1', 'v1'])
+
     def test_conflict_target_required(self):
         query = Person.insert(name='huey').on_conflict(preserve=(Person.dob,))
         with self.assertRaisesCtx(ValueError):
@@ -2727,6 +3441,20 @@ class TestOnConflictPostgresql(BaseTestCase):
             'ON CONFLICT ("key", "value") DO UPDATE '
             'SET "extra" = (EXCLUDED."extra" + ?) '
             'WHERE (EXCLUDED."extra" < "kv"."extra")'), [1, 'k1', 'v1', 2])
+
+    def test_conflict_update_subquery_in_function(self):
+        KV = Table('kv', ('key', 'value', 'extra'), _database=self.database)
+        Stat = Table('stat', _database=self.database)
+        subq = Stat.select(fn.MAX(Stat.c.n))
+        query = (KV.insert(key='k1', value='v1', extra=1)
+                 .on_conflict(conflict_target=(KV.key,),
+                              update={KV.extra: fn.COALESCE(subq, 0)}))
+        self.assertSQL(query, (
+            'INSERT INTO "kv" ("extra", "key", "value") VALUES (?, ?, ?) '
+            'ON CONFLICT ("key") DO UPDATE '
+            'SET "extra" = COALESCE('
+            '(SELECT MAX("t1"."n") FROM "stat" AS "t1"), ?)'),
+            [1, 'k1', 'v1', 0])
 
     def test_conflict_target_or_constraint(self):
         KV = Table('kv', ('key', 'value', 'extra'), _database=self.database)
@@ -2967,6 +3695,15 @@ class TestTableOperations(BaseTestCase):
         # Dynamic column access via .c should raise.
         self.assertRaises(AttributeError, lambda: t.c.id)
 
+    def test_columnless_table_select_star(self):
+        # A table declared without columns falls back to "*", matching Source.
+        self.assertSQL(Table('reg').select(),
+                       'SELECT * FROM "reg" AS "t1"', [])
+        # A table with declared columns still expands to the column list.
+        t = Table('reg', ('id', 'value'))
+        self.assertSQL(t.select(),
+                       'SELECT "t1"."id", "t1"."value" FROM "reg" AS "t1"', [])
+
 
 # ===========================================================================
 # Gap coverage: Alias, Negated, Cast, and wrapped node types
@@ -3112,3 +3849,20 @@ class TestContextAndAliasManager(BaseTestCase):
         s = {t1, t3}
         self.assertIn(t2, s)  # Same as t1.
         self.assertEqual(len(s), 2)
+
+    def test_subselect_clone_rehashes(self):
+        # Without a re-hash the clone stays keyed on the source's address, so
+        # it compares equal to the source and collides with it in the alias
+        # manager. Worse, once the source is collected, an unrelated object
+        # allocated at that address hashes the same.
+        base = User.select(User.c.id)
+        clone = base.where(User.c.username == 'huey')
+        self.assertNotEqual(hash(base), hash(clone))
+        self.assertFalse(base == clone)
+
+        am = AliasManager()
+        self.assertNotEqual(am.add(base), am.add(clone))
+
+        # An explicit alias is content-based, so it survives cloning.
+        aliased = User.select(User.c.id).alias('u')
+        self.assertEqual(hash(aliased), hash(aliased.where(User.c.id > 1)))

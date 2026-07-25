@@ -68,7 +68,7 @@ except ImportError:
         mysql = None
 
 
-__version__ = '4.1.2'
+__version__ = '4.2.6'
 __all__ = [
     'AnyField',
     'AsIs',
@@ -158,8 +158,8 @@ logger.addHandler(logging.NullHandler())
 callable_ = lambda c: isinstance(c, Callable)
 multi_types = (list, tuple, frozenset, set, range, types.GeneratorType)
 
-def qesc(s):
-    return s.replace('"', '""')
+def qesc(s, q='"'):
+    return s.replace(q, q + q)
 
 def unqesc(part):
     part = part.strip()
@@ -384,7 +384,7 @@ JOIN = attrdict(
     FULL_OUTER='FULL OUTER JOIN',
     CROSS='CROSS JOIN',
     NATURAL='NATURAL JOIN',
-    LATERAL='LATERAL',
+    LATERAL='JOIN LATERAL',
     LEFT_LATERAL='LEFT JOIN LATERAL')
 
 # Row representations.
@@ -411,6 +411,12 @@ SCOPE_COLUMN = 16
 CSQ_PARENTHESES_NEVER = 0
 CSQ_PARENTHESES_ALWAYS = 1
 CSQ_PARENTHESES_UNNESTED = 2
+CSQ_PARENTHESES_GROUPED = 3
+
+# Rendering styles for compound select members (_member_style).
+CSQ_FLAT = 0
+CSQ_PARENS = 1
+CSQ_WRAP = 2  # SELECT * FROM (...), for dialects without member parens.
 
 # Regular expressions used to convert class names to snake-case table names.
 # First regex handles acronym followed by word or initial lower-word followed
@@ -473,9 +479,6 @@ class _callable_context_manager(object):
 
 
 class Proxy(object):
-    """
-    Create a proxy or placeholder for another object.
-    """
     __slots__ = ('obj', '_callbacks')
 
     def __init__(self):
@@ -514,9 +517,6 @@ class Proxy(object):
 
 
 class DatabaseProxy(Proxy):
-    """
-    Proxy implementation specifically for proxying `Database` objects.
-    """
     __slots__ = ('obj', '_callbacks', '_Model')
 
     def connection_context(self):
@@ -901,6 +901,12 @@ class _HashableSource(object):
         self._alias = name
         self._update_hash()
 
+    def clone(self):
+        # The copy would otherwise keep the source's id()-based hash.
+        clone = super(_HashableSource, self).clone()
+        clone._update_hash()
+        return clone
+
     def _update_hash(self):
         self._hash = self._get_hash()
 
@@ -1033,8 +1039,9 @@ class Table(_HashableSource, BaseTable):
 
     @__bind_database__
     def select(self, *columns):
-        if not columns and self._columns:
-            columns = [Column(self, column) for column in self._columns]
+        if not columns:
+            columns = ([Column(self, column) for column in self._columns]
+                       if self._columns else (SQL('*'),))
         return Select((self,), columns)
 
     @__bind_database__
@@ -1121,7 +1128,7 @@ class ValuesList(_HashableSource, BaseTable):
             ctx.alias_manager[self] = self._alias
 
         if ctx.scope == SCOPE_SOURCE or ctx.scope == SCOPE_NORMAL:
-            with ctx(parentheses=not ctx.parentheses):
+            with ctx(parentheses=(not ctx.parentheses) or ctx.state.in_expr):
                 ctx = (ctx
                        .literal('VALUES ')
                        .sql(CommaNodeList([
@@ -1142,7 +1149,7 @@ class CTE(_HashableSource, Source):
     def __init__(self, name, query, recursive=False, columns=None,
                  materialized=None):
         self._alias = name
-        self._query = query
+        self._query = query = query.clone()
         self._recursive = recursive
         self._materialized = materialized
         if columns is not None:
@@ -1173,12 +1180,14 @@ class CTE(_HashableSource, Source):
 
     def union_all(self, rhs):
         clone = self._query.clone()
-        return CTE(self._alias, clone + rhs, self._recursive, self._columns)
+        return CTE(self._alias, clone + rhs, self._recursive, self._columns,
+                   self._materialized)
     __add__ = union_all
 
     def union(self, rhs):
         clone = self._query.clone()
-        return CTE(self._alias, clone | rhs, self._recursive, self._columns)
+        return CTE(self._alias, clone | rhs, self._recursive, self._columns,
+                   self._materialized)
     __or__ = union
 
     def __sql__(self, ctx):
@@ -1236,10 +1245,6 @@ class ColumnBase(Node):
         return Negated(self)
 
     def _e(op, inv=False):
-        """
-        Lightweight factory which returns a method that builds an Expression
-        consisting of the left-hand and right-hand operands, using `op`.
-        """
         def inner(self, rhs):
             if inv:
                 return Expression(rhs, op, self)
@@ -1460,7 +1465,7 @@ class BitwiseMixin(object):
         return self.bin_or(other)
 
     def __sub__(self, other):
-        return self.bin_and(other.bin_negated())
+        return self.bin_and(BitwiseNegated(other))
 
     def __invert__(self):
         return BitwiseNegated(self)
@@ -1543,19 +1548,18 @@ class Ordering(WrappedNode):
     def _null_ordering_case(self, nulls):
         if nulls.lower() == 'last':
             ifnull, notnull = 1, 0
-        elif nulls.lower() == 'first':
-            ifnull, notnull = 0, 1
         else:
-            raise ValueError('unsupported value for nulls= ordering.')
+            ifnull, notnull = 0, 1
         return Case(None, ((self.node.is_null(), ifnull),), notnull)
 
     def __sql__(self, ctx):
         if self.nulls and not ctx.state.nulls_ordering:
             ctx.sql(self._null_ordering_case(self.nulls)).literal(', ')
 
-        ctx.sql(self.node).literal(' %s' % self.direction)
+        ctx.sql(self.node)
         if self.collation:
             ctx.literal(' COLLATE %s' % self.collation)
+        ctx.literal(' %s' % self.direction)
         if self.nulls and ctx.state.nulls_ordering:
             ctx.literal(' NULLS %s' % self.nulls)
         return ctx
@@ -1573,6 +1577,8 @@ class Expression(ColumnBase):
     def __init__(self, lhs, op, rhs, flat=False):
         self.lhs = lhs
         self.op = op
+        if op in (OP.IN, OP.NOT_IN) and isinstance(rhs, types.GeneratorType):
+            rhs = tuple(rhs)
         self.rhs = rhs
         self.flat = flat
 
@@ -1602,10 +1608,8 @@ class Expression(ColumnBase):
             # the equivalent boolean expression.
             op_in = self.op == OP.IN or self.op == OP.NOT_IN
             rhs = self.rhs
-            if op_in:
-                #
-                if self._is_rhs_empty(rhs, ctx):
-                    return ctx.literal('0 = 1' if self.op == OP.IN else '1 = 1')
+            if op_in and self._is_rhs_empty(rhs, ctx):
+                return ctx.literal('0 = 1' if self.op == OP.IN else '1 = 1')
             if rhs is None and (self.op == OP.IS or self.op == OP.IS_NOT):
                 rhs = SQL('NULL')
 
@@ -1767,6 +1771,8 @@ class Window(Node):
             start = SQL(start)
         if end is not None and not isinstance(end, SQL):
             end = SQL(end)
+        if isinstance(exclude, str):
+            exclude = SQL(exclude)
 
         self.partition_by = ensure_tuple(partition_by)
         self.order_by = ensure_tuple(order_by)
@@ -1875,7 +1881,7 @@ class _InFunction(Node):
         self.in_function = in_function
 
     def __sql__(self, ctx):
-        with ctx(in_function=self.in_function):
+        with ctx(in_function=self.in_function, function_arg_count=0):
             return ctx.sql(self.node)
 
 
@@ -2007,19 +2013,20 @@ Tuple = lambda *a: EnclosedNodeList(a)
 
 
 class QualifiedNames(WrappedNode):
+    def __init__(self, node, scope=SCOPE_COLUMN):
+        super(QualifiedNames, self).__init__(node)
+        self._scope = scope
+
     def __sql__(self, ctx):
-        with ctx.scope_column():
+        with ctx(scope=self._scope):
             return ctx.sql(self.node)
 
 
 def qualify_names(node):
-    # Search a node heirarchy to ensure that any column-like objects are
-    # referenced using fully-qualified names.
-    if isinstance(node, Expression):
-        return node.__class__(qualify_names(node.lhs), node.op,
-                              qualify_names(node.rhs), node.flat)
-    elif isinstance(node, ColumnBase):
-        return QualifiedNames(node)
+    # SCOPE_NORMAL, not SCOPE_COLUMN, so a nested subquery renders in full
+    # rather than collapsing to its alias.
+    if isinstance(node, ColumnBase):
+        return QualifiedNames(node, SCOPE_NORMAL)
     return node
 
 
@@ -2373,7 +2380,7 @@ class SelectBase(_HashableSource, Source, SelectQuery):
         clone = self.columns(SQL('1'))
         clone._limit = 1
         clone._offset = None
-        return bool(clone.scalar())
+        return bool(clone.scalar(database))
 
     @database_required
     def get(self, database):
@@ -2382,6 +2389,19 @@ class SelectBase(_HashableSource, Source, SelectQuery):
             return self.execute(database)[0]
         except IndexError:
             pass
+
+    def _subquery_parens(self, ctx):
+        # Parens are unnecessary when the sole argument of a function call.
+        if ctx.state.in_function and ctx.state.function_arg_count == 1:
+            return False
+        return ctx.subquery or (ctx.scope == SCOPE_SOURCE)
+
+    def _apply_subquery_alias(self, ctx):
+        # No alias inside a function, or when unaliased in an expr/projection.
+        if ctx.state.in_function or (self._alias is None and (
+                ctx.state.in_expr or ctx.state.in_projection)):
+            return ctx
+        return self.apply_alias(ctx)
 
 
 # QUERY IMPLEMENTATIONS.
@@ -2403,23 +2423,93 @@ class CompoundSelectQuery(SelectBase):
         query = Select((self.limit(1),), (SQL('1'),)).bind(database)
         return bool(query.scalar())
 
-    def _wrap_parens(self, ctx, subq):
+    def _self_wraps(self, subq):
+        # An inner ORDER BY / LIMIT / OFFSET forces the member to group.
+        return (bool(subq._order_by) or subq._limit is not None
+                or subq._offset is not None)
+
+    def _needs_group(self, subq, lhs=False):
+        # Group when writing the member flat would change the result:
+        # non-associative ops, an inner ORDER BY / LIMIT that would apply
+        # to the whole statement, or INTERSECT precedence (it binds
+        # tighter everywhere but sqlite).
+        if self._self_wraps(subq):
+            return True
+        if lhs:
+            # A flat lhs folds left to right before our op applies.
+            return self.op == 'INTERSECT' and subq.op != self.op
+        if self.op == 'EXCEPT':
+            return True
+        # A flat rhs joins the outer chain through its left spine, so
+        # every op along it must match ours.
+        node = subq
+        while isinstance(node, CompoundSelectQuery):
+            if node.op != self.op:
+                return True
+            node = node.lhs
+            if (isinstance(node, CompoundSelectQuery)
+                    and self._self_wraps(node)):
+                break  # Wraps itself, the spine ends here.
+        return False
+
+    def _union_only(self, subq):
+        # Whole subtree is UNION / UNION ALL with no inner ordering.
+        if not isinstance(subq, CompoundSelectQuery):
+            return True
+        if subq.op not in ('UNION', 'UNION ALL') or self._self_wraps(subq):
+            return False
+        return self._union_only(subq.lhs) and self._union_only(subq.rhs)
+
+    def _member_style(self, ctx, subq, lhs=False):
         csq_setting = ctx.state.compound_select_parentheses
 
         if not csq_setting or csq_setting == CSQ_PARENTHESES_NEVER:
-            return False
+            # Parens are not allowed here (sqlite), wrap a member that needs
+            # grouping as a subquery instead: a nested compound, or a plain
+            # member with its own ORDER BY / LIMIT / OFFSET (written flat those
+            # would apply to the whole statement).
+            if isinstance(subq, CompoundSelectQuery):
+                if self._needs_group(subq, lhs):
+                    return CSQ_WRAP
+            elif self._self_wraps(subq):
+                return CSQ_WRAP
         elif csq_setting == CSQ_PARENTHESES_ALWAYS:
-            return True
+            return CSQ_PARENS
         elif csq_setting == CSQ_PARENTHESES_UNNESTED:
             if ctx.state.in_expr or ctx.state.in_function:
                 # If this compound select query is being used inside an
                 # expression, e.g., an IN or EXISTS().
-                return False
+                return CSQ_FLAT
 
             # If the query on the left or right is itself a compound select
             # query, then we do not apply parentheses. However, if it is a
             # regular SELECT query, we will apply parentheses.
-            return not isinstance(subq, CompoundSelectQuery)
+            if not isinstance(subq, CompoundSelectQuery):
+                return CSQ_PARENS
+        elif csq_setting == CSQ_PARENTHESES_GROUPED:
+            # Like unnested, but a nested compound gets parens when it
+            # needs them to keep its meaning.
+            if isinstance(subq, CompoundSelectQuery):
+                if ((ctx.state.in_expr or ctx.state.in_function)
+                        and self.op in ('UNION', 'UNION ALL')
+                        and self._union_only(subq)):
+                    # IN / EXISTS only see the distinct set, and regrouping
+                    # a pure union chain cannot change it. Stay flat so
+                    # mariadb can resolve correlated refs, it cannot see
+                    # them through nested parens.
+                    return CSQ_FLAT
+                if self._needs_group(subq, lhs):
+                    return CSQ_PARENS
+            elif not (ctx.state.in_expr or ctx.state.in_function):
+                return CSQ_PARENS
+        return CSQ_FLAT
+
+    def _member_sql(self, ctx, subq, lhs=False):
+        style = self._member_style(ctx, subq, lhs)
+        if style == CSQ_WRAP:
+            ctx.literal('SELECT * FROM ')
+        with ctx.scope_normal(parentheses=style != CSQ_FLAT, subquery=False):
+            ctx.sql(subq)
 
     def __sql__(self, ctx):
         if ctx.scope == SCOPE_COLUMN:
@@ -2428,18 +2518,16 @@ class CompoundSelectQuery(SelectBase):
         # Call parent method to handle any CTEs.
         super(CompoundSelectQuery, self).__sql__(ctx)
 
-        outer_parens = ctx.subquery or (ctx.scope == SCOPE_SOURCE)
-        with ctx(parentheses=outer_parens):
-            # Should the left-hand query be wrapped in parentheses?
-            lhs_parens = self._wrap_parens(ctx, self.lhs)
-            with ctx.scope_normal(parentheses=lhs_parens, subquery=False):
-                ctx.sql(self.lhs)
+        with ctx(parentheses=self._subquery_parens(ctx)):
+            # Correlated rhs refs must resolve to the enclosing aliases.
+            outer_aliases = dict(ctx.alias_manager.mapping)
+
+            self._member_sql(ctx, self.lhs, lhs=True)
             ctx.literal(' %s ' % self.op)
             with ctx.push_alias():
-                # Should the right-hand query be wrapped in parentheses?
-                rhs_parens = self._wrap_parens(ctx, self.rhs)
-                with ctx.scope_normal(parentheses=rhs_parens, subquery=False):
-                    ctx.sql(self.rhs)
+                # Seed only the outer aliases so rhs sources get fresh ones.
+                ctx.alias_manager.mapping.update(outer_aliases)
+                self._member_sql(ctx, self.rhs)
 
             # Apply ORDER BY, LIMIT, OFFSET. We use the "values" scope so that
             # entity names are not fully-qualified. This is a bit of a hack, as
@@ -2448,7 +2536,7 @@ class CompoundSelectQuery(SelectBase):
             with ctx.scope_values():
                 self._apply_ordering(ctx)
 
-        return self.apply_alias(ctx)
+        return self._apply_subquery_alias(ctx)
 
 
 class Select(SelectBase):
@@ -2505,7 +2593,12 @@ class Select(SelectBase):
         if not self._from_list:
             raise ValueError('No sources to join on.')
         item = self._from_list.pop()
-        if join_type == JOIN.LATERAL or join_type == JOIN.LEFT_LATERAL:
+        # Lateral joins must have an ON clause, default to ON true.
+        if on is None and (
+                join_type == JOIN.LATERAL or
+                join_type == JOIN.LEFT_LATERAL or
+                (join_type != JOIN.CROSS and
+                 getattr(dest, '_lateral', False))):
             on = True
         self._from_list.append(Join(item, dest, join_type, on))
 
@@ -2528,9 +2621,8 @@ class Select(SelectBase):
         self._group_by = grouping
 
     def group_by_extend(self, *values):
-        """@Node.copy used from group_by() call"""
         group_by = tuple(self._group_by or ()) + values
-        return self.group_by(*group_by)
+        return self.group_by(*group_by)  # Uses Node.copy.
 
     @Node.copy
     def having(self, *expressions):
@@ -2542,6 +2634,7 @@ class Select(SelectBase):
     def distinct(self, *columns):
         if len(columns) == 1 and (columns[0] is True or columns[0] is False):
             self._simple_distinct = columns[0]
+            self._distinct = None
         else:
             self._simple_distinct = False
             self._distinct = columns
@@ -2576,14 +2669,17 @@ class Select(SelectBase):
             ctx.literal('LATERAL ')
 
         is_subquery = ctx.subquery
+        # A real FROM/JOIN source. The SELECT-list is SCOPE_SOURCE too, but it
+        # is flagged in_projection. Value operands are SCOPE_NORMAL.
+        is_source = ctx.scope == SCOPE_SOURCE and not ctx.state.in_projection
         state = {
             'converter': None,
+            'in_expr': False,
             'in_function': False,
-            'parentheses': is_subquery or (ctx.scope == SCOPE_SOURCE),
+            'in_projection': False,
+            'parentheses': self._subquery_parens(ctx),
             'subquery': True,
         }
-        if ctx.state.in_function and ctx.state.function_arg_count == 1:
-            state['parentheses'] = False
 
         with ctx.scope_normal(**state):
             # Defer calling parent SQL until here. This ensures that any CTEs
@@ -2600,8 +2696,9 @@ class Select(SelectBase):
                      .sql(EnclosedNodeList(self._distinct))
                      .literal(' '))
 
-            with ctx.scope_source():
-                ctx = self.__sql_selection__(ctx, is_subquery)
+            with ctx.scope_source(in_projection=True):
+                ctx = self.__sql_selection__(ctx, is_subquery and
+                                             not is_source)
 
             if self._from_list:
                 with ctx.scope_source(parentheses=False):
@@ -2630,14 +2727,7 @@ class Select(SelectBase):
                 ctx.literal(' ')
                 ctx.sql(self._for_update)
 
-        # If the subquery is inside a function -or- we are evaluating a
-        # subquery on either side of an expression w/o an explicit alias, do
-        # not generate an alias + AS clause.
-        if ctx.state.in_function or (ctx.state.in_expr and
-                                     self._alias is None):
-            return ctx
-
-        return self.apply_alias(ctx)
+        return self._apply_subquery_alias(ctx)
 
 
 class _WriteQuery(Query):
@@ -2775,7 +2865,7 @@ class Insert(_WriteQuery):
                              else None)
 
     def _simple_insert(self, ctx):
-        if not self._insert:
+        if not self._insert and not self.get_default_data():
             raise self.DefaultValuesException('Error: no data to insert.')
         return self._generate_insert((self._insert,), ctx)
 
@@ -2902,10 +2992,9 @@ class Insert(_WriteQuery):
             return ctx.sql(CommaNodeList(all_values))
 
     def _query_insert(self, ctx):
-        return (ctx
-                .sql(EnclosedNodeList(self._columns))
-                .literal(' ')
-                .sql(self._insert))
+        if self._columns:
+            ctx.sql(EnclosedNodeList(self._columns)).literal(' ')
+        return ctx.sql(self._insert)
 
     def _default_values(self, ctx):
         if not self._database:
@@ -2941,14 +3030,20 @@ class Insert(_WriteQuery):
             if self._on_conflict is not None:
                 update = self._on_conflict.get_conflict_update(ctx, self)
                 if update is not None:
-                    ctx.literal(' ').sql(update)
+                    with ctx(subquery=True):
+                        ctx.literal(' ').sql(update)
 
             return self.apply_returning(ctx)
 
     def _execute(self, database):
-        if self._returning is None and database.returning_clause \
-           and self.table._primary_key:
-            self._returning = (self.table._primary_key,)
+        if self._as_rowcount:
+            # Strip implicit pk-returning, which breaks rowcount on sqlite.
+            if not self._return_cursor:
+                self._returning = None
+        elif self._returning is None and database.returning_clause \
+             and self.table._primary_key:
+            self._returning = (self.table.primary_key,)
+            self._row_type = ROW.TUPLE
         try:
             return super(Insert, self)._execute(database)
         except self.DefaultValuesException:
@@ -3125,11 +3220,14 @@ class BaseJSONMethods(object):
         return Value(field._dumps(value), converter=False)
 
     @staticmethod
-    def _path(keys, suffix=''):
+    def _path_index(idx):
+        return '[#%d]' % idx if idx < 0 else '[%d]' % idx
+
+    def _path(self, keys, suffix=''):
         parts = ['$']
         for k in keys:
             if isinstance(k, int):
-                parts.append('[#%d]' % k if k < 0 else '[%d]' % k)
+                parts.append(self._path_index(k))
             else:
                 k = str(k).replace('\\', '\\\\').replace('"', '\\"')
                 parts.append('."%s"' % k)
@@ -3185,6 +3283,17 @@ class SqliteJSONMethods(BaseJSONMethods):
             return fn.json(dumps(value))
         return wrapper
 
+    def _wrap_value(self, field, value):
+        # Wrap a Python value so SQLite stores it as JSON-typed. Containers,
+        # bools and JSON null go through fn.json() so the result is JSON-typed
+        # (otherwise SQLite stores TEXT, or 0/1 for bools). Other scalars are
+        # passed as-is.
+        if value is None:
+            return fn.json(Value('null', converter=False))
+        if isinstance(value, (dict, list, bool)):
+            return fn.json(field._dumps(value))
+        return value
+
     def extract(self, field, keys):
         return Expression(field, '->', self._path(keys)) if keys else field
 
@@ -3194,16 +3303,6 @@ class SqliteJSONMethods(BaseJSONMethods):
     def cast_type(self, t):
         return {'int': 'INTEGER', 'float': 'REAL'}[t]
 
-    def _wrap_value(self, field, value):
-        # Wrap a Python value so SQLite stores it as JSON-typed. Containers
-        # and JSON null go through fn.json() so the result is JSON-typed
-        # (otherwise SQLite stores them as TEXT). Scalars are passed as-is.
-        if value is None:
-            return fn.json(Value('null', converter=False))
-        if isinstance(value, (dict, list)):
-            return fn.json(field._dumps(value))
-        return value
-
     def set(self, field, keys, value):
         return fn.json_set(
             field,
@@ -3211,23 +3310,18 @@ class SqliteJSONMethods(BaseJSONMethods):
             self._wrap_value(field, value))
 
     def insert(self, field, keys, value):
-        # json_insert is a no-op when the path already exists (including
-        # when it exists with stored JSON null) - matches the "only-if-
-        # missing" semantic on every backend.
         return fn.json_insert(
             field,
             self._path(keys),
             self._wrap_value(field, value))
 
     def replace(self, field, keys, value):
-        # json_replace is a no-op when the path is missing.
         return fn.json_replace(
             field,
             self._path(keys),
             self._wrap_value(field, value))
 
     def append(self, field, keys, value):
-        # SQLite's '$.path[#]' target means "append after the last element."
         return fn.json_set(
             field,
             self._path(keys, '[#]'),
@@ -3246,7 +3340,6 @@ class SqliteJSONMethods(BaseJSONMethods):
         return fn.json_patch(field, fn.json(field._dumps(value)))
 
     def contains(self, field, keys, value):
-        # _pw_json_contains() is a registered UDF - a per-row full scan, no index.
         call = fn._pw_json_contains(self.extract(field, keys),
                                     self._contains_value(field, value))
         return Expression(call, OP.EQ, 1)
@@ -3257,9 +3350,7 @@ class SqliteJSONMethods(BaseJSONMethods):
         return Expression(call, OP.EQ, 1)
 
     def has_key(self, field, keys, key):
-        # json_type() is NULL only when the path selects nothing, so it
-        # doubles as a key-existence test (a stored JSON null still has a
-        # type). Matches MySQL's object-key semantics.
+        # json_type() is SQL NULL only when the path is missing.
         path = self._path(tuple(keys) + (key,))
         return Expression(fn.json_type(field, path), OP.IS_NOT, None)
 
@@ -3288,6 +3379,18 @@ class PostgresqlJSONMethods(BaseJSONMethods):
         # can't use any user-provided loads() impl.
         return lambda v: v
 
+    def _jsonb_wrap(self, field, value):
+        adapter = self.database._adapter
+        jsonb_cls = adapter.jsonb_type
+        if isinstance(value, (adapter.json_type, jsonb_cls)):
+            return value
+        return jsonb_cls(value, dumps=field._dumps)
+
+    def _path_array(self, keys):
+        # Build a text[] from keys for jsonb_set / #- operator.
+        parts = [str(k) for k in keys]
+        return Cast(AsIs(parts, False), 'text[]')
+
     def extract(self, field, keys):
         if not keys:
             return field
@@ -3304,18 +3407,6 @@ class PostgresqlJSONMethods(BaseJSONMethods):
     def cast_for_case(self, field, value):
         return Cast(Value(field._dumps(value)), 'JSONB')
 
-    def _jsonb_wrap(self, field, value):
-        adapter = self.database._adapter
-        jsonb_cls = adapter.jsonb_type
-        if isinstance(value, (adapter.json_type, jsonb_cls)):
-            return value
-        return jsonb_cls(value, dumps=field._dumps)
-
-    def _path_array(self, keys):
-        # Build a text[] from keys for jsonb_set / #- operator.
-        parts = [str(k) for k in keys]
-        return Cast(AsIs(parts, False), 'text[]')
-
     def set(self, field, keys, value):
         # jsonb_set(field, '{path}'::text[], value::jsonb, create_missing=true)
         return fn.jsonb_set(
@@ -3326,10 +3417,7 @@ class PostgresqlJSONMethods(BaseJSONMethods):
 
     def insert(self, field, keys, value):
         # Postgres has no single-call equivalent of json_insert. Wrap
-        # jsonb_set in a CASE that no-ops when the path resolves to anything
-        # other than SQL NULL - `field -> 'k'` returns SQL NULL only for
-        # absent keys; a stored JSON null comes back as jsonb 'null' which
-        # is NOT SQL NULL, so this matches json_insert / JSON_INSERT.
+        # jsonb_set in a CASE.
         return Case(None, [
             (self.extract(field, keys).is_null(),
              fn.jsonb_set(field, self._path_array(keys),
@@ -3337,16 +3425,13 @@ class PostgresqlJSONMethods(BaseJSONMethods):
         ], field)
 
     def replace(self, field, keys, value):
-        # jsonb_set with create_missing=False is a no-op on absent paths.
         return fn.jsonb_set(
             field,
             self._path_array(keys),
             self._jsonb_wrap(field, value),
-            False)
+            False)  # create_missing=False.
 
     def append(self, field, keys, value):
-        # '-1' as the trailing path element + insert_after=True means
-        # "insert after the last array element."
         return fn.jsonb_insert(
             field,
             self._path_array(list(keys) + ['-1']),
@@ -3398,6 +3483,12 @@ class MySQLJSONMethods(BaseJSONMethods):
                                  compact=False)
         return wrapper
 
+    @staticmethod
+    def _path_index(idx):
+        if idx < 0:
+            return '[last]' if idx == -1 else '[last%d]' % (idx + 1)
+        return '[%d]' % idx
+
     def extract(self, field, keys):
         if not keys:
             return field
@@ -3414,8 +3505,10 @@ class MySQLJSONMethods(BaseJSONMethods):
 
     def _json_value(self, field, value):
         # Value for JSON_SET, etc. Need to apply wrapping in order to ensure
-        # objects/arrays/null are CAST as JSON and not strings.
-        if value is None or isinstance(value, (dict, list)):
+        # objects/arrays/null are CAST as JSON and not strings. Bools and
+        # floats also take the dumps form, the driver writes 0/1 and
+        # reformatted floats that break comparisons.
+        if value is None or isinstance(value, (dict, list, bool, float)):
             return self._as_json(self._contains_value(field, value))
         return Value(value, converter=False)
 
@@ -3431,13 +3524,10 @@ class MySQLJSONMethods(BaseJSONMethods):
                            self._json_value(field, value))
 
     def insert(self, field, keys, value):
-        # JSON_INSERT is a no-op when the path already exists (including
-        # when it exists with stored JSON null).
         return fn.JSON_INSERT(field, self._path(keys),
                               self._json_value(field, value))
 
     def replace(self, field, keys, value):
-        # JSON_REPLACE is a no-op when the path is missing.
         return fn.JSON_REPLACE(field, self._path(keys),
                                self._json_value(field, value))
 
@@ -3459,7 +3549,7 @@ class MySQLJSONMethods(BaseJSONMethods):
         return fn.JSON_MERGE_PATCH(field, self._json_value(field, value))
 
     def contains(self, field, keys, value):
-        # JSON_CONTAINS returns 0/1; wrap in `= 1` so it composes cleanly in
+        # JSON_CONTAINS returns 0/1, wrap in `= 1` so it composes cleanly in
         # boolean contexts (NOT, AND, etc.).
         path_args = (self._path(keys),) if keys else ()
         call = fn.JSON_CONTAINS(field, self._contains_value(field, value),
@@ -3467,14 +3557,11 @@ class MySQLJSONMethods(BaseJSONMethods):
         return Expression(call, OP.EQ, 1)
 
     def contained_by(self, field, keys, value):
-        # Args flipped: is `value` a superset of (sub-extract of) field?
         lhs = self.extract(field, keys) if keys else field
         call = fn.JSON_CONTAINS(self._contains_value(field, value), lhs)
         return Expression(call, OP.EQ, 1)
 
     def has_key(self, field, keys, key):
-        # JSON_CONTAINS_PATH(field, 'one', '$.key'). Reuse _path([key]) so the
-        # key gets the same escaping as anywhere else.
         path = self._path(tuple(keys) + (key,))
         call = fn.JSON_CONTAINS_PATH(field, 'one', path)
         return Expression(call, OP.EQ, 1)
@@ -3532,6 +3619,7 @@ EXCEPTIONS = {
     'IntegrityConstraintViolationError': IntegrityError,
     'IntegrityError': IntegrityError,
     'InterfaceError': InterfaceError,
+    'InternalClientError': InternalError,
     'InternalError': InternalError,
     'NotSupportedError': NotSupportedError,
     'OperationalError': OperationalError,
@@ -3674,9 +3762,7 @@ class Database(_callable_context_manager):
         self.deferred = not bool(database)
 
     def __deepcopy__(self, memo):
-        # Databases are shared and hold un-copyable state (locks, thread-local
-        # connections). Reached via deepcopy of an inherited field that caches a
-        # db reference, e.g. JSONField's helper. Keep the same db.
+        # A database is a live resource (locks, connections), copies share it.
         return self
 
     def __enter__(self):
@@ -3816,25 +3902,27 @@ class Database(_callable_context_manager):
                 else:
                     v = Value(v, unpack=False)
             elif qualify:
-                v = QualifiedNames(v)
+                v = qualify_names(v)
             items.append(NodeList((ensure_entity(k), SQL('='), v)))
         return items
 
-    def _build_on_conflict_update(self, on_conflict, query):
+    def _build_on_conflict_target(self, on_conflict):
         if on_conflict._conflict_target:
-            stmt = SQL('ON CONFLICT')
             target = EnclosedNodeList([
                 Entity(col) if isinstance(col, str) else col
                 for col in on_conflict._conflict_target])
             if on_conflict._conflict_where is not None:
                 target = NodeList([target, SQL('WHERE'),
                                    on_conflict._conflict_where])
-        else:
-            stmt = SQL('ON CONFLICT ON CONSTRAINT')
-            target = on_conflict._conflict_constraint
-            if isinstance(target, str):
-                target = Entity(target)
+            return NodeList([SQL('ON CONFLICT'), target])
+        elif on_conflict._conflict_constraint:
+            constraint = on_conflict._conflict_constraint
+            if isinstance(constraint, str):
+                constraint = Entity(constraint)
+            return NodeList([SQL('ON CONFLICT ON CONSTRAINT'), constraint])
+        return SQL('ON CONFLICT')
 
+    def _build_on_conflict_update(self, on_conflict, query):
         updates = []
         if on_conflict._preserve:
             for column in on_conflict._preserve:
@@ -3848,14 +3936,28 @@ class Database(_callable_context_manager):
             updates.extend(self._conflict_update_items(on_conflict, query,
                                                        qualify=True))
 
-        parts = [stmt, target, SQL('DO UPDATE SET'), CommaNodeList(updates)]
+        parts = [self._build_on_conflict_target(on_conflict),
+                 SQL('DO UPDATE SET'), CommaNodeList(updates)]
         if on_conflict._where:
-            parts.extend((SQL('WHERE'), QualifiedNames(on_conflict._where)))
+            parts.extend((SQL('WHERE'), qualify_names(on_conflict._where)))
 
         return NodeList(parts)
 
-    def last_insert_id(self, cursor, query_type=None):
+    def _last_insert_rowid(self, cursor):
         return cursor.lastrowid
+
+    def last_insert_id(self, cursor, query_type=None):
+        if not self.returning_clause:
+            return self._last_insert_rowid(cursor)
+        elif query_type == Insert.SIMPLE:
+            try:
+                row = cursor[0]
+                if isinstance(row, tuple) and len(row) > 1:
+                    return row  # Composite pk, return all columns.
+                return row[0]
+            except (AttributeError, IndexError, KeyError, TypeError):
+                return  # Nothing was inserted, e.g. a conflict was ignored.
+        return cursor
 
     def rows_affected(self, cursor):
         try:
@@ -4260,16 +4362,6 @@ class SqliteDatabase(Database):
             self.execute_sql('DETACH DATABASE ?', (name,))
         return True
 
-    def last_insert_id(self, cursor, query_type=None):
-        if not self.returning_clause:
-            return cursor.lastrowid
-        elif query_type == Insert.SIMPLE:
-            try:
-                return cursor[0][0]
-            except (IndexError, KeyError, TypeError):
-                pass
-        return cursor
-
     def begin(self, lock_type=None):
         statement = 'BEGIN %s' % lock_type if lock_type else 'BEGIN'
         self.execute_sql(statement)
@@ -4372,7 +4464,11 @@ class SqliteDatabase(Database):
             return
 
         if action == 'nothing':
-            return SQL('ON CONFLICT DO NOTHING')
+            if oc._conflict_constraint:
+                raise ValueError('SQLite does not support specifying named '
+                                 'constraints for conflict resolution.')
+            return NodeList([self._build_on_conflict_target(oc),
+                             SQL('DO NOTHING')])
         elif not oc._update and not oc._preserve:
             raise ValueError('If you are not performing any updates (or '
                              'preserving any INSERTed values), then the '
@@ -4418,6 +4514,11 @@ class _BasePsycopgAdapter(object):
             return self.isolation_levels[isolation_level]
         return isolation_level
 
+    def server_side_cursor(self, conn):
+        # psycopg2/3 do not allow us to use these in autocommit, even if we ARE
+        # inside a transaction - so specify withhold (not desirable!).
+        return conn.cursor(name=str(uuid.uuid1()), withhold=True)
+
 
 class Psycopg2Adapter(_BasePsycopgAdapter):
     isolation_levels = {
@@ -4462,24 +4563,34 @@ class Psycopg2Adapter(_BasePsycopgAdapter):
         return txn_status < pg_extensions.TRANSACTION_STATUS_INERROR
 
     def is_connection_reusable(self, conn):
+        # If the status is unknown then we lost the connection to the server
+        # and the connection should not be re-used.
         txn_status = conn.get_transaction_status()
-        # Do not return connection in an error state, as subsequent queries
-        # will all fail. If the status is unknown then we lost the connection
-        # to the server and the connection should not be re-used.
         if txn_status == pg_extensions.TRANSACTION_STATUS_UNKNOWN:
             return False
-        elif txn_status == pg_extensions.TRANSACTION_STATUS_INERROR:
-            conn.reset()
         elif txn_status != pg_extensions.TRANSACTION_STATUS_IDLE:
-            conn.rollback()
+            # rollback() no-ops and reset() raises under autocommit, send a
+            # raw ROLLBACK (clears both in-txn and error states).
+            try:
+                conn.cursor().execute('ROLLBACK')
+            except Exception:
+                return False
         return True
 
     def is_connection_closed(self, conn):
         txn_status = conn.get_transaction_status()
         if txn_status == pg_extensions.TRANSACTION_STATUS_UNKNOWN:
             return True
-        elif txn_status != pg_extensions.TRANSACTION_STATUS_IDLE:
-            conn.rollback()
+        try:
+            if txn_status != pg_extensions.TRANSACTION_STATUS_IDLE:
+                # rollback() no-ops under autocommit, send a raw ROLLBACK.
+                conn.cursor().execute('ROLLBACK')
+            else:
+                # The status flag is local, only a round trip can detect a
+                # server-side disconnect.
+                conn.cursor().execute('SELECT 1')
+        except Exception:
+            return True
         return False
 
 
@@ -4505,6 +4616,8 @@ class Psycopg3Adapter(_BasePsycopgAdapter):
         return psycopg.Binary
 
     def connect(self, db, **params):
+        if db._encoding:
+            params.setdefault('client_encoding', db._encoding)
         if db.database.startswith('postgresql://'):
             params.setdefault('conninfo', db.database)
         else:
@@ -4518,24 +4631,33 @@ class Psycopg3Adapter(_BasePsycopgAdapter):
         return conn.pgconn.transaction_status < TransactionStatus.INERROR
 
     def is_connection_reusable(self, conn):
+        # If the status is unknown then we lost the connection to the server
+        # and the connection should not be re-used.
         txn_status = conn.pgconn.transaction_status
-        # Do not return connection in an error state, as subsequent queries
-        # will all fail. If the status is unknown then we lost the connection
-        # to the server and the connection should not be re-used.
         if txn_status == TransactionStatus.UNKNOWN:
             return False
-        elif txn_status == TransactionStatus.INERROR:
-            conn.reset()
         elif txn_status != TransactionStatus.IDLE:
-            conn.rollback()
+            # rollback() clears both in-txn and error states (psycopg3 has
+            # no Connection.reset()).
+            try:
+                conn.rollback()
+            except Exception:
+                return False
         return True
 
     def is_connection_closed(self, conn):
         txn_status = conn.pgconn.transaction_status
         if txn_status == TransactionStatus.UNKNOWN:
             return True
-        elif txn_status != TransactionStatus.IDLE:
-            conn.rollback()
+        try:
+            if txn_status != TransactionStatus.IDLE:
+                conn.rollback()
+            else:
+                # The status flag is local, only a round trip can detect a
+                # server-side disconnect.
+                conn.execute('SELECT 1')
+        except Exception:
+            return True
         return False
 
 
@@ -4607,15 +4729,11 @@ class PostgresqlDatabase(Database):
         # is otherwise unusable, return False.
         return self._adapter.is_connection_usable(self._state.conn)
 
-    def last_insert_id(self, cursor, query_type=None):
-        try:
-            return cursor if query_type != Insert.SIMPLE else cursor[0][0]
-        except (IndexError, KeyError, TypeError):
-            pass
-
     def begin(self, isolation_level=None):
         if self.is_closed():
             self.connect()
+        if isolation_level is None:
+            isolation_level = self._isolation_level
         if isolation_level:
             txn_type = self._adapter.isolation_level_str(isolation_level)
             stmt = 'BEGIN TRANSACTION ISOLATION LEVEL %s' % txn_type
@@ -4641,10 +4759,10 @@ class PostgresqlDatabase(Database):
         query = """
             SELECT
                 i.relname, idxs.indexdef, idx.indisunique,
-                array_to_string(ARRAY(
+                ARRAY(
                     SELECT pg_get_indexdef(idx.indexrelid, k + 1, TRUE)
                     FROM generate_subscripts(idx.indkey, 1) AS k
-                    ORDER BY k), ',')
+                    ORDER BY k)
             FROM pg_catalog.pg_class AS t
             INNER JOIN pg_catalog.pg_namespace AS n ON t.relnamespace = n.oid
             INNER JOIN pg_catalog.pg_index AS idx ON t.oid = idx.indrelid
@@ -4656,9 +4774,8 @@ class PostgresqlDatabase(Database):
             WHERE t.relname = %s AND t.relkind = %s AND n.nspname = %s
             ORDER BY idx.indisunique DESC, i.relname;"""
         cursor = self.execute_sql(query, (table, 'r', schema or 'public'))
-        unesc = lambda cols: [unqesc(c) for c in cols.split(',')]
-        return [IndexMetadata(name, sql.rstrip(' ;'), unesc(cols), unique,
-                              table)
+        return [IndexMetadata(name, sql.rstrip(' ;'),
+                              [unqesc(c) for c in cols], unique, table)
                 for name, sql, unique, cols in cursor.fetchall()]
 
     def get_columns(self, table, schema=None):
@@ -4748,13 +4865,8 @@ class PostgresqlDatabase(Database):
     def conflict_update(self, oc, query):
         action = oc._action.lower() if oc._action else ''
         if action in ('ignore', 'nothing'):
-            parts = [SQL('ON CONFLICT')]
-            if oc._conflict_target:
-                parts.append(EnclosedNodeList([
-                    Entity(col) if isinstance(col, str) else col
-                    for col in oc._conflict_target]))
-            parts.append(SQL('DO NOTHING'))
-            return NodeList(parts)
+            return NodeList([self._build_on_conflict_target(oc),
+                             SQL('DO NOTHING')])
         elif action and action != 'update':
             raise ValueError('The only supported actions for conflict '
                              'resolution with Postgresql are "ignore" or '
@@ -4850,6 +4962,20 @@ class MySQLDatabase(Database):
         except AttributeError:
             version_raw = conn.get_server_info()
         self.server_version = self._extract_server_version(version_raw)
+        # Oracle MySQL has no 10.x, a 10.x server is MariaDB.
+        self._set_csq_grouped(self.mariadb
+                              or 'maria' in str(version_raw).lower()
+                              or self.server_version >= (10,))
+
+    def _set_csq_grouped(self, is_mariadb):
+        supported = (self.server_version >= (10, 4) if is_mariadb
+                     else self.server_version >= (8, 0, 22))
+        if (supported and self.compound_select_parentheses ==
+                CSQ_PARENTHESES_UNNESTED):
+            # These servers accept parens around compound members, use
+            # them so nested compounds keep their meaning. Only the
+            # default is upgraded, an explicit setting is respected.
+            self.compound_select_parentheses = CSQ_PARENTHESES_GROUPED
 
     def _extract_server_version(self, version):
         if isinstance(version, tuple):
@@ -4909,9 +5035,9 @@ class MySQLDatabase(Database):
         return [ViewMetadata(*row) for row in cursor.fetchall()]
 
     def _show_index_target(self, table, schema):
-        table = table.replace('`', '``')
+        table = qesc(table, '`')
         if schema:
-            return '`%s`.`%s`' % (schema.replace('`', '``'), table)
+            return '`%s`.`%s`' % (qesc(schema, '`'), table)
         return '`%s`' % table
 
     def get_indexes(self, table, schema=None):
@@ -5208,7 +5334,7 @@ class CursorWrapper(object):
                 self.fill_cache(stop)
             return self.row_cache[item]
         elif isinstance(item, int):
-            self.fill_cache(item if item > 0 else 0)
+            self.fill_cache(item + 1 if item >= 0 else 0)
             return self.row_cache[item]
         else:
             raise ValueError('CursorWrapper only supports integer and slice '
@@ -5240,7 +5366,6 @@ class CursorWrapper(object):
         return row
 
     def iterator(self):
-        """Efficient one-pass iteration over the result set."""
         while True:
             try:
                 yield self.iterate(False)
@@ -5291,10 +5416,7 @@ class DictCursorWrapper(CursorWrapper):
         self.ncols = len(self.columns)
 
     def _row_to_dict(self, row):
-        result = {}
-        for i in range(self.ncols):
-            result.setdefault(self.columns[i], row[i])  # Do not overwrite.
-        return result
+        return {self.columns[i]: row[i] for i in range(self.ncols)}
 
     process_row = _row_to_dict
 
@@ -5302,7 +5424,8 @@ class NamedTupleCursorWrapper(CursorWrapper):
     def initialize(self):
         identifiers = self.dedupe_columns(
             [col_spec[0] for col_spec in self.cursor.description])
-        self.tuple_class = collections.namedtuple('Row', identifiers)
+        self.tuple_class = collections.namedtuple('Row', identifiers,
+                                                  rename=True)
 
     def process_row(self, row):
         return self.tuple_class(*row)
@@ -5394,9 +5517,12 @@ class ForeignKeyAccessor(FieldAccessor):
         else:
             fk_value = instance.__data__.get(self.name)
             instance.__data__[self.name] = obj
-            if (obj != fk_value or obj is None) and \
-               self.name in instance.__rel__:
-                del instance.__rel__[self.name]
+            if self.name in instance.__rel__:
+                # Keep the cache only for a real instance w/unchanged fk id.
+                keep = (obj is not None and obj == fk_value and
+                        instance.__rel__[self.name] is not None)
+                if not keep:
+                    del instance.__rel__[self.name]
         instance._dirty.add(self.name)
 
 
@@ -5416,7 +5542,6 @@ class BackrefAccessor(object):
 
 
 class ObjectIdAccessor(object):
-    """Gives direct access to the underlying id"""
     def __init__(self, field):
         self.field = field
 
@@ -5424,9 +5549,10 @@ class ObjectIdAccessor(object):
         if instance is not None:
             value = instance.__data__.get(self.field.name)
             # Pull the object-id from the related object if it is not set.
-            if value is None and self.field.name in instance.__rel__:
-                rel_obj = instance.__rel__[self.field.name]
-                value = getattr(rel_obj, self.field.rel_field.name)
+            if value is None:
+                rel_obj = instance.__rel__.get(self.field.name)
+                if rel_obj is not None:
+                    value = getattr(rel_obj, self.field.rel_field.name)
             return value
         return self.field
 
@@ -5475,7 +5601,8 @@ class Field(ColumnBase):
         self._sort_key = (self.primary_key and 1 or 2), self._order
 
     def __hash__(self):
-        return hash(self.name + '.' + self.model.__name__)
+        # Same-named models are distinguished by class identity, not table.
+        return hash((self.model, self.name))
 
     def __repr__(self):
         if hasattr(self, 'model') and getattr(self, 'name', None):
@@ -5504,8 +5631,12 @@ class Field(ColumnBase):
     def python_value(self, value):
         return value if value is None else self.adapt(value)
 
-    def to_value(self, value, case=False):
+    def to_value(self, value):
         return Value(value, self.db_value, unpack=False)
+
+    def case_value(self, value):
+        # A CASE branch param is untyped on postgres, JSON fields cast it.
+        return self.to_value(value)
 
     def get_sort_key(self, ctx):
         return self._sort_key
@@ -5718,7 +5849,9 @@ class BlobField(FieldDatabaseHook, Field):
 
     def db_value(self, value):
         if isinstance(value, str):
-            value = value.encode('raw_unicode_escape')
+            value = value.encode('utf8')
+        elif isinstance(value, memoryview):
+            value = value.tobytes()
         if isinstance(value, bytes):
             return self._constructor(value)
         return value
@@ -5852,7 +5985,9 @@ class BigBitFieldAccessor(FieldAccessor):
             return self.field
         return BigBitFieldData(instance, self.name)
     def __set__(self, instance, value):
-        if isinstance(value, memoryview):
+        if value is None:
+            pass
+        elif isinstance(value, memoryview):
             value = value.tobytes()
         elif isinstance(value, bytearray):
             value = bytes(value)
@@ -6331,15 +6466,18 @@ class JSONField(FieldDatabaseHook, Field):
             return value
         return self._read(value) if self._read is not None else value
 
-    def to_value(self, value, case=False):
-        # bulk_update() needs a cast.
+    def to_value(self, value):
         if value is None or isinstance(value, Node):
             return value
-        if case and self._helper is not None:
+        return self.db_value(value)
+
+    def case_value(self, value):
+        if self._helper is not None and value is not None and \
+                not isinstance(value, Node):
             cast = self._helper.cast_for_case(self, value)
             if cast is not None:
                 return cast
-        return self.db_value(value)
+        return self.to_value(value)
 
     def __getitem__(self, key):
         return JSONPath(self, (key,))
@@ -6513,7 +6651,7 @@ class ForeignKeyField(Field):
 
         if set_attribute:
             setattr(model, self.object_id_name, ObjectIdAccessor(self))
-            if self.backref not in '!+':
+            if self.backref not in ('+', '!'):
                 setattr(self.rel_model, self.backref,
                         self.backref_accessor_class(self))
 
@@ -6621,7 +6759,7 @@ class ManyToManyFieldAccessor(FieldAccessor):
 
     def __get__(self, instance, instance_type=None, force_query=False):
         if instance is not None:
-            if not force_query and self.src_fk.backref != '+':
+            if not force_query and self.src_fk.backref not in ('+', '!'):
                 backref = getattr(instance, self.src_fk.backref)
                 if isinstance(backref, list):
                     return [getattr(obj, self.dest_fk.name) for obj in backref]
@@ -6675,15 +6813,16 @@ class ManyToManyField(MetaField):
         super(ManyToManyField, self).bind(model, name, set_attribute)
 
         if not self._is_backref:
-            many_to_many_field = ManyToManyField(
-                self.model,
-                backref=name,
-                through_model=self.through_model,
-                on_delete=self._on_delete,
-                on_update=self._on_update,
-                _is_backref=True)
             self.backref = self.backref or model._meta.name + 's'
-            self.rel_model._meta.add_field(self.backref, many_to_many_field)
+            if self.backref not in ('+', '!'):
+                many_to_many_field = ManyToManyField(
+                    self.model,
+                    backref=name,
+                    through_model=self.through_model,
+                    on_delete=self._on_delete,
+                    on_update=self._on_update,
+                    _is_backref=True)
+                self.rel_model._meta.add_field(self.backref, many_to_many_field)
 
     def get_models(self):
         return [model for _, model in sorted((
@@ -6782,6 +6921,10 @@ class CompositeKey(MetaField):
             setattr(instance, self.field_names[idx], field_value)
 
     def __eq__(self, other):
+        if isinstance(other, str) or (isinstance(other, (list, tuple)) and
+                                      len(other) != len(self.field_names)):
+            raise ValueError('The length of the value must equal the number '
+                             'of columns of the composite primary key.')
         expressions = [(self.model._meta.fields[field] == value)
                        for field, value in zip(self.field_names, other)]
         return reduce(operator.and_, expressions)
@@ -7196,9 +7339,12 @@ class Metadata(object):
     def remove_ref(self, field):
         rel = field.rel_model
         del self.refs[field]
-        self.model_refs[rel].remove(field)
+        self.model_refs[rel] = [f for f in self.model_refs[rel]
+                                if f is not field]
         del rel._meta.backrefs[field]
-        rel._meta.model_backrefs[self.model].remove(field)
+        model_backrefs = rel._meta.model_backrefs
+        model_backrefs[self.model] = [f for f in model_backrefs[self.model]
+                                      if f is not field]
 
     def add_manytomany(self, field):
         self.manytomany[field.name] = field
@@ -7701,7 +7847,7 @@ class Model(Node, metaclass=ModelBase):
                 for model in batch:
                     value = getattr(model, attr)
                     if not isinstance(value, Node):
-                        value = field.to_value(value, case=True)
+                        value = field.case_value(value)
                     accum.append((pk.to_value(model._pk), value))
                 case = Case(pk, accum)
                 update[field] = case
@@ -7866,8 +8012,7 @@ class Model(Node, metaclass=ModelBase):
 
     @property
     def dirty_field_names(self):
-        return [f.name for f in self._meta.sorted_fields
-                if f.name in self._dirty]
+        return [f.name for f in self.dirty_fields]
 
     def dependencies(self, search_nullable=True, exclude_null_children=False):
         model_class = type(self)
@@ -7889,14 +8034,12 @@ class Model(Node, metaclass=ModelBase):
                             .where(node))
                 if not fk.null or search_nullable:
                     queries.setdefault(rel_model, []).append((node, fk))
-                    if fk.null and exclude_null_children:
-                        # Do not process additional children of this node, but
-                        # include it in the list of dependencies.
-                        seen.add(rel_model)
-                    else:
+                    # A nullable child is updated, not deleted, so skip its
+                    # children but leave it unseen for non-nullable paths.
+                    if not (fk.null and exclude_null_children):
                         stack.append((rel_model, subquery))
 
-        for m in reversed(sort_models(seen)):
+        for m in reversed(sort_models(list(queries))):
             for sq, q in queries.get(m, ()):
                 yield sq, q
 
@@ -8005,7 +8148,6 @@ class Model(Node, metaclass=ModelBase):
 
 
 class ModelAlias(Node):
-    """Provide a separate reference to a model in a query."""
     def __init__(self, model, alias=None):
         self.__dict__['model'] = model
         self.__dict__['alias'] = alias
@@ -8065,7 +8207,7 @@ class ModelAlias(Node):
 class FieldAlias(Field):
     def __init__(self, source, field):
         self.source = source
-        self.model = source.model
+        self.model = source
         self.field = field
 
     @classmethod
@@ -8303,9 +8445,11 @@ class ModelSelect(BaseModelSelect, Select):
         return self
 
     def select_extend(self, *columns):
-        self._is_default = False
         fields = _normalize_model_select(columns)
-        return super(ModelSelect, self).select_extend(*fields)
+        # Flag the clone, not the receiver, as having a projection.
+        clone = super(ModelSelect, self).select_extend(*fields)
+        clone._is_default = False
+        return clone
 
     def switch(self, ctx=None):
         self._join_ctx = self.model if ctx is None else ctx
@@ -8386,6 +8530,12 @@ class ModelSelect(BaseModelSelect, Select):
             attr = attr or dest._alias
             if not attr and isinstance(dest, Table):
                 attr = dest.__name__
+        elif dest_model:
+            # Joining from a model-less source (subquery, CTE, table) to a
+            # model, e.g. join_from(cte, SomeModel, on=...).
+            self._join_ctx = dest
+            constructor = dest_model
+            attr = attr or dest_model._meta.name
 
         return (on, attr, constructor)
 
@@ -8447,7 +8597,7 @@ class ModelSelect(BaseModelSelect, Select):
                 lhs_f = lhs.field if isinstance(lhs, FieldAlias) else lhs
                 if lhs_f in fk_set:
                     to_field = lhs_f
-            elif isinstance(rhs, Field):
+            if to_field is None and isinstance(rhs, Field):
                 rhs_f = rhs.field if isinstance(rhs, FieldAlias) else rhs
                 if rhs_f in fk_set:
                     to_field = rhs_f
@@ -8459,8 +8609,12 @@ class ModelSelect(BaseModelSelect, Select):
         src = self._join_ctx if src is None else src
 
         if join_type == JOIN.LATERAL or join_type == JOIN.LEFT_LATERAL:
-            on = True
+            if on is None:
+                on = True
         elif join_type != JOIN.CROSS:
+            # A lateral source correlates inside the subquery, default ON true.
+            if on is None and getattr(dest, '_lateral', False):
+                on = True
             on, attr, constructor = self._normalize_join(src, dest, on, attr)
             if attr:
                 self._joins.setdefault(src, [])
@@ -8727,13 +8881,11 @@ def safe_python_value(conv_func):
 
 
 def _resolve_model_columns(cursor, model, select):
-    """Resolve cursor columns against a model's selected nodes.
-
-    Returns ``(columns, fields, converters, no_convert, convert)``:
-    ``columns`` and ``fields`` are aligned per-column lists, ``converters``
-    is a per-column ``python_value`` callable or ``None``, and
-    ``no_convert``/``convert`` are the index partitions of ``converters``.
-    """
+    # Resolve cursor columns against a model's selected nodes. Returns a tuple
+    # of ``(columns, fields, converters, no_convert, convert)``:
+    # ``columns`` and ``fields`` are aligned per-column lists,
+    # ``converters`` is a per-column ``python_value`` callable or ``None``,
+    # ``no_convert``/``convert`` are the index partitions of ``converters``.
     combined = model._meta.combined
     table = model._meta.table
     description = cursor.description
@@ -8866,7 +9018,7 @@ class ModelNamedTupleCursorWrapper(ModelTupleCursorWrapper):
     def initialize(self):
         super(ModelNamedTupleCursorWrapper, self).initialize()
         identifiers = self.dedupe_columns(self.columns)
-        self.impl = collections.namedtuple('Row', identifiers)
+        self.impl = collections.namedtuple('Row', identifiers, rename=True)
         self.constructor = lambda row: self.impl(*row)
 
 
@@ -8929,13 +9081,19 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                     self.key_to_constructor[key] = (constructor,
                                                     is_model(constructor))
 
-                    # (src, attr, dest, join_type, is outer?).
+                    src_ctor = self.key_to_constructor.get(curr)
+                    is_fk = (src_ctor is not None and src_ctor[1] and
+                             isinstance(src_ctor[0]._meta.fields.get(attr),
+                                        ForeignKeyField))
+                    # (src, attr, dest, src is dict?, is outer?,
+                    # attr is src's fk?).
                     self.src_to_dest.append((
                         curr,
                         attr,
                         key,
-                        join_type,
-                        join_type.endswith('OUTER')))
+                        src_ctor is not None and not src_ctor[1],
+                        'LEFT' in join_type or 'FULL' in join_type,
+                        is_fk))
 
                     accum.append(key)
 
@@ -8982,7 +9140,7 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
 
         # Pre-compute join-graph reachability.
         self._dest_reachable = {}
-        for _, _, dest, _, _ in self.src_to_dest:
+        for _, _, dest, _, _, _ in self.src_to_dest:
             if dest not in self.joins:
                 continue
             reachable = set()
@@ -9013,7 +9171,6 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
             # Get the instance corresponding to the selected column/value,
             # falling back to the "root" model instance.
             instance = objects.get(key, default_instance)
-            column = self.columns[idx]
             value = row[idx]
             if value is not None:
                 set_keys.add(key)
@@ -9026,7 +9183,7 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                 setattr(instance, column, value)
 
         # Need to do some analysis on the joins before this.
-        for (src, attr, dest, _, is_outer) in self.src_to_dest:
+        for (src, attr, dest, is_dict, is_outer, is_fk) in self.src_to_dest:
             instance = objects.get(src)
             joined_instance = objects.get(dest)
             if joined_instance is None and dest not in objects:
@@ -9050,8 +9207,11 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
             if src not in set_keys and dest not in set_keys and is_outer:
                 continue
 
-            if isinstance(instance, dict):
+            if is_dict:
                 instance[attr] = joined_instance
+            elif is_fk and joined_instance is None:
+                # None in __rel__ marks a verified-absent row, fk id intact.
+                instance.__rel__[attr] = None
             else:
                 setattr(instance, attr, joined_instance)
 
@@ -9112,6 +9272,11 @@ class PrefetchQuery(collections.namedtuple('_PrefetchQuery', (
 
 
 def _parent_keys(parent_query, cols):
+    if isinstance(parent_query, CompoundSelectQuery):
+        # A compound renders as a derived table, key columns must resolve
+        # through its alias rather than through the model's.
+        sub = parent_query.alias('_compound')
+        return Select((sub,), [getattr(sub.c, c.column_name) for c in cols])
     sub = parent_query.select(*cols)
     # MySQL rejects LIMIT directly inside IN so move it into a derived table.
     if parent_query._limit is not None or parent_query._offset is not None:
@@ -9121,26 +9286,36 @@ def _parent_keys(parent_query, cols):
 
 
 def _relate_children(query, parent_query, pairs, strategy):
-    """Restrict a one-to-many child query to rows whose foreign key matches a
-    parent in parent_query. pairs are (child_fk, parent_key) field tuples."""
     if strategy == PREFETCH_TYPE.JOIN:
-        sub = _parent_keys(parent_query, {pk for _, pk in pairs})
+        # Distinct the key subquery, not the child query. Deduping the
+        # keys prevents join fan-out without clobbering a child DISTINCT.
+        # Inherited ordering is dropped, a key set has none and postgres
+        # rejects DISTINCT ordered by an unprojected column.
+        sub = (_parent_keys(parent_query, {pk for _, pk in pairs})
+               .order_by().distinct())
         on = reduce(operator.or_, [getattr(sub.c, pk.column_name) == fk
                                    for fk, pk in pairs])
-        return query.distinct().join(sub, on=on)
+        query = query.join(sub, on=on)
+        if len(pairs) > 1:
+            # An OR join over several fks can match a child row to more
+            # than one key row, dedupe the children as well.
+            query = query.distinct()
+        return query
     expr = reduce(operator.or_, [fk << _parent_keys(parent_query, (pk,))
                                  for fk, pk in pairs])
     return query.where(expr)
 
 
 def _relate_parent(query, parent_query, pairs, strategy):
-    """Restrict a many-to-one query to the rows referenced by parent_query.
-    pairs are (child_ref, parent_fk) field tuples."""
     if strategy == PREFETCH_TYPE.JOIN:
-        sub = _parent_keys(parent_query, [fk for _, fk in pairs])
+        sub = (_parent_keys(parent_query, [fk for _, fk in pairs])
+               .order_by().distinct())
         on = reduce(operator.or_, [ref == getattr(sub.c, fk.column_name)
                                    for ref, fk in pairs])
-        return query.distinct().join(sub, on=on)
+        query = query.join(sub, on=on)
+        if len(pairs) > 1:
+            query = query.distinct()
+        return query
     expr = reduce(operator.or_, [ref << _parent_keys(parent_query, (fk,))
                                  for ref, fk in pairs])
     return query.where(expr)
@@ -9236,15 +9411,6 @@ def _bucket(field, is_backref, children, parents):
     # backref lists directly, skipping descriptor and dirty tracking.
     name, rel_name = field.name, field.rel_field.name
     if is_backref:
-        # children are the referenced rows, parents carry the fk.
-        id_map = {}
-        for child in children:
-            id_map[child.__data__[rel_name]] = child
-        for parent in parents:
-            key = parent.__data__[name]
-            if key in id_map:
-                parent.__rel__[name] = id_map[key]
-    else:
         # children carry the fk, parents get backref lists.
         buckets = {}
         for child in children:
@@ -9255,6 +9421,15 @@ def _bucket(field, is_backref, children, parents):
             for inst in rel:
                 inst.__rel__[name] = parent
             setattr(parent, backref, rel)
+    else:
+        # children are the referenced rows, parents carry the fk.
+        id_map = {}
+        for child in children:
+            id_map[child.__data__[rel_name]] = child
+        for parent in parents:
+            key = parent.__data__[name]
+            if key in id_map:
+                parent.__rel__[name] = id_map[key]
 
 
 class Load(Node):
@@ -9342,7 +9517,7 @@ class Load(Node):
                                             parent_query, parents)
         # The whole tree runs on the database the parent ran against.
         children = list(child_query.execute(database))
-        _bucket(field, not self._is_backref, children, parents)
+        _bucket(field, self._is_backref, children, parents)
         return children, child_query
 
     @staticmethod

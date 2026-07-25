@@ -126,7 +126,6 @@ from peewee import Node
 from peewee import NodeList
 from peewee import OP
 from peewee import callable_
-from peewee import sort_models
 from peewee import sqlite3
 from peewee import _truncate_constraint_name
 try:
@@ -520,7 +519,6 @@ class PostgresqlMigrator(SchemaMigrator):
                 .sql(Entity(fk_constraint)))
 
 
-
 class CockroachDBMigrator(PostgresqlMigrator):
     explicit_create_foreign_key = True
     transactional_ddl = False
@@ -634,7 +632,9 @@ class MySQLMigrator(SchemaMigrator):
                     table,
                     column,
                     fk_metadata.dest_table,
-                    fk_metadata.dest_column))
+                    fk_metadata.dest_column,
+                    fk_metadata.on_delete,
+                    fk_metadata.on_update))
 
     @operation
     def drop_not_null(self, table, column):
@@ -669,7 +669,9 @@ class MySQLMigrator(SchemaMigrator):
                     table,
                     new_name,
                     fk_metadata.dest_table,
-                    fk_metadata.dest_column),
+                    fk_metadata.dest_column,
+                    fk_metadata.on_delete,
+                    fk_metadata.on_update),
             ]
         else:
             return rename_ctx
@@ -707,11 +709,6 @@ class SqliteMigrator(SchemaMigrator):
     column_name_re = re.compile(r'''["`']?([\w]+)''')
     fk_re = re.compile(r'FOREIGN KEY\s+\("?([\w]+)"?\)\s+', re.I)
 
-    def _get_column_names(self, table):
-        quoted = table.replace('"', '""')
-        res = self.database.execute_sql('select * from "%s" limit 1' % quoted)
-        return [item[0] for item in res.description]
-
     def _get_create_table(self, table):
         res = self.database.execute_sql(
             ('select name, sql from sqlite_master '
@@ -747,7 +744,8 @@ class SqliteMigrator(SchemaMigrator):
         new_column_defs = []
         new_column_names = []
         original_column_names = []
-        constraint_terms = ('foreign ', 'primary ', 'constraint ', 'check ')
+        constraint_terms = ('foreign ', 'primary ', 'constraint ', 'check ',
+                            'unique ')
 
         for column_def in column_defs:
             column_name, = self.column_name_re.match(column_def).groups()
@@ -792,7 +790,7 @@ class SqliteMigrator(SchemaMigrator):
 
         # Update the name of the new CREATE TABLE query.
         temp_table = table + '__tmp__'
-        rgx = re.compile(r'("?)%s("?)' % re.escape(table), re.I)
+        rgx = re.compile(r'("?)%s("?)\s*$' % re.escape(table), re.I)
         create = rgx.sub(
             r'\1%s\2' % temp_table,
             raw_create)
@@ -892,7 +890,6 @@ class SqliteMigrator(SchemaMigrator):
                 r'\g<1>%s\1' % new_name,
                 column_def,
                 count=1)
-            return column_def.replace(column_name, new_name)
         return self._update_column(table, old_name, _rename)
 
     @operation

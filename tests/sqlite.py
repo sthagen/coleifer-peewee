@@ -8,8 +8,6 @@ from peewee import sqlite3
 from playhouse.sqlite_ext import *
 
 from .base import BaseTestCase
-from .base import IS_SQLITE_37
-from .base import IS_SQLITE_9
 from .base import ModelTestCase
 from .base import TestModel
 from .base import get_in_memory_db
@@ -17,6 +15,7 @@ from .base import get_sqlite_db
 from .base import requires_models
 from .base import skip_if
 from .base import skip_unless
+from .base import skip_unless_db
 from .base_models import Person
 from .base_models import Tweet
 from .base_models import User
@@ -90,7 +89,7 @@ class ContentPost(FTSModel, Post):
 class ContentPostMessage(FTSModel, TestModel):
     message = TextField()
     class Meta:
-        options = {'tokenize': 'porter', 'content': Post.message}
+        options = {'tokenize': 'porter', 'content': Post}
 
 
 class Document(FTSModel, TestModel):
@@ -141,6 +140,72 @@ class FTS5Document(FTS5Model):
     message = SearchField()
     class Meta:
         options = {'tokenize': 'porter'}
+
+
+class ContentPost5(FTS5Model):
+    message = SearchField()
+    class Meta:
+        options = {'content': Post, 'content_rowid': Post.id}
+
+
+class FTS5Contentless(FTS5Model):
+    title = SearchField()
+    data = SearchField()
+    class Meta:
+        legacy_table_names = False
+        options = {'content': '', 'contentless_delete': 1}
+
+
+class FTS5ContentlessUnindexed(FTS5Model):
+    title = SearchField()
+    meta = SearchField(unindexed=True)
+    class Meta:
+        legacy_table_names = False
+        options = {
+            'content': '',
+            'contentless_delete': 1,
+            'contentless_unindexed': 1}
+
+    @classmethod
+    def drop_table(cls, *args, **kwargs):
+        super(FTS5ContentlessUnindexed, cls).drop_table(*args, **kwargs)
+        # Sqlite drop of a contentless_unindexed fts5 table (thru at least
+        # 3.54) orphans the _content shadow table, breaking re-creation.
+        cls._meta.database.execute_sql(
+            'DROP TABLE IF EXISTS "%s_content"' % cls._meta.table_name)
+
+
+class FTS5DeleteCommand(FTS5Model):
+    # Contentless, with the attribute name mapped to a different column.
+    body = SearchField(column_name='msg')
+    note = SearchField(unindexed=True)
+    class Meta:
+        legacy_table_names = False
+        options = {'content': ''}
+
+
+FTS5Vocab = FTS5Test.VocabModel()
+FTS5VocabCol = FTS5Test.VocabModel('col')
+FTS5VocabInstance = FTS5Test.VocabModel('instance')
+
+
+class SearchWeight(FTSModel, TestModel):
+    # FTS4 model for exercising dict-form search weights. The implicit `rowid`
+    # primary-key precedes these content columns.
+    title = SearchField()
+    body = SearchField()
+    class Meta:
+        options = {'tokenize': 'porter'}
+
+
+class SearchWeight5(FTS5Model):
+    # FTS5 model with an UNINDEXED column *between* two indexed columns, so a
+    # mis-placed weight is observable in the ranking.
+    title = SearchField()
+    extra = SearchField(unindexed=True)
+    body = SearchField()
+    class Meta:
+        legacy_table_names = False
 
 
 class DT(TestModel):
@@ -741,17 +806,17 @@ class TestFullTextSearch(BaseFTSTestCase, ModelTestCase):
     @requires_models(Document)
     def test_fts_insert_or_replace(self):
         # We can use replace to create a new row.
-        n = Document.replace(docid=100, message='m100').execute()
+        n = Document.replace(rowid=100, message='m100').execute()
         self.assertEqual(n, 100)
         self.assertEqual(Document.select().count(), 1)
 
         # We can use replace to update an existing row.
-        n = Document.replace(docid=100, message='x100').execute()
+        n = Document.replace(rowid=100, message='x100').execute()
         self.assertEqual(n, 100)
         self.assertEqual(Document.select().count(), 1)
 
         # Adds a new row.
-        n = Document.replace(docid=101, message='x101').execute()
+        n = Document.replace(rowid=101, message='x101').execute()
         self.assertEqual(n, 101)
         self.assertEqual(Document.select().count(), 2)
 
@@ -765,7 +830,7 @@ class TestFullTextSearch(BaseFTSTestCase, ModelTestCase):
         query = (Document
                  .select()
                  .where(Document.match('believe'))
-                 .order_by(Document.docid))
+                 .order_by(Document.rowid))
         self.assertMessages(query, [0, 3])
 
         query = Document.search('believe')
@@ -804,12 +869,12 @@ class TestFullTextSearch(BaseFTSTestCase, ModelTestCase):
         query = (ContentPost
                  .select(ContentPost, ContentPost.rank().alias('score'))
                  .where(ContentPost.match('believe'))
-                 .order_by(ContentPost.docid))
+                 .order_by(ContentPost.rowid))
         self.assertMessages(query, [0, 3])
 
         query = (ContentPost
-                 .select(ContentPost.docid)
-                 .order_by(ContentPost.docid))
+                 .select(ContentPost.rowid)
+                 .order_by(ContentPost.rowid))
         for content_post in query:
             self.assertEqual(content_post.delete_instance(), 1)
 
@@ -945,25 +1010,25 @@ class TestFullTextSearch(BaseFTSTestCase, ModelTestCase):
         pq = (ModelClass
               .select()
               .where(ModelClass.match('faith'))
-              .order_by(ModelClass.docid))
+              .order_by(ModelClass.rowid))
         self.assertMessages(pq, range(len(self.messages)))
 
         pq = (ModelClass
               .select()
               .where(ModelClass.match('believe'))
-              .order_by(ModelClass.docid))
+              .order_by(ModelClass.rowid))
         self.assertMessages(pq, [0, 3])
 
         pq = (ModelClass
               .select()
               .where(ModelClass.match('thin*'))
-              .order_by(ModelClass.docid))
+              .order_by(ModelClass.rowid))
         self.assertMessages(pq, [2, 4])
 
         pq = (ModelClass
               .select()
               .where(ModelClass.match('"it is"'))
-              .order_by(ModelClass.docid))
+              .order_by(ModelClass.rowid))
         self.assertMessages(pq, [2, 3])
 
         pq = ModelClass.search('things', with_score=True)
@@ -986,7 +1051,7 @@ class TestFullTextSearch(BaseFTSTestCase, ModelTestCase):
     def test_fts_auto_model(self):
         self._test_fts_auto(ContentPost)
 
-    def test_fts_auto_field(self):
+    def test_fts_auto_table_name(self):
         self._test_fts_auto(ContentPostMessage)
 
     def test_weighting(self):
@@ -1027,6 +1092,36 @@ class TestFullTextSearch(BaseFTSTestCase, ModelTestCase):
         assertResults(MultiColumn.search_bm25, 'bbbbb', [1., -1., 0.], [
             (1, -0.),
             (2, 0.85)])
+
+    @requires_models(SearchWeight)
+    def test_search_dict_weights(self):
+        # Regression: the dict form of `weights` iterated *all* sorted_fields,
+        # so the rowid PK prepended a phantom weight and shifted every column
+        # by one (IndexError with the Python ranking UDF, silent mis-scoring
+        # with the Cython one). It must behave exactly like the list form.
+        SearchWeight.create(title='alpha alpha', body='common words')  # 1
+        SearchWeight.create(title='common words', body='alpha alpha')  # 2
+        SearchWeight.create(title='common', body='words')              # 3
+
+        def results(weights):
+            return [(x.rowid, round(x.score, 5)) for x in
+                    SearchWeight.search_bm25('alpha', weights=weights,
+                                             with_score=True)]
+
+        # Weighting the title 3x ranks the title match (rowid 1) ahead of the
+        # body match (rowid 2); the dict forms must match the list form
+        # exactly.
+        by_list = results([3., 1.])
+        self.assertEqual([rowid for rowid, _ in by_list], [1, 2])
+        self.assertEqual(
+            results({SearchWeight.title: 3., SearchWeight.body: 1.}),
+            by_list)
+        self.assertEqual(results({'title': 3., 'body': 1.}), by_list)
+
+        # Weighting the body instead flips the ranking -- proof the weights
+        # land on the intended columns rather than being shifted.
+        self.assertEqual(
+            [rowid for rowid, _ in results({'body': 3., 'title': 1.})], [2, 1])
 
     def test_fts_match_single_column(self):
         data = (
@@ -1226,6 +1321,9 @@ class TestFTS5(BaseFTSTestCase, ModelTestCase):
             'INSERT INTO "fts5_test" ("fts5_test", "rank") VALUES (?, ?)'),
             ['merge', 4])
         FTS5Test.merge(4)  # Runs without error.
+        FTS5Test.automerge(64)  # fts5 accepts levels up to 64.
+        self.assertRaises(ValueError, FTS5Test.automerge, 65)
+        self.assertRaises(ValueError, FTS5Test.automerge, -1)
 
         FTS5Test.insert_many([{'title': 'k%08d' % i, 'data': 'v%08d' % i}
                               for i in range(100)]).execute()
@@ -1254,6 +1352,20 @@ class TestFTS5(BaseFTSTestCase, ModelTestCase):
             'content="post", content_rowid="id", '
             'prefix=\'2,3\', tokenize="porter unicode61")'), [])
 
+        # fts5 must accept the generated DDL (content tbl resolved lazily).
+        self.database.create_tables([Test1])
+        self.database.drop_tables([Test1])
+
+    def test_content_option_rejects_field(self):
+        class BadIndex(FTS5Model):
+            message = SearchField()
+
+            class Meta:
+                database = self.database
+                options = {'content': Post.message}
+
+        self.assertRaises(ImproperlyConfigured, BadIndex._schema._create_table)
+
     def assertResults(self, query, expected, scores=False, alias='score'):
         if scores:
             results = [(obj.title, round(getattr(obj, alias), 7))
@@ -1272,6 +1384,29 @@ class TestFTS5(BaseFTSTestCase, ModelTestCase):
 
         self.assertResults(FTS5Test.search('baze OR dd'),
                            ['baze cc dd', 'bar bb cc', 'nug aa dd'])
+
+    @requires_models(SearchWeight5)
+    def test_search_dict_weights_unindexed(self):
+        # Regression: FTS5 bm25() weights are positional across *all* columns,
+        # including UNINDEXED ones. The dict form skipped unindexed columns, so
+        # with `extra` UNINDEXED between `title` and `body` a weight on `body`
+        # was mis-applied to `extra`. It must behave exactly like the list form.
+        SearchWeight5.create(title='alpha', extra='junk', body='common')  # rowid 1
+        SearchWeight5.create(title='common', extra='junk', body='alpha')  # rowid 2
+
+        def order(weights):
+            return [x.rowid for x in
+                    SearchWeight5.search_bm25('alpha', weights=weights)]
+
+        # Positional list over (title, extra, body): weighting body ranks the
+        # body match (rowid 2) first. The dict forms must match.
+        by_list = order([1., 1., 5.])
+        self.assertEqual(by_list, [2, 1])
+        self.assertEqual(order({SearchWeight5.body: 5.}), by_list)
+        self.assertEqual(order({'body': 5.}), by_list)
+        # Equal weights leave the default ordering (proof body-weighting above
+        # actually changed it).
+        self.assertEqual(order([1., 1., 1.]), [1, 2])
 
     @requires_models(FTS5Document)
     def test_fts_manual(self):
@@ -1398,6 +1533,145 @@ class TestFTS5(BaseFTSTestCase, ModelTestCase):
             'bb cc [dd] bb cc...',
             'bb cc bb cc bb...'])
 
+    @requires_models(Post, ContentPost5)
+    def test_fts5_external_content(self):
+        for message in self.messages:
+            Post.create(message=message)
+        ContentPost5.rebuild()
+        ContentPost5.integrity_check(rank=1)
+
+        query = ContentPost5.select().where(ContentPost5.match('faith'))
+        self.assertEqual(sorted(r.rowid for r in query), [1, 2, 4, 5])
+
+        # Column values are read through from the content table.
+        query = ContentPost5.search('nothing')
+        self.assertEqual([r.message for r in query], [self.messages[0]])
+
+        # Out-of-band update: the index is stale but reads are current.
+        Post.update(message='replaced entirely').where(Post.id == 1).execute()
+        query = ContentPost5.select().where(ContentPost5.match('nothing'))
+        self.assertEqual([(r.rowid, r.message) for r in query],
+                         [(1, 'replaced entirely')])
+
+        ContentPost5.integrity_check(rank=0)  # Does not verify content.
+        self.assertRaises(DatabaseError, ContentPost5.integrity_check, 1)
+
+        # Resync using the fts5 delete command w/the old values.
+        ContentPost5._fts_cmd('delete', rowid=1, message=self.messages[0])
+        ContentPost5.insert({'rowid': 1, 'message': 'replaced entirely'}).execute()
+        ContentPost5.integrity_check(rank=1)
+        query = ContentPost5.select().where(ContentPost5.match('faith'))
+        self.assertEqual(sorted(r.rowid for r in query), [2, 4, 5])
+
+    @requires_models(Post, ContentPost5)
+    def test_fts5_delete_command_external(self):
+        for message in self.messages:
+            Post.create(message=message)
+        ContentPost5.rebuild()
+
+        # Remove a row whose content row is already gone, supplying the
+        # values as they were indexed.
+        Post.delete_by_id(1)
+        ContentPost5.delete_command(1, message=self.messages[0])
+        ContentPost5.integrity_check(rank=1)
+        query = ContentPost5.select().where(ContentPost5.match('faith'))
+        self.assertEqual(sorted(r.rowid for r in query), [2, 4, 5])
+
+        # An update is the delete command w/the old values followed by a
+        # plain insert of the new ones.
+        Post.update(message='changed entirely').where(Post.id == 2).execute()
+        ContentPost5.delete_command(2, message=self.messages[1])
+        ContentPost5.insert({'rowid': 2, 'message': 'changed entirely'}).execute()
+        ContentPost5.integrity_check(rank=1)
+        query = ContentPost5.select().where(ContentPost5.match('changed'))
+        self.assertEqual([(r.rowid, r.message) for r in query],
+                         [(2, 'changed entirely')])
+        query = ContentPost5.select().where(ContentPost5.match('faith'))
+        self.assertEqual(sorted(r.rowid for r in query), [4, 5])
+
+        # All indexed columns are required and unknown columns are rejected.
+        # Either mistake would otherwise corrupt the index silently.
+        self.assertRaises(ValueError, ContentPost5.delete_command, 3)
+        self.assertRaises(ValueError, ContentPost5.delete_command, 3,
+                          message=self.messages[2], other='x')
+        ContentPost5.integrity_check(rank=1)
+
+    @requires_models(FTS5DeleteCommand)
+    def test_fts5_delete_command_contentless(self):
+        FD = FTS5DeleteCommand
+        FD.insert({'rowid': 1, 'body': 'alpha beta', 'note': 'x'}).execute()
+        FD.insert({'rowid': 2, 'body': 'beta gamma', 'note': 'y'}).execute()
+
+        # Plain DELETE is refused on a contentless table, but the delete
+        # command works when the original values are supplied. The attribute
+        # name maps to the underlying column and unindexed columns may be
+        # omitted.
+        self.assertRaises(OperationalError,
+                          FD.delete().where(FD.rowid == 1).execute)
+        FD.delete_command(1, body='alpha beta')
+        self.assertEqual([r.rowid for r in FD.search('beta')], [2])
+        FD.integrity_check()
+
+    @skip_unless_db(lambda db: db.server_version >= (3, 43), 'sqlite >= 3.43')
+    @requires_models(FTS5Contentless)
+    def test_fts5_contentless_delete(self):
+        FC = FTS5Contentless
+        FC.insert({'rowid': 1, 'title': 'alpha one', 'data': 'first'}).execute()
+        FC.insert({'rowid': 2, 'title': 'beta two', 'data': 'second'}).execute()
+
+        # Only the rowid is stored, other columns select as NULL.
+        query = FC.search('alpha')
+        self.assertEqual([(r.rowid, r.title) for r in query], [(1, None)])
+
+        self.assertEqual(FC.delete().where(FC.rowid == 1).execute(), 1)
+        self.assertEqual([r.rowid for r in FC.search('alpha')], [])
+
+        # Updates must assign all indexed columns together.
+        FC.update(title='beta renamed', data='2nd').where(FC.rowid == 2).execute()
+        self.assertEqual([r.rowid for r in FC.search('renamed')], [2])
+        self.assertRaises(
+            OperationalError,
+            FC.update(title='partial').where(FC.rowid == 2).execute)
+
+    @skip_unless_db(lambda db: db.server_version >= (3, 47), 'sqlite >= 3.47')
+    @requires_models(FTS5ContentlessUnindexed)
+    def test_fts5_contentless_unindexed(self):
+        FC = FTS5ContentlessUnindexed
+        FC.insert({'rowid': 1, 'title': 'hello world', 'meta': 'kept'}).execute()
+        query = FC.search('hello')
+        self.assertEqual([(r.rowid, r.title, r.meta) for r in query],
+                         [(1, None, 'kept')])
+
+        # Stored unindexed columns may be updated independently.
+        FC.update(meta='changed').where(FC.rowid == 1).execute()
+        self.assertEqual([r.meta for r in FC.select()], ['changed'])
+
+    @requires_models(FTS5Vocab, FTS5VocabCol, FTS5VocabInstance)
+    def test_vocab_model(self):
+        self.assertEqual(
+            [v._meta.table_name
+             for v in (FTS5Vocab, FTS5VocabCol, FTS5VocabInstance)],
+            ['fts5_test_v', 'fts5_test_v_col', 'fts5_test_v_instance'])
+
+        query = FTS5Vocab.select().order_by(FTS5Vocab.term)
+        self.assertEqual([(v.term, v.doc, v.cnt) for v in query], [
+            ('aa', 2, 12), ('bar', 1, 1), ('baze', 1, 1), ('bb', 3, 28),
+            ('cc', 4, 36), ('dd', 3, 19), ('ee', 1, 8), ('foo', 1, 1),
+            ('nug', 1, 1)])
+
+        query = (FTS5VocabCol
+                 .select()
+                 .where(FTS5VocabCol.term == 'aa')
+                 .order_by(FTS5VocabCol.col))
+        self.assertEqual([(v.term, v.col, v.doc, v.cnt) for v in query],
+                         [('aa', 'data', 1, 10), ('aa', 'title', 2, 2)])
+
+        query = (FTS5VocabInstance
+                 .select()
+                 .where(FTS5VocabInstance.term == 'foo'))
+        self.assertEqual([(v.term, v.doc, v.col, v.offset) for v in query],
+                         [('foo', 1, 'title', 0)])
+
     def test_clean_query(self):
         cases = (
             ('test', 'test'),
@@ -1458,18 +1732,34 @@ class TestUserDefinedCallbacks(ModelTestCase):
         for i in [1, 4, 3, 5, 2]:
             Post.create(message='p%d' % i)
 
-        pq = Post.select().order_by(NodeList((Post.message, SQL('collate collate_reverse'))))
-        self.assertEqual([p.message for p in pq], ['p5', 'p4', 'p3', 'p2', 'p1'])
+        pq = Post.select().order_by(Post.message.collate('collate_reverse'))
+        self.assertEqual([p.message for p in pq],
+                         ['p5', 'p4', 'p3', 'p2', 'p1'])
+
+        pq = Post.select().order_by(
+            Post.message.asc(collation='collate_reverse'))
+        self.assertEqual([p.message for p in pq],
+                         ['p5', 'p4', 'p3', 'p2', 'p1'])
+
+        pq = Post.select().order_by(
+            Post.message.desc(collation='collate_reverse'))
+        self.assertEqual([p.message for p in pq],
+                         ['p1', 'p2', 'p3', 'p4', 'p5'])
 
     def test_collation_decorator(self):
-        posts = [Post.create(message=m) for m in ['aaa', 'Aab', 'ccc', 'Bba', 'BbB']]
-        pq = Post.select().order_by(collate_case_insensitive.collation(Post.message))
-        self.assertEqual([p.message for p in pq], [
-            'aaa',
-            'Aab',
-            'Bba',
-            'BbB',
-            'ccc'])
+        posts = [Post.create(message=m)
+                 for m in ['aaa', 'Aab', 'ccc', 'Bba', 'BbB']]
+        exprs = (
+            Post.message.collate('collate_case_insensitive'),
+            Post.message.asc(collation='collate_case_insensitive'))
+        for expr in exprs:
+            pq = Post.select().order_by(expr)
+            self.assertEqual([p.message for p in pq], [
+                'aaa',
+                'Aab',
+                'Bba',
+                'BbB',
+                'ccc'])
 
     def test_custom_function(self):
         p1 = Post.create(message='this is a test')
@@ -1700,6 +1990,12 @@ class KVR(TestModel):
     key = TextField(primary_key=True)
     value = IntegerField()
 
+class KVC(TestModel):
+    key = TextField()
+    value = IntegerField()
+    class Meta:
+        primary_key = CompositeKey('key', 'value')
+
 
 @skip_unless(database.server_version >= (3, 35, 0), 'sqlite returning clause required')
 class TestSqliteReturning(ModelTestCase):
@@ -1789,7 +2085,7 @@ class TestSqliteReturning(ModelTestCase):
 @skip_unless(database.server_version >= (3, 35, 0), 'sqlite returning clause required')
 class TestSqliteReturningConfig(ModelTestCase):
     database = SqliteDatabase(':memory:', returning_clause=True)
-    requires = [KVR, User]
+    requires = [KVC, KVR, User]
 
     def test_pk_set_properly(self):
         user = User.create(username='u1')
@@ -1805,12 +2101,10 @@ class TestSqliteReturningConfig(ModelTestCase):
         iq = User.insert_many([{'username': 'u2'}, {'username': 'u3'}])
         self.assertEqual(list(iq.execute()), [(2,), (3,)])
 
-        # NOTE: sqlite3_changes() does not return the inserted rowcount until
-        # the statement has been consumed. The fact that it returned 2 is a
-        # side-effect of the statement cache and our having consumed the query
-        # in the previous test assertion. So this test is invalid.
-        #iq = User.insert_many([('u4',), ('u5',)]).as_rowcount()
-        #self.assertEqual(iq.execute(), 2)
+        # as_rowcount() suppresses the implicit RETURNING, so the driver
+        # rowcount is valid here.
+        iq = User.insert_many([('u4',), ('u5',)]).as_rowcount()
+        self.assertEqual(iq.execute(), 2)
 
         iq = KVR.insert({'key': 'k1', 'value': 1})
         self.assertEqual(iq.execute(), 'k1')
@@ -1818,9 +2112,18 @@ class TestSqliteReturningConfig(ModelTestCase):
         iq = KVR.insert_many([('k2', 2), ('k3', 3)])
         self.assertEqual(list(iq.execute()), [('k2',), ('k3',)])
 
-        # See note above.
-        #iq = KVR.insert_many([('k4', 4), ('k5', 5)]).as_rowcount()
-        #self.assertEqual(iq.execute(), 2)
+        iq = KVR.insert_many([('k4', 4), ('k5', 5)]).as_rowcount()
+        self.assertEqual(iq.execute(), 2)
+
+    def test_insert_composite_pk(self):
+        iq = KVC.insert({'key': 'k1', 'value': 1})
+        self.assertEqual(iq.execute(), ('k1', 1))
+
+        iq = KVC.insert_many([('k2', 2), ('k3', 3)])
+        self.assertEqual(list(iq.execute()), [('k2', 2), ('k3', 3)])
+
+        iq = KVC.insert_many([('k4', 4), ('k5', 5)]).as_rowcount()
+        self.assertEqual(iq.execute(), 2)
 
     def test_insert_on_conflict(self):
         KVR.create(key='k1', value=1)
@@ -1840,6 +2143,16 @@ class TestSqliteReturningConfig(ModelTestCase):
         self.assertEqual(list(iq.execute()), [('k1',), ('k2',), ('k3',)])
         self.assertEqual(sorted(KVR.select().tuples()),
                          [('k1', 21), ('k2', 12), ('k3', 300)])
+
+    def test_insert_ignored_returns_none(self):
+        KVR.create(key='k1', value=1)
+        iq = KVR.insert({'key': 'k1', 'value': 100}).on_conflict_ignore()
+        self.assertTrue(iq.execute() is None)
+        self.assertEqual(KVR.get(KVR.key == 'k1').value, 1)
+
+        iq = KVC.insert({'key': 'k1', 'value': 1})
+        self.assertEqual(iq.execute(), ('k1', 1))
+        self.assertTrue(iq.clone().on_conflict_ignore().execute() is None)
 
     def test_update_delete_rowcounts(self):
         users = [User.create(username=u) for u in 'abc']
@@ -1939,6 +2252,7 @@ class TestDeterministicFunction(ModelTestCase):
                     SQL('create unique index "reg_pylower_key" '
                         'on "reg" (pylower("key"))')]
 
+        db.drop_tables([Reg])
         db.create_tables([Reg])
         Reg.create(key='k1')
         with self.assertRaises(IntegrityError):
@@ -1971,6 +2285,21 @@ class TestISODateTimeField(ModelTestCase):
 
         raw = self.database.execute_sql('select * from dt').fetchone()
         self.assertEqual(raw, ('k1', str(d1), d2.isoformat()))
+
+    def test_string_input(self):
+        d_obj = datetime.datetime(2026, 1, 2, 3, 4, 5)
+        DT.create(key='k2', d='2026-01-02 03:04:05',
+                  iso='2026-01-02 03:04:05')
+        dt = DT['k2']
+        self.assertEqual(dt.iso, d_obj)
+
+        # String input is normalized to isoformat on write.
+        raw = self.database.execute_sql(
+            'select iso from dt where key = ?', ('k2',)).fetchone()
+        self.assertEqual(raw, ('2026-01-02T03:04:05',))
+
+        query = DT.select().where(DT.iso >= '2026-01-01')
+        self.assertEqual([d.key for d in query], ['k2'])
 
 #
 # If we have cysqlite, let's run tests on it.
@@ -2016,3 +2345,8 @@ else:
             'database': cysqlite_database,
         })
         locals()[new_name] = klass
+
+    @skip_unless(cysqlite_database.server_version >= (3, 35, 0),
+                 'sqlite returning clause required')
+    class TestSqliteReturningConfigCySqlite(TestSqliteReturningConfig):
+        database = CySqliteDatabase(':memory:', returning_clause=True)

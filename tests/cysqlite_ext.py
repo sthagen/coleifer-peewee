@@ -225,8 +225,7 @@ class DataTypes(cysqlite.TableFunction):
         raise StopIteration
 
 
-@skip_unless(cysqlite.sqlite_version_info >= (3, 9), 'requires sqlite >= 3.9')
-class TestDataTypesTableFunction(CyDatabaseTestCase):
+class TestCySqliteTableFunction(CyDatabaseTestCase):
     database = db_loader('cysqlite')
 
     def test_data_types_table_function(self):
@@ -247,3 +246,38 @@ class TestDataTypesTableFunction(CyDatabaseTestCase):
             # Ensure table re-registered after close.
             self.database.close()
             self.database.connect()
+
+    def _values(self, sql, *params):
+        return [row for row, in self.execute(sql, *params)]
+
+    def test_plain_function(self):
+        def series(start, stop, step=1):
+            i = start
+            while i < stop:
+                yield (i,)
+                i += step
+
+        self.database.register_table_function(series, columns=['value'])
+        self.assertEqual(self._values('SELECT value FROM series(0, 5)'),
+                         [0, 1, 2, 3, 4])
+
+        # Registration is replayed on reconnect.
+        self.database.close()
+        self.database.connect()
+        self.assertEqual(self._values('SELECT value FROM series(0, 10, 3)'),
+                         [0, 3, 6, 9])
+
+        self.assertTrue(self.database.unregister_table_function('series'))
+        self.database.close()
+        self.database.connect()
+        self.assertRaises(OperationalError, self.execute,
+                          'SELECT value FROM series(0, 5)')
+
+    def test_decorator(self):
+        @self.database.table_function(name='seq', columns=['n'])
+        def gen(stop):
+            return [(i,) for i in range(stop)]
+
+        self.assertEqual(self._values('SELECT n FROM seq(3)'), [0, 1, 2])
+        # The decorator returns the original callable.
+        self.assertEqual(gen(2), [(0,), (1,)])

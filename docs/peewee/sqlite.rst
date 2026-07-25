@@ -34,6 +34,7 @@ Implementations
    * Commit / Rollback / Update / Progress / Trace hooks
    * BLOB I/O
    * Online backups
+   * Supports fully self-contained builds.
    * Can be built `with encryption <https://cysqlite.readthedocs.io/en/latest/installation.html#sqlcipher>`__.
 
 :class:`~playhouse.apsw_ext.APSWDatabase` (``playhouse.apsw_ext``)
@@ -142,7 +143,7 @@ Collations
    * :meth:`SqliteDatabase.collation` - decorator.
 
 Table Functions
-   User-defined tables (requres ``cysqlite``).
+   User-defined tables (requires ``cysqlite``).
 
    * :meth:`.CySqliteDatabase.register_table_function`
    * :meth:`.CySqliteDatabase.table_function` - decorator.
@@ -208,8 +209,7 @@ User-defined aggregates must define two methods:
 Window function example
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-User-defined window functions are simply aggregates with two additional
-methods:
+User-defined window functions are aggregates with two additional methods:
 
 * ``step(*values)`` - called for each row being aggregated.
 * ``inverse(*values)`` - "invert" the effect of a call to ``step(*values)``.
@@ -218,10 +218,7 @@ methods:
 
 .. code-block:: python
 
-   # Window functions are normal aggregates with two additional methods:
-   # inverse(value) - Perform the inverse of step(value).
-   # value() - Report value at current step.
-   @db.aggregate('mysum')
+   @db.window_function('mysum')
    class MySum(object):
        def __init__(self):
            self._value = 0
@@ -261,20 +258,46 @@ ordered (e.g. ``cmp(lhs, rhs)``).
    Book.select().order_by(collate_reverse.collation(Book.title))
 
    # Or...
-   Book.select().order_by(Book.title.asc(collation='reverse'))
+   Book.select().order_by(Book.title.asc(collation='ireverse'))
 
 Table function example
 ^^^^^^^^^^^^^^^^^^^^^^
 
-Example user-defined table-value function (see `cysqlite TableFunction docs <https://cysqlite.readthedocs.io/en/latest/api.html#tablefunction>`_
-for full details on ``TableFunction``).
+The simplest table function is a plain function or generator. It is called
+once per query with the SQL arguments and returns an iterable of row tuples.
+Parameters are taken from the function signature. A parameter with a Python
+default is optional in SQL.
+
+.. code-block:: python
+
+   from playhouse.cysqlite_ext import CySqliteDatabase
+
+   db = CySqliteDatabase('my_app.db')
+
+   @db.table_function(columns=['value'])
+   def series(start, stop, step=1):
+       i = start
+       while i < stop:
+           yield (i,)
+           i += step
+
+   cursor = db.execute_sql('SELECT value FROM series(0, 5, 2)')
+   print([value for value, in cursor])
+   # [0, 2, 4]
+
+   # step falls back to its default of 1.
+   cursor = db.execute_sql('SELECT value FROM series(0, 3)')
+   print([value for value, in cursor])
+   # [0, 1, 2]
+
+For writable tables, ``with_rowid``, or full control over the per-query
+lifecycle, subclass ``cysqlite.TableFunction`` (see `cysqlite TableFunction
+docs <https://cysqlite.readthedocs.io/en/latest/api.html#tablefunction>`_) and
+register it the same way. The equivalent of the above:
 
 .. code-block:: python
 
    from cysqlite import TableFunction
-   from playhouse.cysqlite_ext import CySqliteDatabase
-
-   db = CySqliteDatabase('my_app.db')
 
    @db.table_function('series')
    class Series(TableFunction):
@@ -282,37 +305,19 @@ for full details on ``TableFunction``).
        params = ['start', 'stop', 'step']
 
        def initialize(self, start=0, stop=None, step=1):
-           """
-           Table-functions declare an initialize() method, which is
-           called with whatever arguments the user has called the
-           function with.
-           """
+           # Called once per query, with the SQL arguments.
            self.start = self.current = start
-           self.stop = stop or float('Inf')
+           self.stop = stop if stop is not None else float('Inf')
            self.step = step
 
        def iterate(self, idx):
-           """
-           Iterate is called repeatedly by the SQLite database engine
-           until the required number of rows has been read **or** the
-           function raises a `StopIteration` signalling no more rows
-           are available.
-           """
-           if self.current > self.stop:
+           # Called for each row. Raise StopIteration when done.
+           if ((self.step > 0 and self.current > self.stop) or
+               (self.step < 0 and self.current < self.stop)):
                raise StopIteration
 
            ret, self.current = self.current, self.current + self.step
            return (ret,)
-
-   # Usage:
-   cursor = db.execute_sql('SELECT * FROM series(?, ?, ?)', (0, 5, 2))
-   for value, in cursor:
-       print(value)
-
-   # Prints:
-   # 0
-   # 2
-   # 4
 
 Shared Libraries
 ^^^^^^^^^^^^^^^^
@@ -393,6 +398,9 @@ Installation:
 
    pip install cysqlite
 
+Detailed instructions on building self-contained ``cysqlite`` modules and
+encryption support are described on the `cysqlite install guide <https://cysqlite.readthedocs.io/en/latest/installation.html>`_.
+
 Usage:
 
 .. code-block:: python
@@ -407,7 +415,7 @@ Usage:
 
 .. class:: CySqliteDatabase(database, **kwargs)
 
-   :param list pragmas: A list of 2-tuples containing pragma key and value to
+   :param pragmas: A dict (or list of 2-tuples) of pragma key/value pairs to
        set every time a connection is opened.
    :param timeout: Set the busy-timeout on the SQLite driver (in seconds).
    :param bool rank_functions: Make search result ranking functions available.
@@ -415,7 +423,7 @@ Usage:
    :param bool regexp_function: Make the REGEXP function available.
 
    .. seealso::
-      CySqliteDatabase extends :class:`SqliteDatabase` and inherits all
+      ``CySqliteDatabase`` extends :class:`SqliteDatabase` and inherits all
       methods for declaring user-defined functions, aggregates, window
       functions, collations, pragmas, etc.
 
@@ -425,69 +433,23 @@ Usage:
 
        db = CySqliteDatabase('app.db', pragmas={'journal_mode': 'wal'})
 
-   .. method:: table_function(name)
+   .. method:: table_function(name=None, columns=None, params=None)
 
-      Class-decorator for registering a ``cysqlite.TableFunction``. Table
-      functions are user-defined functions that, rather than returning a
-      single, scalar value, can return any number of rows of tabular data.
+      Decorator for registering a table function. Table functions are
+      user-defined functions that, rather than returning a single, scalar
+      value, can return any number of rows of tabular data. Accepts a plain
+      callable or generator, or a ``cysqlite.TableFunction`` subclass for
+      writable tables and full control over the per-query lifecycle. For a
+      plain callable ``columns`` is required, and the SQL parameters are
+      taken from the function signature.
 
-      See `cysqlite docs <https://cysqlite.readthedocs.io/en/latest/api.html#tablefunction>`__ for details on
-      ``TableFunction`` API.
+      See `Table function example`_ above, and `cysqlite docs <https://cysqlite.readthedocs.io/en/latest/api.html#tablefunction>`__
+      for the full ``TableFunction`` API.
 
-      .. code-block:: python
+   .. method:: register_table_function(klass, name=None, columns=None, params=None)
 
-         from cysqlite import TableFunction
-
-         @db.table_function('series')
-         class Series(TableFunction):
-             columns = ['value']
-             params = ['start', 'stop', 'step']
-
-             def initialize(self, start=0, stop=None, step=1):
-                 """
-                 Table-functions declare an initialize() method, which is
-                 called with whatever arguments the user has called the
-                 function with.
-                 """
-                 self.start = self.current = start
-                 self.stop = stop or float('Inf')
-                 self.step = step
-
-             def iterate(self, idx):
-                 """
-                 Iterate is called repeatedly by the SQLite database engine
-                 until the required number of rows has been read **or** the
-                 function raises a `StopIteration` signalling no more rows
-                 are available.
-                 """
-                 if self.current > self.stop:
-                     raise StopIteration
-
-                 ret, self.current = self.current, self.current + self.step
-                 return (ret,)
-
-         cursor = db.execute_sql('SELECT * FROM series(?, ?, ?)', (0, 5, 2))
-         for (value,) in cursor:
-             print(value)
-
-         # Prints:
-         # 0
-         # 2
-         # 4
-
-   .. method:: register_table_function(klass, name)
-
-      :param TableFunction klass: class implementing TableFunction API.
-      :param str name: name for user-defined table function.
-
-      Register a ``cysqlite.TableFunction`` class with the connection. Table
-      functions are user-defined functions that, rather than returning a
-      single, scalar value, can return any number of rows of tabular data.
-
-      .. seealso::
-         * :meth:`CySqliteDatabase.table_function` for example implementation.
-         * `cysqlite docs <https://cysqlite.readthedocs.io/en/latest/api.html#tablefunction>`__
-           for details on ``TableFunction`` API.
+      Non-decorator form of :meth:`CySqliteDatabase.table_function`.
+      Registrations are replayed each time a new connection is opened.
 
    .. method:: unregister_table_function(name)
 
@@ -504,8 +466,8 @@ Usage:
       on the current connection. The callback accepts no parameters and the
       return value is ignored.
 
-      However, if the callback raises a :class:`ValueError`, the
-      transaction will be aborted and rolled-back.
+      If the callback raises a :class:`ValueError`, the transaction is
+      aborted and rolled back.
 
       Example:
 
@@ -585,7 +547,7 @@ Usage:
 
       More details can be found in the `cysqlite docs <https://cysqlite.readthedocs.io/en/latest/api.html#Connection.authorizer>`__.
 
-   .. method:: trace(fn, mask=2, expand_sql=True):
+   .. method:: trace(fn, mask=2, expand_sql=True)
 
       :param fn: callable or ``None`` to clear the current trace hook.
       :param int mask: mask of what types of events to trace. Default value
@@ -631,6 +593,12 @@ Usage:
 
       More details can be found in the `cysqlite docs <https://cysqlite.readthedocs.io/en/latest/api.html#Connection.progress>`__.
 
+   .. method:: begin(lock_type='deferred')
+
+      Begin a transaction, optionally specifying the lock type, one of
+      ``deferred``, ``immediate`` or ``exclusive``. See
+      :ref:`sqlite-locking-mode`.
+
    .. attribute:: autocommit
 
       Property which returns a boolean indicating if autocommit is enabled.
@@ -673,7 +641,7 @@ Usage:
          # Backup the contents of master to replica.
          master.backup(replica)
 
-   .. method:: backup_to_file(filename, pages, name, progress)
+   .. method:: backup_to_file(filename, pages=None, name=None, progress=None)
 
       :param filename: Filename to store the database backup.
       :param int pages: Number of pages per iteration. Default value of -1
@@ -697,7 +665,7 @@ Usage:
              filename = 'backup-%s.db' % (datetime.date.today())
              db.backup_to_file(filename)
 
-   .. method:: blob_open(table, column, rowid, read_only=False)
+   .. method:: blob_open(table, column, rowid, read_only=False, dbname=None)
 
       :param str table: Name of table containing data.
       :param str column: Name of column containing data.
@@ -736,10 +704,39 @@ Usage:
           blob.seek(0)
           image_data = blob.read(img_size)
 
+   .. attribute:: server_version
+
+      Version tuple of the SQLite library linked at runtime, e.g.
+      ``(3, 54, 0)``.
+
+   .. attribute:: memory_used
+
+      2-tuple of current and highwater memory usage of the SQLite library,
+      in bytes. Reads as zeros when the linked SQLite was built without
+      memory statistics.
+
+   .. attribute:: cache_used
+
+      Bytes of heap memory used by the current connection's page cache.
+
+   .. attribute:: cache_hit
+
+      Number of page-cache hits on the current connection.
+
+   .. attribute:: cache_miss
+
+      Number of page-cache misses on the current connection.
+
+   .. attribute:: cache_write
+
+      Number of dirty cache entries written to disk on the current
+      connection.
+
 
 .. class:: PooledCySqliteDatabase(database, **kwargs)
 
-   Connection-pooling variant of :class:`CySqliteDatabase`.
+   Connection-pooling variant of :class:`CySqliteDatabase`. See
+   :ref:`connection-pooling`.
 
 .. _apsw:
 
@@ -860,8 +857,8 @@ of PRAGMAs and their descriptions can be found in the `SQLCipher documentation <
 .. class:: SqlCipherDatabase(database, passphrase, **kwargs)
 
    :param str database: Path to the encrypted database file.
-   :param str passphrase: Encryption passphrase (should be 8 character minimum;
-       enforce stronger requirements in your application).
+   :param str passphrase: Encryption passphrase, 8 characters minimum.
+       Enforce stronger requirements in your application.
 
    If the database file does not exist, it is created and encrypted with a
    key derived from ``passphrase``. If it does exist, ``passphrase`` must
@@ -928,9 +925,10 @@ transaction from one thread execute atomically without statements from
 another thread appearing between them. The ``atomic()`` and
 ``transaction()`` methods raise a ``ValueError`` if called.
 
-If you need to temporarily bypass the queue and write directly (for
-example, during a batch import), use :meth:`~SqliteQueueDatabase.pause`
-and :meth:`~SqliteQueueDatabase.unpause`.
+To write directly, bypassing the queue (for example, a bulk import through
+a separate connection), use :meth:`~SqliteQueueDatabase.pause` and
+:meth:`~SqliteQueueDatabase.unpause`. While paused the writer thread is
+disconnected, and writes submitted through the queue raise ``WriterPaused``.
 
 .. class:: SqliteQueueDatabase(database, use_gevent=False, autostart=True, queue_max_size=None, results_timeout=None, **kwargs)
 
@@ -957,8 +955,10 @@ and :meth:`~SqliteQueueDatabase.unpause`.
    .. method:: pause()
 
       Block until the writer thread finishes its current work, then
-      disconnect it. The calling thread takes over direct database access.
-      Must be followed by a call to :meth:`~SqliteQueueDatabase.unpause`.
+      disconnect it so another connection may write to the database
+      directly. While paused, writes submitted through the queue raise
+      ``WriterPaused``. Must be followed by a call to
+      :meth:`~SqliteQueueDatabase.unpause`.
 
    .. method:: unpause()
 
@@ -993,14 +993,7 @@ These field classes live in ``playhouse.sqlite_ext`` and can be used with:
           content = TextField()
           timestamp = TimestampField()
 
-   RowIDField can be mapped to a different field name, but it's underlying
-   column name will always be ``rowid``.
-
-   .. code-block:: python
-
-      class Note(Model):
-          id = RowIDField()
-          ...
+   The field must be named ``rowid``. Any other name raises ``ValueError``.
 
 .. class:: AutoIncrementField()
 
@@ -1032,6 +1025,9 @@ SQLite JSON
 
 :class:`~playhouse.sqlite_ext.JSONField` enables storing and querying JSON data
 in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
+
+.. warning::
+   This field is deprecated. New code should use the cross-backend :ref:`core JSONField <json-field>`.
 
 .. class:: JSONField(json_dumps=None, json_loads=None, **kwargs)
 
@@ -1136,36 +1132,37 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
                .select(
                    Config.data['statuses'],
                    Config.data['statuses'].length())
+               .where(Config.id.in_([cfg1.id, cfg2.id]))
                .tuples())
 
       # [([1, 99, 1, 1], 4), ([1, 1], 2)]
 
-   Let's add a nested value and then see how to iterate through it's contents
+   Let's add a nested value and then see how to iterate through its contents
    recursively using the :meth:`~JSONField.tree` method:
 
    .. code-block:: python
 
-      Config.create(data={'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': [1, 2]})
+      cfg = Config.create(data={'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': [1, 2]})
 
       tree = Config.data.tree().alias('tree')
       query = (Config
-               .select(Config.id, tree.c.fullkey, tree.c.value)
-               .from_(Config, tree))
+               .select(tree.c.fullkey, tree.c.value)
+               .from_(Config, tree)
+               .where(Config.id == cfg.id))
 
       for row in query.tuples():
           print(row)
 
-      (1, '$', {'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': [1, 2]}),
-      (1, '$.x2', [1, 2]),
-      (1, '$.x2[0]', 1),
-      (1, '$.x2[1]', 2),
-      (1, '$.x1', {'y1': 'z1', 'y2': 'z2'}),
-      (1, '$.x1.y1', 'z1'),
-      (1, '$.x1.y2', 'z2')]
+      ('$', '{"x1":{"y1":"z1","y2":"z2"},"x2":[1,2]}')
+      ('$.x1', '{"y1":"z1","y2":"z2"}')
+      ('$.x1.y1', 'z1')
+      ('$.x1.y2', 'z2')
+      ('$.x2', '[1,2]')
+      ('$.x2[0]', 1)
+      ('$.x2[1]', 2)
 
-   The :meth:`~JSONField.tree` and :meth:`~JSONField.children` methods
-   are powerful. For more information on how to utilize them, see the
-   `json1 extension documentation <http://sqlite.org/json1.html#jtree>`_.
+   For more on :meth:`~JSONField.tree` and :meth:`~JSONField.children`, see
+   the `json1 extension documentation <http://sqlite.org/json1.html#jtree>`_.
 
    .. method:: __getitem__(item)
 
@@ -1174,8 +1171,8 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
       :rtype: JSONPath
 
       Access a specific key or array index in the JSON data. Returns a
-      :class:`JSONPath` object, which exposes convenient methods for
-      reading or modifying a particular part of a JSON object.
+      :class:`JSONPath` object, which exposes methods for reading or
+      modifying a particular part of a JSON object.
 
       Example:
 
@@ -1345,10 +1342,10 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
           KeyData.create(key='b', data={'x1': {'y1': 'z1', 'y2': 'z2'}})
 
           # We will query the KeyData model for the key and all the
-          # top-level keys and values in it's data field.
+          # top-level keys and values in its data field.
           kd = KeyData.data.children().alias('children')
           query = (KeyData
-                   .select(kd.c.key, kd.c.value, kd.c.fullkey)
+                   .select(KeyData.key, kd.c.key, kd.c.value, kd.c.fullkey)
                    .from_(KeyData, kd)
                    .order_by(kd.c.key)
                    .tuples())
@@ -1393,10 +1390,10 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
           KeyData.create(key='b', data={'x1': {'y1': 'z1', 'y2': 'z2'}})
 
           # We will query the KeyData model for the key and all the
-          # keys and values in it's data field, recursively.
+          # keys and values in its data field, recursively.
           kd = KeyData.data.tree().alias('tree')
           query = (KeyData
-                   .select(kd.c.key, kd.c.value, kd.c.fullkey)
+                   .select(KeyData.key, kd.c.key, kd.c.value, kd.c.fullkey)
                    .from_(KeyData, kd)
                    .order_by(kd.c.key)
                    .tuples())
@@ -1418,7 +1415,7 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
    :param JSONField field: the field object we intend to access.
    :param tuple path: Components comprising the JSON path.
 
-   A convenient, Pythonic way of representing JSON paths for use with
+   A Pythonic way of representing JSON paths for use with
    :class:`JSONField`. Implements the same methods as :class:`JSONField` but
    designed for operating on nested items, e.g.:
 
@@ -1456,25 +1453,400 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
 
 .. _sqlite-fts:
 
-Full-Text Search
+Full-text search
 -----------------
 
-Peewee supports :ref:`FTS3, FTS4 <sqlite-fts4>` (legacy, widely available) and
-:ref:`FTS5 <sqlite-fts5>` full-text search extensions.
+SQLite can maintain a full-text index over one or more columns of text, and
+query it using the ``MATCH`` operator. Peewee exposes an index as a
+:class:`Model`, where each column is a :class:`SearchField`.
 
-The general pattern is:
+:ref:`FTS5 <sqlite-fts5>` should be used wherever possible. Legacy
+:ref:`FTS3 and FTS4 <sqlite-fts4>` support is available for older databases.
 
-1. Define a :class:`FTSModel` or :class:`FTS5Model` subclass with one or more
-   :class:`SearchField` columns.
-2. When a row is created or updated in the source table, insert or update
-   the corresponding row in the search index.
-3. Query the index using :meth:`~FTSModel.match` and rank results with
-   :meth:`~FTSModel.bm25` (or :meth:`~FTSModel.rank` for FTS5).
+Using a search index has three parts:
 
-Consult the SQLite documentation for FTS query syntax diagrams:
+1. Define an index model with one or more :class:`SearchField` columns.
+2. Write to the index whenever the source data changes.
+3. Query the index, joining back to the source rows using the ``rowid``.
 
-* `FTS3 and FTS4 <https://www.sqlite.org/fts3.html#full_text_index_queries>`__
-* `FTS5 <https://sqlite.org/fts5.html#full_text_query_syntax>`__
+.. _sqlite-fts5:
+
+FTS5
+^^^^
+
+:class:`FTS5Model` stores data in a full-text search index using SQLite
+`FTS5 <https://www.sqlite.org/fts5.html>`_ (SQLite 3.9.0+) and provides
+built-in BM25 result ranking.
+
+``FTS5Model`` caveats:
+
+* Only ``MATCH`` and lookups on the ``rowid`` column can be performed
+  efficiently with FTS tables. All other queries require a full table scan.
+* Constraints, foreign-keys, and indexes are not supported.
+* The primary key is the implicit ``rowid``, which may be declared explicitly
+  using :class:`RowIDField`.
+* Besides the implicit ``rowid``, all columns **must** be instances of
+  :class:`SearchField`.
+
+Because there are no secondary indexes, it usually makes sense to treat the
+``rowid`` as a foreign-key to a row in an ordinary table, and to store the
+canonical data there.
+
+Defining an index
+~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from peewee import *
+   from playhouse.sqlite_ext import FTS5Model, SearchField, RowIDField
+
+   db = SqliteDatabase('app.db')
+
+   class Document(Model):
+       # Canonical source of data, stored in an ordinary table.
+       author = TextField()
+       title = TextField()
+       content = TextField()
+       timestamp = DateTimeField()
+
+       class Meta:
+           database = db
+
+   class DocumentIndex(FTS5Model):
+       rowid = RowIDField()  # If not provided will be added implicitly.
+       title = SearchField()
+       content = SearchField()
+       author = SearchField(unindexed=True)  # Stored but not searchable.
+
+       class Meta:
+           database = db
+           # Use the porter stemming algorithm and unicode tokenizers, and
+           # optimize prefix matches of 3 or 4 characters (e.g. typeahead).
+           options = {'tokenize': 'porter unicode61', 'prefix': [3, 4]}
+
+Columns declared ``unindexed=True`` are stored and returned by ``SELECT``, but
+are not searchable. They are useful for metadata you want alongside search
+results.
+
+``Meta.options`` declares how the indexed text is stored via the ``content``
+key. The choice determines what can be read back out of the index and how it is
+kept up to date:
+
+* **Default** (no ``content`` option): the index keeps its own copy of the
+  text, and is read and written like any other table.
+* :ref:`External content <sqlite-fts-external-content>` (``content=Model``):
+  only the search structures are stored. The searchable text itself is read
+  from the content table on demand, so ``SELECT`` and the highlighting
+  functions still work. In exchange, every change to the content table must be
+  mirrored into the index, normally with triggers.
+* :ref:`Contentless <sqlite-fts5-contentless>` (``content=''``): searchable
+  text is indexed and discarded. A search returns matching ``rowid``\s, but no
+  column can be read back, and rows can only be inserted, never changed or
+  removed (two newer options relax this).
+
+Prefer the default, which the rest of this section assumes. Choose external
+content when storing a second copy of the text would be prohibitively
+expensive, and choose contentless when the text never needs to be read back
+through the index.
+
+Writing to the index
+~~~~~~~~~~~~~~~~~~~~
+
+With the default storage mode the index is an ordinary table as far as writes
+are concerned. Set the ``rowid`` to the id of the source row so results can be
+joined back to it:
+
+.. code-block:: python
+
+   DocumentIndex.create(
+       rowid=document.id,
+       title=document.title,
+       content=document.content,
+       author=document.author)
+
+   # Replace acts as an upsert, for re-indexing a row that may or may not
+   # already be present:
+   (DocumentIndex
+    .replace(rowid=document.id,
+             title=document.title,
+             content=document.content,
+             author=document.author)
+    .execute())
+
+Searching
+~~~~~~~~~
+
+Three methods deal with the search string:
+
+* :meth:`~FTS5Model.match` builds a ``MATCH`` expression from a string of FTS5
+  query syntax, passed through unchanged.
+* :meth:`~FTS5Model.search` matches the same way, after scrubbing most syntax
+  characters from the string, and orders the results by relevance.
+* :meth:`~FTS5Model.web_query` translates "web search" style queries into FTS5
+  syntax, **always** producing a valid query for use with :meth:`~FTS5Model.match`
+  and :meth:`~FTS5Model.search`.
+
+FTS5 query syntax is unforgiving, and most punctuation means something in
+it, so text typed by a user will frequently fail to parse. Compare the same
+strings passed through unchanged, scrubbed, and translated:
+
+=========================  =========================================  =============================  ============================
+Input                      :meth:`~FTS5Model.match`                   :meth:`~FTS5Model.search`      :meth:`~FTS5Model.web_query`
+=========================  =========================================  =============================  ============================
+``python sqlite``          both terms                                 both terms                     both terms
+``"sqlite fts5"``          the phrase                                 the phrase                     the phrase
+``title: python``          the term, in ``title``                     the term, in ``title``         the term, in ``title``
+``python OR sqlite``       either term                                either term                    either term
+``covid-19``               ``OperationalError: no such column: 19``   the phrase "covid 19"          the term "covid-19"
+``o'brien``                ``OperationalError: syntax error``         the phrase "o brien"           the term "o'brien"
+``python -sqlite``         ``OperationalError: no such column``       both terms, exclusion lost     "python", excluding "sqlite"
+``python AND NOT sqlite``  ``OperationalError: syntax error``         ``OperationalError``           "python", excluding "sqlite"
+``(python OR``             ``OperationalError: syntax error``         ``OperationalError``           "python"
+(empty)                    ``OperationalError: syntax error``         ``OperationalError``           matches nothing
+=========================  =========================================  =============================  ============================
+
+A search box should pass the user's text through :meth:`~FTS5Model.web_query`.
+This example fetches documents matching a user search query ``phrase``:
+
+.. code-block:: python
+
+   def search(phrase):
+       return (Document
+               .select(Document, DocumentIndex.rank().alias('score'))
+               .join(DocumentIndex, on=(Document.id == DocumentIndex.rowid))
+               .where(DocumentIndex.match(DocumentIndex.web_query(phrase)))
+               .order_by(DocumentIndex.rank()))
+
+Use :meth:`~FTS5Model.match` directly when the query is trusted to be a valid
+FTS5 query.
+
+.. code-block:: python
+
+   # Search a single column.
+   query = DocumentIndex.select().where(DocumentIndex.title.match('python'))
+
+   # Terms within 5 tokens of each other.
+   query = DocumentIndex.select().where(
+       DocumentIndex.match('NEAR(python sqlite, 5)'))
+
+Ranking and highlighting
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+FTS5 ranks matches using BM25, exposed as :meth:`~FTS5Model.rank`. Lower
+scores are better, so results sort ascending. :meth:`~FTS5Model.search`
+applies the ordering for you, and can return the score and weight columns
+individually:
+
+.. code-block:: python
+
+   # Ordered by relevance, title matches weighted twice as heavily.
+   results = DocumentIndex.search(
+       DocumentIndex.web_query('cysqlite OR (peewee AND sqlite)'),
+       weights={'title': 2.0, 'content': 1.0},
+       with_score=True,
+       score_alias='relevance')
+
+   for r in results:
+       print(r.title, r.relevance)
+
+:meth:`~SearchField.highlight` and :meth:`~SearchField.snippet` return the
+matched text with the matching terms wrapped in the delimiters you provide,
+the latter returning only an excerpt:
+
+.. code-block:: python
+
+   query = (DocumentIndex
+            .search(DocumentIndex.web_query('python'))
+            .select(DocumentIndex.title.highlight('[', ']').alias('hi'),
+                    DocumentIndex.content.snippet('[', ']').alias('snip')))
+
+   for r in query:
+       print(r.hi)    # e.g. "Learn [python] the hard way"
+       print(r.snip)  # e.g. "...chapter on [python] and sqlite..."
+
+Because both functions rely on reading the stored text, they will return
+``NULL`` on contentless FTS tables.
+
+.. _sqlite-fts-external-content:
+
+External content
+~~~~~~~~~~~~~~~~
+
+If the text being indexed already lives in another table, the ``content``
+option tells SQLite to read it from there instead of storing a second copy.
+
+The ``content`` option accepts a :class:`Model` class or a table-name string.
+``content_rowid`` names the column holding the source table's primary key:
+
+.. code-block:: python
+   :emphasize-lines: 4, 10, 14
+
+   class Blog(Model):
+       title = TextField()
+       pub_date = DateTimeField(default=datetime.datetime.now)
+       content = TextField()  # We want to search this.
+
+       class Meta:
+           database = db
+
+   class BlogIndex(FTS5Model):
+       content = SearchField()  # Must match name of column(s) in source model.
+
+       class Meta:
+           database = db
+           options = {'content': Blog, 'content_rowid': Blog.id}
+
+   db.create_tables([Blog, BlogIndex])
+
+   # Populate the search index from the content table.
+   BlogIndex.rebuild()
+
+SQLite maps the content table into the FTS table **by column name**: every
+column declared on the index must exist in the content table, though the
+order does not matter. The mapping is not checked when the table is created,
+so a missing column surfaces later as a ``no such column`` error when the
+index is rebuilt or queried. When the names do not line up, either declare the
+search field with a matching ``column_name``, or point ``content`` at a view
+that renames the columns:
+
+.. code-block:: python
+
+   class DocumentIndex(FTS5Model):
+       # Model attribute "body", mapped to Document's "content" column.
+       body = SearchField(column_name='content')
+
+       class Meta:
+           database = db
+           options = {'content': Document, 'content_rowid': Document.id}
+
+SQLite does not keep the index in sync for you, and writing the index has a
+twist: to remove or change a row, the index needs the values that were
+originally indexed, since it stores no text of its own to look them up in.
+They are supplied with the special "delete" command, an ``INSERT`` naming
+the table itself. Removing a row is one such ``INSERT``. Changing a row is a
+removal followed by a plain ``INSERT`` of the new values:
+
+.. code-block:: sql
+
+   -- Remove one row, passing the values exactly as they were indexed.
+   INSERT INTO blogindex(blogindex, rowid, content) VALUES ('delete', ?, ?);
+
+In peewee the command is :meth:`~FTS5Model.delete_command`:
+
+.. code-block:: python
+
+   BlogIndex.delete_command(blog.id, content=old_content)
+
+Ordinary ``UPDATE`` and ``DELETE`` statements are also accepted, but they
+work by reading the old values out of the content table at that moment: once
+the content row has been changed or removed they silently corrupt the index,
+as do wrong values passed to "delete".
+
+Keep the two in sync by re-indexing explicitly with :meth:`~FTS5Model.rebuild`,
+issuing the statements before writes in application code, or installing triggers
+on the content table, which perform them at exactly the right time:
+
+.. code-block:: sql
+
+   CREATE TRIGGER blog_ai AFTER INSERT ON blog BEGIN
+     INSERT INTO blogindex(rowid, content) VALUES (new.id, new.content);
+   END;
+   CREATE TRIGGER blog_ad AFTER DELETE ON blog BEGIN
+     INSERT INTO blogindex(blogindex, rowid, content)
+       VALUES('delete', old.id, old.content);
+   END;
+   CREATE TRIGGER blog_au AFTER UPDATE ON blog BEGIN
+     INSERT INTO blogindex(blogindex, rowid, content)
+       VALUES('delete', old.id, old.content);
+     INSERT INTO blogindex(rowid, content) VALUES (new.id, new.content);
+   END;
+
+.. warning::
+   With SQLite's default ``recursive_triggers=off``, ``INSERT OR REPLACE``
+   will not fire the delete trigger, which leaves stale rows in the index. If
+   the content table is written using :meth:`Model.replace`,
+   :meth:`Model.replace_many` or ``on_conflict('replace')``, enable the pragma
+   on the database: ``SqliteDatabase('app.db', pragmas={'recursive_triggers':
+   1})``.
+
+To check whether an index has drifted out of sync with its content table, use
+:meth:`~FTS5Model.integrity_check` with ``rank=1``. The default ``rank=0``
+only verifies the index's internal structure and will not detect the drift.
+
+.. _sqlite-fts5-contentless:
+
+Contentless tables
+~~~~~~~~~~~~~~~~~~
+
+Specifying the empty string for ``content`` tells SQLite to index the text and
+then discard it. Searching works as usual, but ``SELECT`` returns ``NULL`` for
+every column except ``rowid``, as do auxiliary functions that return text.
+Set the ``rowid`` explicitly so results can be tied back to a canonical table:
+
+.. code-block:: python
+
+   class NoteIndex(FTS5Model):
+       content = SearchField()
+
+       class Meta:
+           database = db
+           options = {'content': ''}
+
+   # Index a note, linking the rowid back to the canonical row.
+   NoteIndex.insert({'rowid': note.id, 'content': note.content}).execute()
+
+Contentless tables accept ``INSERT`` only: ``UPDATE`` and ``DELETE`` raise an
+``OperationalError``, because removing a row means removing the entries its
+values produced, and a contentless table no longer has the values.
+:meth:`~FTS5Model.delete_command` (the :ref:`"delete" command
+<sqlite-fts-external-content>`) works if the original values can be
+re-supplied, and :meth:`~FTS5Model.delete_all` clears the index outright. Two
+independent options relax the restrictions further, and they
+may be combined:
+
+* ``contentless_delete=1`` (SQLite 3.43+) stores extra bookkeeping so SQLite
+  can remove a row without being given its old values: ``DELETE`` works, as
+  does ``UPDATE`` provided all indexed columns are assigned together
+  (assigning a partial subset is an error). The practical choice when indexed
+  rows change or disappear.
+* ``contentless_unindexed=1`` (SQLite 3.47+) stores the values of
+  ``UNINDEXED`` columns, which are then returned by ``SELECT`` and may be
+  updated on their own. Useful for keeping a bit of metadata alongside an
+  otherwise contentless index, for example a title to display with each hit
+  without joining back to the source table.
+
+Using both:
+
+.. code-block:: python
+
+   class NoteIndex(FTS5Model):
+       content = SearchField()
+       title = SearchField(unindexed=True)
+
+       class Meta:
+           database = db
+           options = {
+               'content': '',
+               'contentless_delete': 1,
+               'contentless_unindexed': 1}
+
+   # The title is stored and comes back with each hit. The content is
+   # indexed, then discarded, and selects as NULL.
+   NoteIndex.insert({'rowid': note.id, 'content': note.content,
+                     'title': note.title}).execute()
+
+   # Updates must assign all indexed columns together, though the stored
+   # title may also be updated on its own.
+   (NoteIndex
+    .update(content=new_content, title=new_title)
+    .where(NoteIndex.rowid == note.id)
+    .execute())
+   NoteIndex.update(title='archived').where(NoteIndex.rowid == note.id).execute()
+
+   NoteIndex.delete().where(NoteIndex.rowid == note.id).execute()
+
+``SearchField``
+~~~~~~~~~~~~~~~
 
 .. class:: SearchField(unindexed=False, column_name=None)
 
@@ -1487,7 +1859,7 @@ Consult the SQLite documentation for FTS query syntax diagrams:
 
    .. code-block:: python
 
-      class DocumentIndex(FTSModel):
+      class DocumentIndex(FTS5Model):
           title = SearchField()
           content = SearchField()
           tags = SearchField()
@@ -1496,56 +1868,38 @@ Consult the SQLite documentation for FTS query syntax diagrams:
    .. method:: match(term)
 
       :param str term: full-text search query/terms.
-      :return: a :class:`Expression` corresponding to the ``MATCH``
-          operator.
+      :return: a :class:`Expression` corresponding to the ``MATCH`` operator.
 
-      Sqlite's full-text search supports searching either the full table,
-      including all indexed columns, **or** searching individual columns. The
-      :meth:`~SearchField.match` method can be used to restrict search to
-      a single column:
+      Restrict a search to this column:
 
       .. code-block:: python
 
          # Search *only* the title field and return results ordered by
-         # relevance, using bm25.
+         # relevance.
          query = (DocumentIndex
-                  .select(DocumentIndex, DocumentIndex.bm25().alias('score'))
+                  .select(DocumentIndex, DocumentIndex.rank().alias('score'))
                   .where(DocumentIndex.title.match('python'))
-                  .order_by(DocumentIndex.bm25()))
+                  .order_by(DocumentIndex.rank()))
 
-      To search *all* indexed columns, use the :meth:`FTSModel.match` method:
-
-      .. code-block:: python
-         :emphasize-lines: 5
-
-         # Searches *both* the title and body and return results ordered by
-         # relevance, using bm25.
-         query = (DocumentIndex
-                  .select(DocumentIndex, DocumentIndex.bm25().alias('score'))
-                  .where(DocumentIndex.match('python'))
-                  .order_by(DocumentIndex.bm25()))
+      To search all indexed columns, use :meth:`FTS5Model.match`.
 
    .. method:: highlight(left, right)
 
       :param str left: opening tag for highlight, e.g. ``'<b>'``
       :param str right: closing tag for highlight, e.g. ``'</b>'``
 
-      When performing a search using the ``MATCH`` operator, FTS5 can return
-      text highlighting matches in a given column.
+      **FTS5 only.** Return the column's text with the terms matched by the
+      search wrapped in the given delimiters:
 
       .. code-block:: python
 
-         # Search for items matching string 'python' and return the title
-         # highlighted with square brackets.
-         query = (SearchIndex
-                  .search('python')
-                  .select(SearchIndex.title.highlight('[', ']').alias('hi')))
+         query = (DocumentIndex
+                  .search(DocumentIndex.web_query('python'))
+                  .select_extend(DocumentIndex.title.highlight('[', ']').alias('hi')))
+         # e.g. result.hi = "Learn [python] the hard way"
 
-         for result in query:
-             print(result.hi)
-
-         # For example, might print:
-         # Learn [python] the hard way
+      The highlighted text comes from the stored content, so this returns
+      ``NULL`` for a :ref:`contentless table <sqlite-fts5-contentless>`.
 
    .. method:: snippet(left, right, over_length='...', max_tokens=16)
 
@@ -1553,223 +1907,67 @@ Consult the SQLite documentation for FTS query syntax diagrams:
       :param str right: closing tag for highlight, e.g. ``'</b>'``
       :param str over_length: text to prepend or append when snippet exceeds
           the maximum number of tokens.
-      :param int max_tokens: max tokens returned, **must be 1 - 64**.
+      :param int max_tokens: max tokens returned, between 1 and 64.
 
-      When performing a search using the ``MATCH`` operator, FTS5 can return
-      text with a snippet containing the highlighted match in a given column.
+      **FTS5 only.** Like :meth:`~SearchField.highlight`, but returns a
+      short excerpt of the column containing the match rather than the whole
+      value. Returns ``NULL`` for a contentless table.
 
-      .. code-block:: python
+``FTS5Model``
+~~~~~~~~~~~~~
 
-         # Search for items matching string 'python' and return the title
-         # highlighted with square brackets.
-         query = (SearchIndex
-                  .search('python')
-                  .select(SearchIndex.title.snippet('[', ']').alias('snip')))
+.. class:: FTS5Model()
 
-         for result in query:
-             print(result.snip)
+   Model class for working with SQLite FTS5 search indexes.
 
-.. _sqlite-fts4:
+   Table options are declared in ``Meta.options`` and passed through to the
+   ``CREATE VIRTUAL TABLE`` statement as-is, so any option FTS5 accepts may
+   be used, including any not listed here. :class:`Model` and :class:`Field`
+   values are resolved to the appropriate table or column name. The
+   commonly-used options:
 
-FTS4 / ``FTSModel``
-^^^^^^^^^^^^^^^^^^^
-
-FTSModel enables Peewee applications to store data in an efficient full-text
-search index using SQLite `FTS4 <https://www.sqlite.org/fts3.html>`_.
-
-FTSModel caveats:
-
-* All queries **except** ``MATCH`` and ``rowid`` lookup require a full table scan.
-* Constraints, foreign-keys, and indexes are not supported.
-* All columns are treated as ``TEXT``.
-* No built-in ranking. Peewee provides several implementations which can be
-  automatically registered by passing ``rank_functions=True`` to ``SqliteDatabase(...)``.
-* FTSModel ``rowid`` primary key may be declared using :class:`RowIDField`.
-  Lookups on the ``rowid`` are very efficient.
-
-Given these constraints all fields besides ``rowid`` should be instances of
-:class:`SearchField` to ensure correctness.
-
-.. tip::
-   Because of the lack of secondary indexes, it usually makes sense to treat
-   the ``FTSModel.rowid`` primary key as a foreign-key to a row in a normal
-   SQLite table.
-
-Example:
-
-.. code-block:: python
-
-   from peewee import *
-   from playhouse.sqlite_ext import FTSModel, SearchField
-
-   db = SqliteDatabase('app.db', rank_functions=True)
-
-   class Document(Model):
-       # Canonical source of data, stored in a normal table.
-       author = ForeignKeyField(User, backref='documents')
-       title = TextField(null=False, unique=True)
-       content = TextField(null=False)
-       timestamp = DateTimeField()
-
-       class Meta:
-           database = db
-
-   class DocumentIndex(FTSModel):
-       # Full-text search index.
-       rowid = RowIDField()
-       title = SearchField()
-       content = SearchField()
-       author = SearchField(unindexed=True)
-
-       class Meta:
-           database = db
-           # Use the porter stemming algorithm to tokenize content, optimize
-           # prefix searches of 3 or 4 characters.
-           options = {'tokenize': 'porter unicode61', 'prefix': [3, 4]}
-
-Store data by inserting it into the FTS table:
-
-.. code-block:: python
-
-   # Store a document in the index:
-   DocumentIndex.create(
-       rowid=document.id,  # Set rowid to match Document's id.
-       title=document.title,
-       content=document.content,
-       author=document.author.get_full_name())
-
-   # Equivalent:
-   (DocumentIndex
-    .insert({
-        'rowid': document.id,
-        'title': document.title,
-        'content': document.content,
-        'author': document.author.get_full_name()})
-    .execute())
-
-:class:`FTSModel` provides several shortcuts for full-text search queries:
-
-.. code-block:: python
-
-   # Simple search using basic ranking algorithm.
-   results = DocumentIndex.search('python sqlite')
-
-   # BM25 search With score and per-column weighting:
-   results = DocumentIndex.search_bm25(
-       'python sqlite',
-       weights={'title': 2.0, 'content': 1.0},
-       with_score=True,
-       score_alias='relevance')
-
-   for r in results:
-       print(r.title, r.relevance)
-
-An important method of searching relies on the ``rowid`` of the indexed
-data matching the document's canonical id. Using this technique we can
-apply additional filters and retrieve the matching ``Document`` objects
-efficiently:
-
-.. code-block:: python
-
-   # Search and ensure we only retrieve articles from the last 30 days.
-   cutoff = datetime.datetime.now() - datetime.timedelta(days=30)
-
-   query = (Document
-            .select()
-            .join(
-                DocumentIndex,
-                on=(Document.id == DocumentIndex.rowid))
-            .where(
-                (Document.timestamp >= cutoff) &
-                DocumentIndex.match('python sqlite'))
-            .order_by(DocumentIndex.bm25()))
-
-.. warning::
-   All SQL queries on ``FTSModel`` classes will be full-table scans
-   **except** full-text searches and ``rowid`` lookups.
-
-.. _sqlite-fts4-external-content:
-
-.. topic:: External Content
-
-   If the primary source of the content you are indexing exists in a separate
-   table, you can save some disk space by instructing SQLite to not store an
-   additional copy of the search index content.
-
-   To accomplish this, you can specify a table using the ``content`` option.
-   The `FTS4 documentation <https://www.sqlite.org/fts3.html#the_content_option_>`_
-   and `FTS5 documentation <https://www.sqlite.org/fts5.html#external_content_and_contentless_tables>`_
-   have more information.
-
-   Here is a short example illustrating how to implement this with peewee:
-
-   .. code-block:: python
-
-      class Blog(Model):
-          title = TextField()
-          pub_date = DateTimeField(default=datetime.datetime.now)
-          content = TextField()  # We want to search this.
-
-          class Meta:
-              database = db
-
-      class BlogIndex(FTSModel):  # or FTS5Model.
-          content = SearchField()
-
-          class Meta:
-              database = db
-              options = {
-                  'content': Blog,  # Data source.
-                  'content_rowid': Blog.id,  # FTS5 only.
-              }
-
-      db.create_tables([Blog, BlogIndex])
-
-      # Now, we can manage content in the BlogIndex. To populate the
-      # search index:
-      BlogIndex.rebuild()
-
-      # Optimize the index.
-      BlogIndex.optimize()
-
-   The ``content`` option accepts a :class:`Model` and can reduce the amount of
-   storage used by the database at the expense of requiring more care and
-   attention to keeping data synchronized.
-
-
-.. class:: FTSModel()
-
-   Base Model class suitable for working with SQLite FTS3 / FTS4.
-
-   Supports the following options:
-
-   * ``content``: :class:`Model` containing external content, or empty string
-     for "contentless"
-   * ``prefix``: integer(s). Ex: '2' or '2,3,4'
-   * ``tokenize``: simple, porter, unicode61. Ex: 'porter'
+   * ``content``: :class:`Model` class (or table-name string) containing the
+     external content, or empty string for "contentless".
+   * ``content_rowid``: :class:`Field` (external content primary key)
+   * ``contentless_delete``: set to ``1`` to allow ``DELETE`` and full-row
+     ``UPDATE`` on a contentless table. Requires SQLite 3.43+.
+   * ``contentless_unindexed``: set to ``1`` to store the values of
+     ``UNINDEXED`` columns in a contentless table. Requires SQLite 3.47+.
+   * ``prefix``: integer(s) to maintain a prefix index for. Ex: ``3`` or
+     ``[3, 4]``
+   * ``tokenize``: ``unicode61`` (default), ``ascii``, ``porter`` or
+     ``trigram``. Ex: ``'porter unicode61'``
+   * ``detail``: ``full`` (default), ``column`` or ``none``. Reduces index
+     size at the cost of phrase queries (``none``) or per-column queries.
 
    Example:
 
    .. code-block:: python
 
-      class DocumentIndex(FTSModel):
+      class DocumentIndex(FTS5Model):
           title = SearchField()
-          body = SearchField()
+          content = SearchField()
 
           class Meta:
               database = db
               options = {
                   'tokenize': 'porter unicode61',
-                  'prefix': '3',
+                  'prefix': [3, 4],
               }
+
+   .. classmethod:: fts5_installed()
+
+      Return ``True`` if FTS5 is available.
 
    .. classmethod:: match(term)
 
-      :param term: Search term or expression. `FTS syntax documentation <https://www.sqlite.org/fts3.html#full_text_index_queries>`__.
+      :param term: Search term or expression. `FTS5 syntax documentation <https://sqlite.org/fts5.html#full_text_query_syntax>`__.
 
       Generate a SQL expression representing a search for the given term or
       expression in the table. SQLite uses the ``MATCH`` operator to indicate
       a full-text search.
+
+      Invalid FTS5 syntax raises an ``OperationalError``.
 
       Example:
 
@@ -1780,70 +1978,357 @@ efficiently:
          query = (DocumentIndex
                   .select()
                   .where(DocumentIndex.match('search phrase'))
-                  .order_by(DocumentIndex.bm25()))
+                  .order_by(DocumentIndex.rank()))
 
          for result in query:
              print('Result: %s' % result.title)
 
    .. classmethod:: search(term, weights=None, with_score=False, score_alias='score', explicit_ordering=False)
 
-      :param term: Search term or expression. `FTS syntax documentation <https://www.sqlite.org/fts3.html#full_text_index_queries>`__.
+      :param term: Search term or expression. `FTS5 syntax documentation <https://sqlite.org/fts5.html#full_text_query_syntax>`__.
       :param weights: A list of weights for the columns, ordered with respect
         to the column's position in the table. **Or**, a dictionary keyed by
-        the field or field name and mapped to a value.
+        the field or field name and mapped to a value. Weights apply
+        positionally across *all* columns, including ``UNINDEXED`` ones.
+        Unrecognized keys are ignored.
       :param with_score: Whether the score should be returned as part of
         the ``SELECT`` statement.
       :param str score_alias: Alias to use for the calculated rank score.
         This is the attribute you will use to access the score
         if ``with_score=True``.
       :param bool explicit_ordering: Order using full SQL function to
-          calculate rank, as opposed to simply referencing the score alias
-          in the ORDER BY clause.
+          calculate rank, as opposed to referencing the score alias in the
+          ORDER BY clause.
 
       Shorthand way of searching for a term and sorting results by the
-      quality of the match.
+      quality of the match using BM25.
+
+      .. code-block:: python
+
+          # Search on user input, best matches first.
+          docs = DocumentIndex.search(DocumentIndex.web_query(user_input))
+          for result in docs:
+              print(result.title)
+
+          # Weighted columns, returning the computed score.
+          docs = DocumentIndex.search(
+              DocumentIndex.web_query(user_input),
+              weights={'title': 2.0, 'content': 1.0},
+              with_score=True,
+              score_alias='search_score')
+          for result in docs:
+              print(result.title, result.search_score)
+
+      .. note::
+         The term is FTS5 query syntax. Characters that FTS5 treats as
+         syntax are removed from unquoted portions of the term (which also
+         removes the ``^`` initial-token operator), but the result is not
+         guaranteed to be valid: unbalanced quotes or parentheses still
+         raise.
+
+         Use :meth:`~FTS5Model.web_query` to convert common "web search" style
+         queries into valid FTS5 syntax.
+
+   .. classmethod:: web_query(query)
+
+      :param str query: a "web search" style query, e.g. from a search box.
+      :return: an equivalent FTS5 query, as a string.
+
+      Translate the query syntax people expect from a web search engine into
+      the `FTS5 query syntax <https://sqlite.org/fts5.html#full_text_query_syntax>`_.
+      Pass the result to :meth:`~FTS5Model.search` or :meth:`~FTS5Model.match`:
+
+      .. code-block:: python
+
+         results = DocumentIndex.search(DocumentIndex.web_query(user_input))
+
+      The supported syntax:
+
+      ============================== ==========================================
+      Input                          Meaning
+      ============================== ==========================================
+      ``python sqlite``              both terms (words are AND-ed)
+      ``python OR sqlite``           either term
+      ``python NOT sqlite``          the first term, excluding the second
+      ``python -sqlite``             same, using the leading-minus form
+      ``"full text search"``         the exact phrase
+      ``pyth*``                      terms starting with "pyth"
+      ``title: python``              the term, in the ``title`` column only
+      ``{title content}: python``    the term, in either named column
+      ``title: (python OR sqlite)``  the group, in the ``title`` column only
+      ``(python OR sqlite) fast``    grouping with parentheses
+      ============================== ==========================================
+
+      Anything else is searched as ordinary text, so characters that are FTS5
+      syntax do not have to be escaped: ``covid-19``, ``o'brien`` and ``c++``
+      all search for what they say. Column filters naming a column the model
+      does not have (or an ``UNINDEXED`` column, which can never match) are
+      searched as text.
+
+      The query is **always** valid, no matter what was typed. Unbalanced quotes
+      and parentheses are repaired, operators with nothing to operate on are
+      dropped, deeply-nested input is flattened, and a query with no terms in
+      it becomes ``""``, which matches nothing. Empty input therefore returns
+      no rows rather than raising.
+
+      An exclusion applies to the terms it is AND-ed with, so
+      ``python -sqlite`` excludes as expected, while in ``python OR -sqlite``
+      the exclusion has nothing to apply to and is dropped.
+
+      .. note::
+         The minus sign has a different meaning here than in FTS5 itself. In
+         FTS5, ``-title: python`` matches "python" in every column *except*
+         the title. In a search box it means "exclude documents with python in
+         the title", which is how :meth:`~FTS5Model.web_query` translates it.
+
+      FTS5 features that have no search-box equivalent are searched as text
+      rather than being passed through. That includes ``NEAR()`` groups, the
+      ``^`` initial-token operator, and ``+`` phrase concatenation. Use
+      :meth:`~FTS5Model.match` to write those queries directly.
+
+   .. classmethod:: rank(col1_weight, col2_weight...coln_weight)
+
+      :param float col_weight: (Optional) weight to give to the *ith* column
+          of the model. By default all columns have a weight of ``1.0``.
+
+      Generate an expression that will calculate and return the quality of
+      the search match using the `BM25 algorithm <https://en.wikipedia.org/wiki/Okapi_BM25>`_.
+      This value can be used to sort the search results.
+
+      .. code-block:: python
+
+         query = (DocumentIndex
+                  .select(
+                      DocumentIndex,
+                      DocumentIndex.rank().alias('score'))
+                  .where(DocumentIndex.match('search phrase'))
+                  .order_by(DocumentIndex.rank()))
+
+         for search_result in query:
+             print(search_result.title, search_result.score)
+
+   .. staticmethod:: clean_query(query, replace=chr(26))
+
+      Replace characters that FTS5 treats as syntax with ``replace`` in the
+      unquoted portions of ``query``. This is applied automatically by
+      :meth:`~FTS5Model.search`. It does not guarantee a valid query, and
+      :meth:`~FTS5Model.web_query` is usually the better choice.
+
+   .. staticmethod:: validate_query(query)
+
+      Return ``True`` if ``query`` contains no characters that FTS5 would
+      treat as syntax outside of a quoted phrase. This only inspects the
+      characters used and will not catch every malformed query.
+
+   .. classmethod:: VocabModel(table_type='row'|'col'|'instance', table=None)
+
+      :param str table_type: Either 'row', 'col' or 'instance'.
+      :param table: Name for the vocab table. If not specified, defaults to
+          the index's table name plus ``"_v"`` for the *row* type, and
+          ``"_v_col"`` or ``"_v_instance"`` for the other two.
+
+      Generate a model class suitable for accessing the `vocab table <http://sqlite.org/fts5.html#the_fts5vocab_virtual_table_module>`_
+      corresponding to FTS5 search index. The columns depend on the table
+      type:
+
+      * *row* has ``term``, ``doc`` and ``cnt``
+      * *col* has ``term``, ``col``, ``doc`` and ``cnt``
+      * *instance* has ``term``, ``doc``, ``col`` and ``offset``
+
+      A new class is returned on each call, and the table must be created
+      before it can be queried:
+
+      .. code-block:: python
+
+         Vocab = DocumentIndex.VocabModel()
+         db.create_tables([Vocab])
+
+         # The 10 most common terms in the index.
+         query = Vocab.select().order_by(Vocab.cnt.desc()).limit(10)
+         for term in query:
+             print(term.term, term.doc, term.cnt)
+
+   .. classmethod:: rebuild()
+
+      Discard and rebuild the search index from its content. Not valid for
+      contentless tables, which have no content to rebuild from.
+
+   .. classmethod:: optimize()
+
+      Merge the index into as few b-tree segments as possible. This can be
+      expensive on a large index, but improves query performance.
+
+   .. classmethod:: merge(npages)
+
+      Merge ``npages`` pages of index segments together.
+
+   .. classmethod:: automerge(level)
+
+      Configure the automerge level, between 0 and 64. Zero disables
+      automatic merging.
+
+   .. classmethod:: set_pgsz(pgsz)
+
+      Set the page size used by the index.
+
+   .. classmethod:: set_rank(rank_expression)
+
+      Set the default ranking function used by the ``rank`` column, e.g.
+      ``set_rank('bm25(10.0, 5.0)')``.
+
+   .. classmethod:: delete_all()
+
+      Remove all rows from the index. Only valid for contentless and
+      external-content tables.
+
+   .. classmethod:: delete_command(rowid, **values)
+
+      :param rowid: the row to remove.
+      :param values: the values of the indexed columns, keyed by field name
+          (or column name), exactly as they were indexed.
+
+      Remove a row using the fts5 "delete" command. This is how rows are
+      removed from :ref:`external-content <sqlite-fts-external-content>` and
+      :ref:`contentless <sqlite-fts5-contentless>` tables, which cannot look
+      the old values up themselves. The command exists only for those two
+      configurations. Default-storage and ``contentless_delete=1`` tables
+      reject it and use ordinary ``DELETE`` statements.
+
+      SQLite requires the values to match what was indexed, treating an
+      omitted column as NULL. A mismatch leaves stale entries behind,
+      detectable by :meth:`~FTS5Model.integrity_check` with ``rank=1`` on an
+      external-content table and undetectable on a contentless one. A value
+      is therefore required for every indexed column (pass ``None`` where
+      NULL was indexed), and a missing or unrecognized column raises
+      ``ValueError``.
+
+   .. classmethod:: integrity_check(rank=0)
+
+      Verify the index, raising ``DatabaseError`` if it is corrupt. Pass
+      ``rank=1`` to also verify an external-content index against its content
+      table, which is what detects an index that has drifted out of sync.
+
+.. _sqlite-fts4:
+
+FTS3 and FTS4 / ``FTSModel``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. note::
+   FTS3 and FTS4 are the legacy full-text search extensions. Use :ref:`FTS5 <sqlite-fts5>`
+   where possible.
+
+:class:`FTSModel` stores data in an `FTS4 <https://www.sqlite.org/fts3.html>`_
+index (to use FTS3, set ``Meta.extension_module = 'FTS3'``). It works the way
+:class:`FTS5Model` does: all columns besides the implicit ``rowid`` primary
+key are :class:`SearchField` instances, only ``MATCH`` and ``rowid`` lookups
+are efficient, and the ``rowid`` is best treated as a foreign-key to an
+ordinary table holding the canonical data. The differences:
+
+* There is no built-in ranking. Peewee provides ranking functions,
+  implemented in Python (or C), which must be registered by passing
+  ``rank_functions=True`` to :class:`SqliteDatabase`. Without it,
+  :meth:`~FTSModel.search` and the ranking functions fail with, e.g.,
+  ``no such function: fts_rank``.
+* :meth:`~FTSModel.search` ranks by simple term frequency, while
+  :meth:`~FTSModel.search_bm25` uses BM25 (FTS4 only). Neither scrubs the
+  search string.
+* :meth:`~FTS5Model.web_query`, :meth:`~SearchField.highlight` and
+  :meth:`~SearchField.snippet` are FTS5-only and cannot be used with FTS4.
+* :ref:`External content <sqlite-fts-external-content>` differs in the
+  details: FTS4 always uses the content table's ``rowid`` and rejects the
+  ``content_rowid`` option, and there is no "delete" command. Plain
+  ``UPDATE`` and ``DELETE`` read the old values from the content table, so
+  sync triggers must be ``BEFORE`` triggers on the content table.
+* The table options differ, see :class:`FTSModel`.
+
+.. code-block:: python
+
+   from playhouse.sqlite_ext import FTSModel, SearchField
+
+   db = SqliteDatabase('app.db', rank_functions=True)
+
+   class DocumentIndex(FTSModel):
+       title = SearchField()
+       content = SearchField()
+
+       class Meta:
+           database = db
+
+   # Store a document, setting rowid to the id of the canonical row.
+   DocumentIndex.create(rowid=document.id, title=document.title,
+                        content=document.content)
+
+   # Search, best matches first.
+   results = DocumentIndex.search_bm25('python sqlite', with_score=True)
+   for r in results:
+       print(r.title, r.score)
+
+``FTSModel``
+~~~~~~~~~~~~
+
+.. class:: FTSModel()
+
+   Base Model class suitable for working with SQLite FTS3 / FTS4.
+
+   Table options are declared in ``Meta.options`` and passed through to the
+   ``CREATE VIRTUAL TABLE`` statement as-is, so any option FTS4 accepts may
+   be used, whether or not it is listed here. The commonly-used options:
+
+   * ``content``: :class:`Model` class (or table-name string) containing the
+     external content, or empty string for "contentless".
+   * ``prefix``: integer(s) to maintain a prefix index for. Ex: ``2`` or
+     ``[2, 3]``
+   * ``tokenize``: ``simple`` (default), ``porter`` or ``unicode61``. Ex:
+     ``'porter'``
+   * ``notindexed``: name of a column to omit from the index.
+   * ``matchinfo``: set to ``fts3`` to store less match data, at the cost of
+     the ranking functions that need it.
+   * ``compress`` / ``uncompress``: names of registered functions used to
+     compress the stored content.
+
+   .. classmethod:: match(term)
+
+      :param term: Search term or expression. `FTS syntax documentation <https://www.sqlite.org/fts3.html#full_text_index_queries>`__.
+
+      Generate a SQL expression representing a search for the given term or
+      expression in the table. SQLite uses the ``MATCH`` operator to indicate
+      a full-text search. The term is passed through unmodified, so invalid
+      syntax raises an ``OperationalError``.
+
+   .. classmethod:: search(term, weights=None, with_score=False, score_alias='score', explicit_ordering=False)
+
+      :param term: Search term or expression. `FTS syntax documentation <https://www.sqlite.org/fts3.html#full_text_index_queries>`__.
+      :param weights: A list of weights for the columns, ordered with respect
+        to the column's position in the table. **Or**, a dictionary keyed by
+        the field or field name and mapped to a value. Unrecognized keys are
+        ignored.
+      :param with_score: Whether the score should be returned as part of
+        the ``SELECT`` statement.
+      :param str score_alias: Alias to use for the calculated rank score.
+        This is the attribute you will use to access the score
+        if ``with_score=True``.
+      :param bool explicit_ordering: Order using full SQL function to
+          calculate rank, as opposed to referencing the score alias in the
+          ORDER BY clause.
+
+      Shorthand way of searching for a term and sorting results by the
+      quality of the match. Requires ``rank_functions=True`` on the database.
 
       This method uses a simplified algorithm for determining the
       relevance rank of results. For more sophisticated result ranking,
       use the :meth:`~FTSModel.search_bm25` method.
 
-      .. code-block:: python
-
-         # Simple search.
-         docs = DocumentIndex.search('search term')
-         for result in docs:
-             print(result.title)
-
-         # More complete example.
-         docs = DocumentIndex.search(
-             'search term',
-             weights={'title': 2.0, 'content': 1.0},
-             with_score=True,
-             score_alias='search_score')
-         for result in docs:
-             print(result.title, result.search_score)
+      Unlike :meth:`FTS5Model.search`, the term is passed through unmodified.
 
    .. classmethod:: search_bm25(term, weights=None, with_score=False, score_alias='score', explicit_ordering=False)
 
-      :param term: Search term or expression. `FTS syntax documentation <https://www.sqlite.org/fts3.html#full_text_index_queries>`__.
-      :param weights: A list of weights for the columns, ordered with respect
-        to the column's position in the table. **Or**, a dictionary keyed by
-        the field or field name and mapped to a value.
-      :param with_score: Whether the score should be returned as part of
-        the ``SELECT`` statement.
-      :param str score_alias: Alias to use for the calculated rank score.
-        This is the attribute you will use to access the score
-        if ``with_score=True``.
-      :param bool explicit_ordering: Order using full SQL function to
-          calculate rank, as opposed to simply referencing the score alias
-          in the ORDER BY clause.
-
-      Shorthand way of searching for a term and sorting results by the
-      quality of the match using the BM25 algorithm.
+      Same as :meth:`~FTSModel.search`, but using the BM25 ranking algorithm.
+      Requires ``rank_functions=True`` on the database.
 
       .. attention::
-         The BM25 ranking algorithm is only available for FTS4. If you are
-         using FTS3, use the :meth:`~FTSModel.search` method instead.
+         The BM25 ranking algorithm is only available for FTS4 via a
+         peewee-provided function. If you are using FTS3, use the
+         :meth:`~FTSModel.search` method instead.
 
    .. classmethod:: search_bm25f(term, weights=None, with_score=False, score_alias='score', explicit_ordering=False)
 
@@ -1862,10 +2347,7 @@ efficiently:
 
       Generate an expression that will calculate and return the quality of
       the search match. This ``rank`` can be used to sort the search results.
-
-      The ``rank`` function accepts optional parameters that allow you to
-      specify weights for the various columns. If no weights are specified,
-      all columns are considered of equal importance.
+      Requires ``rank_functions=True`` on the database.
 
       The algorithm used by :meth:`~FTSModel.rank` is simple and
       relatively quick. For more sophisticated result ranking, use:
@@ -1874,55 +2356,15 @@ efficiently:
       * :meth:`~FTSModel.bm25f`
       * :meth:`~FTSModel.lucene`
 
-      .. code-block:: python
-
-         query = (DocumentIndex
-                  .select(
-                      DocumentIndex,
-                      DocumentIndex.rank().alias('score'))
-                  .where(DocumentIndex.match('search phrase'))
-                  .order_by(DocumentIndex.rank()))
-
-         for search_result in query:
-             print(search_result.title, search_result.score)
-
    .. classmethod:: bm25(col1_weight, col2_weight...coln_weight)
 
       :param float col_weight: (Optional) weight to give to the *ith* column
           of the model. By default all columns have a weight of ``1.0``.
 
-      Generate an expression that will calculate and return the quality of
-      the search match using the `BM25 algorithm <https://en.wikipedia.org/wiki/Okapi_BM25>`_.
-      This value can be used to sort the search results.
-
-      Like :meth:`~FTSModel.rank`, ``bm25`` function accepts optional
-      parameters that allow you to specify weights for the various columns.
-      If no weights are specified, all columns are considered of equal
-      importance.
-
-      The BM25 result ranking algorithm requires FTS4. If you are using
-      FTS3, use :meth:`~FTSModel.rank` instead.
-
-      .. code-block:: python
-
-         query = (DocumentIndex
-                  .select(
-                      DocumentIndex,
-                      DocumentIndex.bm25().alias('score'))
-                  .where(DocumentIndex.match('search phrase'))
-                  .order_by(DocumentIndex.bm25()))
-
-         for search_result in query:
-             print(search_result.title, search_result.score)
-
-      The above code example is equivalent to calling the
-      :meth:`~FTSModel.search_bm25` method:
-
-          .. code-block:: python
-
-             query = DocumentIndex.search_bm25('search phrase', with_score=True)
-             for search_result in query:
-                 print(search_result.title, search_result.score)
+      Same as :meth:`~FTSModel.rank`, but using the `BM25 algorithm
+      <https://en.wikipedia.org/wiki/Okapi_BM25>`_. Requires FTS4 and
+      ``rank_functions=True`` on the database. If you are using FTS3, use
+      :meth:`~FTSModel.rank` instead.
 
    .. classmethod:: bm25f(col1_weight, col2_weight...coln_weight)
 
@@ -1936,290 +2378,23 @@ efficiently:
 
    .. classmethod:: rebuild()
 
-      Rebuild the search index. Only valid when the ``content`` option
-      was specified (content tables).
+      Discard and rebuild the search index from its content.
 
    .. classmethod:: optimize()
 
-      Optimize the index.
+      Merge the index into as few b-tree segments as possible.
 
-.. _sqlite-fts5:
+   .. classmethod:: merge(blocks=200, segments=8)
 
-FTS5 / ``FTS5Model``
-^^^^^^^^^^^^^^^^^^^^
+      Merge ``blocks`` blocks of ``segments`` index segments together.
 
-FTS5Model enables Peewee applications to store data in an efficient full-text
-search index using SQLite `FTS5 <https://www.sqlite.org/fts5.html>`_. FTS5 also
-comes with native BM25 result ranking.
+   .. classmethod:: automerge(state=True)
 
-FTS5Model caveats:
+      Enable or disable automatic merging of index segments.
 
-* All queries **except** ``MATCH`` and ``rowid`` lookup require a full table scan.
-* Constraints, foreign-keys, and indexes are not supported. All columns **must**
-  be instances of :class:`SearchField`.
-* FTS5Model ``rowid`` primary key may be declared using :class:`RowIDField`.
-  Lookups on the ``rowid`` are very efficient.
+   .. classmethod:: integrity_check()
 
-.. tip::
-   Because of the lack of secondary indexes, it usually makes sense to treat
-   the ``FTS5Model.rowid`` primary key as a foreign-key to a row in a normal
-   SQLite table.
-
-Example:
-
-.. code-block:: python
-
-   from peewee import *
-   from playhouse.sqlite_ext import FTS5Model, SearchField
-
-   db = SqliteDatabase('app.db')
-
-   class Document(Model):
-       # Canonical source of data, stored in a normal table.
-       author = ForeignKeyField(User, backref='documents')
-       title = TextField(null=False, unique=True)
-       content = TextField(null=False)
-       timestamp = DateTimeField()
-
-       class Meta:
-           database = db
-
-   class DocumentIndex(FTS5Model):
-       # Full-text search index.
-       rowid = RowIDField()
-       title = SearchField()
-       content = SearchField()
-       author = SearchField(unindexed=True)
-
-       class Meta:
-           database = db
-           # Use the porter stemming algorithm and unicode tokenizers,
-           # and optimize prefix matches of 3 or 4 characters.
-           options = {'tokenize': 'porter unicode61', 'prefix': [3, 4]}
-
-   # Check that FTS5 is available:
-   if not DocumentIndex.fts5_installed():
-       raise RuntimeError('FTS5 is not available in this SQLite build.')
-
-Store data by inserting it into the FTS5 table:
-
-.. code-block:: python
-
-   # Store a document in the index:
-   DocumentIndex.create(
-       rowid=document.id,  # Set rowid to match Document's id.
-       title=document.title,
-       content=document.content,
-       author=document.author.get_full_name())
-
-   # Equivalent:
-   (DocumentIndex
-    .insert({
-        'rowid': document.id,
-        'title': document.title,
-        'content': document.content,
-        'author': document.author.get_full_name()})
-    .execute())
-
-:class:`FTS5Model` provides several shortcuts for full-text search queries:
-
-.. code-block:: python
-
-   # Simple search (BM25, ordered by relevance):
-   results = DocumentIndex.search('python sqlite')
-
-   # With score and per-column weighting:
-   results = DocumentIndex.search(
-       'python sqlite',
-       weights={'title': 2.0, 'content': 1.0},
-       with_score=True,
-       score_alias='relevance')
-
-   for r in results:
-       print(r.title, r.relevance)
-
-   # Highlight matches in the title:
-   for r in (DocumentIndex.search('python')
-             .select(DocumentIndex.title.highlight('[', ']').alias('hi'))):
-       print(r.hi)  # e.g. "Learn [python] the hard way"
-
-.. tip::
-   An important method of searching relies on the ``rowid`` of the indexed
-   data matching the document's canonical id. Using this technique we can
-   apply additional filters and retrieve the matching ``Document`` objects
-   efficiently:
-
-   .. code-block:: python
-
-      # Search and ensure we only retrieve articles from the last 30 days.
-      cutoff = datetime.datetime.now() - datetime.timedelta(days=30)
-
-      query = (Document
-               .select()
-               .join(
-                   DocumentIndex,
-                   on=(Document.id == DocumentIndex.rowid))
-               .where(
-                   (Document.timestamp >= cutoff) &
-                   DocumentIndex.match('python sqlite'))
-               .order_by(DocumentIndex.rank()))
-
-If the primary source of the content you are indexing exists in a separate
-table, you can save some disk space by instructing SQLite to not store an
-additional copy of the search index content. See :ref:`External Content
-<sqlite-fts4-external-content>` for implementation details. The `FTS5 documentation <https://www.sqlite.org/fts5.html#external_content_and_contentless_tables>`_
-has more information.
-
-.. class:: FTS5Model()
-
-   Inherits all :class:`FTSModel` methods plus.
-
-   Supports the following options:
-
-   * ``content``: :class:`Model` containing external content, or empty string
-     for "contentless"
-   * ``content_rowid``: :class:`Field` (external content primary key)
-   * ``prefix``: integer(s). Ex: '2' or ``[2, 3]``
-   * ``tokenize``: simple, porter, unicode61. Ex: 'porter unicode61'
-
-   Example:
-
-   .. code-block:: python
-
-      class DocumentIndex(FTS5Model):
-          title = SearchField()
-          body = SearchField()
-
-          class Meta:
-              database = db
-              options = {
-                  'tokenize': 'porter unicode61',
-                  'prefix': '3',
-              }
-
-   .. classmethod:: fts5_installed()
-
-      Return ``True`` if FTS5 is available.
-
-   .. classmethod:: match(term)
-
-      :param term: Search term or expression. `FTS5 syntax documentation <https://sqlite.org/fts5.html#full_text_query_syntax>`__.
-
-      Generate a SQL expression representing a search for the given term or
-      expression in the table. SQLite uses the ``MATCH`` operator to indicate
-      a full-text search.
-
-      Example:
-
-      .. code-block:: python
-
-         # Search index for "search phrase" and return results ranked
-         # by relevancy using the BM25 algorithm.
-         query = (DocumentIndex
-                  .select()
-                  .where(DocumentIndex.match('search phrase'))
-                  .order_by(DocumentIndex.rank()))
-
-         for result in query:
-             print('Result: %s' % result.title)
-
-   .. classmethod:: search(term, weights=None, with_score=False, score_alias='score')
-
-      :param term: Search term or expression. `FTS5 syntax documentation <https://sqlite.org/fts5.html#full_text_query_syntax>`__.
-      :param weights: A list of weights for the columns, ordered with respect
-        to the column's position in the table. **Or**, a dictionary keyed by
-        the field or field name and mapped to a value.
-      :param with_score: Whether the score should be returned as part of
-        the ``SELECT`` statement.
-      :param str score_alias: Alias to use for the calculated rank score.
-        This is the attribute you will use to access the score
-        if ``with_score=True``.
-      :param bool explicit_ordering: Order using full SQL function to
-          calculate rank, as opposed to simply referencing the score alias
-          in the ORDER BY clause.
-
-      Shorthand way of searching for a term and sorting results by the
-      quality of the match. The ``FTS5`` extension provides a built-in
-      implementation of the BM25 algorithm, which is used to rank the results
-      by relevance.
-
-      .. code-block:: python
-
-          # Simple search.
-          docs = DocumentIndex.search('search term')
-          for result in docs:
-              print(result.title)
-
-          # More complete example.
-          docs = DocumentIndex.search(
-              'search term',
-              weights={'title': 2.0, 'content': 1.0},
-              with_score=True,
-              score_alias='search_score')
-          for result in docs:
-              print(result.title, result.search_score)
-
-   .. classmethod:: search_bm25(term, weights=None, with_score=False, score_alias='score')
-
-      With FTS5, :meth:`~FTS5Model.search_bm25` is identical to the
-      :meth:`~FTS5Model.search` method.
-
-   .. classmethod:: rank(col1_weight, col2_weight...coln_weight)
-
-      :param float col_weight: (Optional) weight to give to the *ith* column
-          of the model. By default all columns have a weight of ``1.0``.
-
-      Generate an expression that will calculate and return the quality of
-      the search match using the `BM25 algorithm <https://en.wikipedia.org/wiki/Okapi_BM25>`_.
-      This value can be used to sort the search results.
-
-      The :meth:`~FTS5Model.rank` function accepts optional parameters
-      that allow you to specify weights for the various columns.  If no
-      weights are specified, all columns are considered of equal importance.
-
-      .. code-block:: python
-
-         query = (DocumentIndex
-                  .select(
-                      DocumentIndex,
-                      DocumentIndex.rank().alias('score'))
-                  .where(DocumentIndex.match('search phrase'))
-                  .order_by(DocumentIndex.rank()))
-
-         for search_result in query:
-             print(search_result.title, search_result.score)
-
-      The above code example is equivalent to calling the
-      :meth:`~FTS5Model.search` method:
-
-      .. code-block:: python
-
-         query = DocumentIndex.search('search phrase', with_score=True)
-         for search_result in query:
-             print(search_result.title, search_result.score)
-
-   .. classmethod:: bm25(col1_weight, col2_weight...coln_weight)
-
-      Because FTS5 provides built-in support for BM25, this method is identical
-      to :meth:`~FTS5Model.rank` method.
-
-   .. classmethod:: VocabModel(table_type='row'|'col'|'instance', table_name=None)
-
-      :param str table_type: Either 'row', 'col' or 'instance'.
-      :param table_name: Name for the vocab table. If not specified, will be
-          "fts5tablename_v".
-
-      Generate a model class suitable for accessing the `vocab table <http://sqlite.org/fts5.html#the_fts5vocab_virtual_table_module>`_
-      corresponding to FTS5 search index.
-
-   .. classmethod:: rebuild()
-
-      Rebuild the search index. Only valid when the ``content`` option
-      was specified (content tables).
-
-   .. classmethod:: optimize()
-
-      Optimize the index.
+      Verify the index, raising ``DatabaseError`` if it is corrupt.
 
 
 .. _sqlite-udf:
@@ -2276,9 +2451,9 @@ Available functions
    :param date_str: A datetime, encoded as a string.
    :returns: The datetime with any timezone info stripped off.
 
-   The time is not adjusted in any way, the timezone is simply removed.
+   The time is not adjusted. Only the timezone is removed.
 
-.. function:: humandelta(nseconds, glue=', ')
+.. function:: human_delta(nseconds, glue=', ')
 
    :param int nseconds: Number of seconds, total, in timedelta.
    :param str glue: Fragment to join values.
@@ -2306,35 +2481,6 @@ Available functions
    :returns: Duration from smallest to largest value in list, in seconds.
 
    *Aggregate*: duration from the smallest to the largest value, in seconds.
-
-.. function:: date_series(start, stop, step_seconds=86400)
-
-   :param datetime start: Start datetime
-   :param datetime stop: Stop datetime
-   :param int step_seconds: Number of seconds comprising a step.
-
-   *Table-value function*: returns rows consisting of the date/+time values
-   encountered iterating from start to stop, ``step_seconds`` at a time.
-
-   Additionally, if start does not have a time component and step_seconds is
-   greater-than-or-equal-to one day (86400 seconds), the values returned will
-   be dates. Conversely, if start does not have a date component, values will
-   be returned as times. Otherwise values are returned as datetimes.
-
-   Example:
-
-   .. code-block:: sql
-
-       SELECT * FROM date_series('2017-01-28', '2017-02-02');
-
-       value
-       -----
-       2017-01-28
-       2017-01-29
-       2017-01-30
-       2017-01-31
-       2017-02-01
-       2017-02-02
 
 **FILE**
 
@@ -2490,23 +2636,3 @@ Available functions
 
    .. note:: Only available if you compiled the ``_sqlite_udf`` extension.
 
-.. function:: regex_search(regex, search_string)
-
-   :param str regex: Regular expression
-   :param str search_string: String to search for instances of regex.
-
-   *Table-value function*: searches a string for substrings that match
-   the provided ``regex``. Returns rows for each match found.
-
-   Example:
-
-   .. code-block:: python
-
-      SELECT * FROM regex_search('\w+', 'extract words, ignore! symbols');
-
-      value
-      -----
-      extract
-      words
-      ignore
-      symbols

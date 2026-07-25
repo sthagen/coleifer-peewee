@@ -507,17 +507,24 @@ class TestModelAPIs(ModelTestCase):
         p3, p7 = people[3], people[7]
         p3.first = p7.first = 'fx'
         p3.last = p7.last = 'lx'
-        with self.assertRaises(IntegrityError):
-            with self.assertQueryCount(1):
-                with self.database.atomic():
-                    Person.bulk_update(people, fields=['first', 'last'])
+        # A raising block skips assertQueryCount()'s assertion. Count UPDATEs,
+        # as sqlite logs BEGIN/ROLLBACK where the other backends do not.
+        n_updates = lambda: len([r for r in self.history
+                                 if r.msg[0].startswith('UPDATE')])
 
+        self.reset_sql_history()
         with self.assertRaises(IntegrityError):
-            # 10 objects, batch size=4, so 0-3, 4-7, 8&9. But we never get to 8
-            # and 9 because of the integrity error processing the 2nd batch.
-            with self.assertQueryCount(2):
-                with self.database.atomic():
-                    Person.bulk_update(people, ['first', 'last'], 4)
+            with self.database.atomic():
+                Person.bulk_update(people, fields=['first', 'last'])
+        self.assertEqual(n_updates(), 1)
+
+        # 10 objects, batch size=4, so 0-3, 4-7, 8&9. But we never get to 8 and
+        # 9 because of the integrity error processing the 2nd batch.
+        self.reset_sql_history()
+        with self.assertRaises(IntegrityError):
+            with self.database.atomic():
+                Person.bulk_update(people, ['first', 'last'], 4)
+        self.assertEqual(n_updates(), 2)
 
         # Ensure no changes were made.
         vals = [(p.first, p.last) for p in Person.select().order_by(Person.id)]
@@ -952,6 +959,25 @@ class TestModelAPIs(ModelTestCase):
                 ('House Party', 'House', 'Topeka'),
                 ('Nowhere Party', 'Nowhere', None)])
 
+    @requires_models(User, Tweet)
+    def test_join_outer_no_related(self):
+        huey = self.add_user('huey')
+        self.add_tweets(huey, 'meow', 'purr')
+        self.add_user('zaizee')  # No tweets.
+
+        with self.assertQueryCount(1):
+            query = (User
+                     .select(User, Tweet)
+                     .join(Tweet, JOIN.LEFT_OUTER)
+                     .order_by(User.username, Tweet.content))
+            # The tweet-less user must hydrate as tweet=None, not raise.
+            accum = [(u.username, u.tweet.content if u.tweet is not None
+                      else None) for u in query]
+        self.assertEqual(accum, [
+            ('huey', 'meow'),
+            ('huey', 'purr'),
+            ('zaizee', None)])
+
     @requires_models(Relationship, Person)
     def test_join_same_model_twice(self):
         d = datetime.date(2010, 1, 1)
@@ -980,6 +1006,25 @@ class TestModelAPIs(ModelTestCase):
             ('huey', 'zaizee'),
             ('zaizee', 'huey'),
             ('mickey', 'huey')])
+
+    @requires_models(Relationship, Person)
+    def test_join_multi_fk_rhs_predicate(self):
+        d = datetime.date(2010, 1, 1)
+        huey = Person.create(first='huey', last='cat', dob=d)
+        zaizee = Person.create(first='zaizee', last='cat', dob=d)
+        Relationship.create(from_person=huey, to_person=zaizee)
+
+        # With two foreign keys to Person the join resolves to the key named
+        # in the predicate regardless of which side it is on. The joined row
+        # used to land on a phantom attribute when the key was on the right,
+        # which forced an N+1 reload.
+        for on in ((Relationship.to_person == Person.id),
+                   (Person.id == Relationship.to_person)):
+            with self.assertQueryCount(1):
+                rel = (Relationship
+                       .select(Relationship, Person)
+                       .join(Person, on=on))[0]
+                self.assertEqual(rel.to_person.first, 'zaizee')
 
     @requires_models(User, Tweet)
     def test_join_to_dict(self):
@@ -1029,6 +1074,44 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(rows, [
             ('meow', {'username': 'huey'}),
             ('woof', {'username': 'mickey'})])
+
+    @requires_models(User, Tweet)
+    def test_alias_query_constructors(self):
+        huey = self.add_user('huey')
+        self.add_tweets(huey, 'meow')
+
+        TA = Tweet.alias('ta')
+        query = (TA.select(TA, User)
+                 .join(User, on=(TA.user == User.id))
+                 .order_by(TA.content))
+        with self.assertQueryCount(1):
+            cursor = query.execute()
+            rows = [(t.content, t.user.username) for t in cursor]
+
+        self.assertEqual(rows, [('meow', 'huey')])
+        # The aliased model must not get a spurious constructor entry.
+        self.assertTrue(Tweet not in cursor.key_to_constructor)
+
+    @requires_sqlite
+    @requires_models(User, Tweet)
+    def test_join_expression_attribute_name(self):
+        huey = self.add_user('huey')
+        self.add_tweets(huey, 'meow', 'purr')
+
+        # Unaliased expressions hydrate with the same cleaned attribute name
+        # in join queries as in flat queries.
+        flat = (User
+                .select(User.username, fn.COUNT(SQL('1')))
+                .group_by(User.username))
+        row, = flat
+        self.assertEqual(row.COUNT, 1)
+
+        query = (User
+                 .select(User.username, fn.COUNT(SQL('1')))
+                 .join(Tweet, JOIN.LEFT_OUTER)
+                 .group_by(User.username))
+        row, = query
+        self.assertEqual(row.COUNT, 2)
 
     @requires_models(User, Tweet, Favorite)
     def test_multi_join(self):
@@ -1206,6 +1289,35 @@ class TestModelAPIs(ModelTestCase):
             self.assertEqual([t.content for t in query],
                              ['meow', 'purr', 'hiss'])
 
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
+    @requires_models(User, Tweet)
+    def test_join_from_cte_to_model(self):
+        self._create_user_tweets()
+
+        cte = (Tweet
+               .select(Tweet.user.alias('uid'), fn.COUNT(Tweet.id).alias('ct'))
+               .group_by(Tweet.user)
+               .cte('tweet_ct'))
+
+        with self.assertQueryCount(1):
+            # Join from the CTE to a model: the joined instance is stored in
+            # the CTE's row dict, keyed by the model name.
+            query = (Tweet
+                     .select(Tweet.content, cte.c.ct, User.username)
+                     .join(cte, on=(Tweet.user == cte.c.uid))
+                     .join_from(cte, User, on=(cte.c.uid == User.id))
+                     .with_cte(cte)
+                     .order_by(Tweet.content))
+            rows = [(t.content, t.tweet_ct['ct'], t.tweet_ct['user'].username)
+                    for t in query]
+
+        self.assertEqual(rows, [
+            ('grr', 2, 'mickey'),
+            ('hiss', 3, 'huey'),
+            ('meow', 3, 'huey'),
+            ('purr', 3, 'huey'),
+            ('woof', 2, 'mickey')])
+
     @skip_if(IS_MYSQL)  # MariaDB does not support LIMIT in subqueries!
     @requires_models(User)
     def test_subquery_emulate_window(self):
@@ -1338,6 +1450,46 @@ class TestModelAPIs(ModelTestCase):
 
         self.assertEqual([row.value for row in c2], [0, 1, 5, 8, 9])
         self.assertEqual(c2.count(), 5)
+
+    @requires_models(User, Tweet, Favorite)
+    def test_correlated_compound_subquery(self):
+        # A compound (UNION) used as a correlated subquery must resolve the
+        # outer model's alias in every branch; before the fix the right-hand
+        # branch emitted a phantom alias and the query failed at execution.
+        users = {n: User.create(username=n) for n in ('u1', 'u2', 'u3', 'u4')}
+        tweet = Tweet.create(user=users['u1'], content='hello')
+        Favorite.create(user=users['u2'], tweet=tweet)
+        Favorite.create(user=users['u3'], tweet=tweet)
+
+        tweeted = Tweet.select(Tweet.user).where(Tweet.user == User.id)
+        favorited = Favorite.select(Favorite.user).where(
+            Favorite.user == User.id)
+        query = (User
+                 .select()
+                 .where(User.id.in_(tweeted | favorited))
+                 .order_by(User.username))
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
+            'WHERE ("t1"."id" IN ('
+            'SELECT "t2"."user_id" FROM "tweet" AS "t2" '
+            'WHERE ("t2"."user_id" = "t1"."id") '
+            'UNION '
+            'SELECT "t3"."user_id" FROM "favorite" AS "t3" '
+            'WHERE ("t3"."user_id" = "t1"."id"))) '
+            'ORDER BY "t1"."username"'), [])
+
+        # u1 tweeted, u2/u3 favorited, u4 did neither.
+        self.assertEqual([u.username for u in query], ['u1', 'u2', 'u3'])
+
+        # A branch that independently re-queries the *outer* model reuses the
+        # outer alias (standard same-table scope shadowing) and still executes.
+        others = User.select(User.id).where(User.username == 'u4')
+        shadowed = (User
+                    .select()
+                    .where(User.id.in_(tweeted | favorited | others))
+                    .order_by(User.username))
+        self.assertEqual([u.username for u in shadowed],
+                         ['u1', 'u2', 'u3', 'u4'])
 
     @requires_models(User, Tweet)
     def test_union_column_resolution(self):
@@ -1472,6 +1624,91 @@ class TestModelAPIs(ModelTestCase):
                  .where(User.username.in_(['u1', 'u7']))
                  .with_cte(u_cte))
         self.assertEqual(sorted([u.username for u in query]), ['u1', 'u7'])
+
+    @requires_models(User)
+    def test_nested_compound_grouping(self):
+        if IS_ORACLE_MYSQL and self.database.server_version < (8, 0, 31):
+            self.skipTest('INTERSECT/EXCEPT requires MySQL 8.0.31.')
+        elif (IS_MYSQL and not IS_ORACLE_MYSQL
+              and self.database.server_version < (10, 4)):
+            self.skipTest('Compound parentheses require MariaDB 10.4.')
+
+        User.insert_many([('u%s' % i,) for i in range(1, 8)],
+                         fields=[User.username]).execute()
+        A = {'u1', 'u2', 'u3', 'u4', 'u5'}
+        B = {'u3', 'u4', 'u5', 'u6', 'u7'}
+        C = {'u2', 'u3', 'u7'}
+
+        def q(names):
+            return (User
+                    .select(User.username)
+                    .where(User.username.in_(sorted(names))))
+        a, b, c = q(A), q(B), q(C)
+
+        cases = (
+            ((a | b) & c, (A | B) & C),
+            (a | (b & c), A | (B & C)),
+            (a - (b - c), A - (B - C)),
+            (a - (b | c), A - (B | C)),
+            (((a | b) & c) | (b - c), ((A | B) & C) | (B - C)))
+        for query, expected in cases:
+            self.assertEqual(sorted(u.username for u in query),
+                             sorted(expected))
+
+        top2 = (a | b).order_by(User.username.desc()).limit(2)
+        self.assertEqual([u.username for u in (top2 - c)], ['u6'])
+
+        # Regression: a same-op rhs must not expose a different op
+        # through its flattened left spine.
+        query = a + ((b | c) + c)
+        expected = sorted(list(A) + list(B | C) + list(C))
+        self.assertEqual(sorted(u.username for u in query), expected)
+
+        # Correlated union-family IN stays flat on the mysql family.
+        UA = User.alias()
+        def corr(names):
+            return (UA.select(UA.username)
+                    .where(UA.username.in_(sorted(names)) &
+                           (UA.username == User.username)))
+        query = (User.select()
+                 .where(User.username.in_(corr(A) | (corr(B) + corr(C)))))
+        self.assertEqual(sorted(u.username for u in query),
+                         sorted(A | B | C))
+
+    @requires_models(User)
+    def test_compound_member_order_limit(self):
+        User.insert_many([('u%s' % i,) for i in range(1, 8)],
+                         fields=[User.username]).execute()
+        lo = (User.select(User.username)
+              .where(User.username.in_(['u1', 'u2', 'u3', 'u4'])))
+        hi = (User.select(User.username)
+              .where(User.username.in_(['u5', 'u6', 'u7'])))
+        top2 = lo.order_by(User.username.desc()).limit(2)
+        expected = ['u3', 'u4', 'u5', 'u6', 'u7']
+
+        # A member's ORDER BY / LIMIT stays confined to that member. On
+        # sqlite a flat lhs was a syntax error and a flat rhs LIMIT
+        # silently applied to the whole statement.
+        self.assertEqual(sorted(u.username for u in (top2 | hi)), expected)
+        self.assertEqual(sorted(u.username for u in (hi | top2)), expected)
+        self.assertEqual(sorted(u.username for u in (top2 + hi)), expected)
+        self.assertEqual(sorted(u.username for u in (top2 + top2)),
+                         ['u3', 'u3', 'u4', 'u4'])
+
+        # Offset-only member, limit_max supplies a LIMIT where required.
+        skip2 = lo.order_by(User.username).offset(2)
+        self.assertEqual(sorted(u.username for u in (skip2 | hi)), expected)
+
+        # Ordering the whole statement still belongs to the compound.
+        self.assertEqual([u.username for u in
+                          (top2 | hi).order_by(User.username.desc())],
+                         ['u7', 'u6', 'u5', 'u4', 'u3'])
+
+        if not IS_MYSQL:
+            # The member limit stays confined inside IN as well. The
+            # mysql family still renders in-expr members flat.
+            query = User.select().where(User.username.in_(hi | top2))
+            self.assertEqual(sorted(u.username for u in query), expected)
 
     @requires_models(Category)
     def test_self_referential_fk(self):
@@ -1673,9 +1910,14 @@ class TestRaw(ModelTestCase):
             self.assertEqual([u.username for u in query], [])
 
 
+class DefaultOnly(TestModel):
+    a = IntegerField(default=3)
+    b = CharField(default='x')
+
+
 class TestDefaultValues(ModelTestCase):
     database = get_in_memory_db()
-    requires = [Sample, SampleMeta]
+    requires = [Sample, SampleMeta, DefaultOnly]
 
     def test_default_present_on_insert(self):
         # Although value is not specified, it has a default, which is included
@@ -1699,6 +1941,13 @@ class TestDefaultValues(ModelTestCase):
         self.assertSQL(query, (
             'INSERT INTO "sample" ("counter", "value") '
             'VALUES (?, ?), (?, ?)'), [0, 1.0, 1, 2.0])
+
+    def test_empty_insert_lands_defaults(self):
+        # An empty insert applies python-side defaults, matching a partial
+        # insert, rather than emitting DEFAULT VALUES and dropping them.
+        rowid = DefaultOnly.insert({}).execute()
+        obj = DefaultOnly.get_by_id(rowid)
+        self.assertEqual((obj.a, obj.b), (3, 'x'))
 
     def test_default_present_on_create(self):
         s = Sample.create(counter=3)
@@ -1894,6 +2143,66 @@ class TestFunctionCoerce(ModelTestCase):
         query = Sample.select(fn.AVG(Sample.counter).alias('a'))
         self.assertEqual(query.get().a, 1.5)
 
+    @skip_if(sys.version_info < (3, 11, 0), 'requires 3.11')
+    @requires_models(Post)
+    def test_function_coerce(self):
+        for i in range(3):
+            for j in range(i + 1):
+                Post.create(
+                    content='p',
+                    timestamp=datetime.datetime(2026, 1, j + 1))
+
+        @self.database.func()
+        def ymd(s):
+            return datetime.datetime.fromisoformat(s).strftime('%Y%m%d')
+
+        def assertResults(agg, expected):
+            q = (Post
+                 .select(agg, fn.COUNT(Post.id))
+                 .group_by(agg)
+                 .order_by(SQL('1')))
+            self.assertEqual(list(q.tuples()), expected)
+
+        exp = fn.ymd(Post.timestamp)
+
+        convert = [
+            exp,
+            exp.alias('xyz'),
+            exp.alias('xyz').coerce(True),
+            exp.bind_to(Post).alias('xyz'),
+            exp.cast('text').coerce(True),
+            exp.cast('text').alias('timestamp').coerce(True),
+            exp.python_value(Post.timestamp.python_value),
+            fn.upper(Post.timestamp),
+
+            # I don't want to screw up people doing stuff like fn.json_extract
+            # on a field casted to json (e.g.), so this will run through the
+            # converter:
+            fn.upper(Post.timestamp.cast('text')),
+        ]
+        for e in convert:
+            assertResults(e, [
+                (datetime.datetime(2026, 1, 1), 3),
+                (datetime.datetime(2026, 1, 2), 2),
+                (datetime.datetime(2026, 1, 3), 1)])
+
+        no_convert = [
+            exp.coerce(False),
+            exp.cast('text'),
+            exp.cast('text').alias('xyz'),
+            exp.cast('text').alias('timestamp'),
+            exp.alias('xyz').coerce(False),
+            exp.cast('text').alias('xyz').coerce(False),
+            exp.python_value(Post.timestamp.python_value).cast('text'),
+            fn.upper(exp),
+            fn.upper(exp.cast('text')),
+        ]
+        for e in no_convert:
+            assertResults(e, [
+                ('20260101', 3),
+                ('20260102', 2),
+                ('20260103', 1)])
+
 
 class T1(TestModel):
     pk = AutoField()
@@ -2061,6 +2370,55 @@ class TestSaveNoData(ModelTestCase):
         self.assertRaises(ValueError, t5.save, only=[])
         t5_db = T5.get(T5.id == t5.id)
         self.assertEqual(t5_db.val, 1)
+
+
+class TestCompositeKeyGuard(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [CPK]
+
+    def test_composite_key_length_guard(self):
+        CPK.create(key='a', value=1, extra=1)
+        CPK.create(key='a', value=2, extra=2)
+
+        row = CPK.get_by_id(('a', 1))
+        self.assertEqual(row.extra, 1)
+
+        self.assertRaises(ValueError, CPK.get_by_id, ('a',))
+        self.assertRaises(ValueError, CPK.delete_by_id, ('a',))
+        self.assertRaises(ValueError, lambda: CPK._meta.primary_key == 'ab')
+        self.assertEqual(CPK.select().count(), 2)
+
+
+class RDA(TestModel): pass
+
+class RDC(TestModel):
+    a = ForeignKeyField(RDA)
+
+class RDB(TestModel):
+    a = ForeignKeyField(RDA, null=True)
+    c = ForeignKeyField(RDC)
+
+class RDD(TestModel):
+    b = ForeignKeyField(RDB)
+
+
+class TestDeleteRecursiveNullableChain(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [RDA, RDC, RDB, RDD]
+
+    def test_delete_recursive_nullable_chain(self):
+        # RDB is reachable from RDA via its own nullable FK (updated to NULL)
+        # and via the non-nullable chain RDA -> RDC -> RDB (deleted). Its
+        # child RDD must also be deleted.
+        a = RDA.create()
+        c = RDC.create(a=a)
+        b = RDB.create(a=a, c=c)
+        RDD.create(b=b)
+
+        a.delete_instance(recursive=True)
+        self.assertEqual(RDC.select().count(), 0)
+        self.assertEqual(RDB.select().count(), 0)
+        self.assertEqual(RDD.select().count(), 0)
 
 
 class TestDeleteInstance(ModelTestCase):
@@ -2723,6 +3081,21 @@ class TestWindowFunctionIntegration(ModelTestCase):
                  .tuples())
         self.assertEqual(list(query), expected)
 
+    @skip_if(IS_MYSQL or IS_CRDB or (IS_SQLITE and not IS_SQLITE_30),
+             'window frame EXCLUDE')
+    def test_frame_exclude_string(self):
+        # A raw string exclude= used to bind as a parameter (EXCLUDE ?), a
+        # syntax error at execution. It must render as literal SQL.
+        w = Window(order_by=[Sample.value],
+                   start=Window.preceding(),
+                   end=Window.following(),
+                   exclude='NO OTHERS')
+        query = (Sample
+                 .select(fn.SUM(Sample.value).over(window=w).alias('total'))
+                 .window(w))
+        # EXCLUDE NO OTHERS excludes nothing, so every frame is the full set.
+        self.assertEqual([r.total for r in query], [134] * 5)
+
     def test_mixed_ordering(self):
         s = fn.SUM(Sample.value).over(order_by=[Sample.value])
         query = (Sample
@@ -2937,7 +3310,6 @@ class TestWindowFunctionIntegration(ModelTestCase):
         self.assertEqual(list(query),
                          [(1, 1), (1, 2), (2, 3), (2, 4), (3, 5)])
 
-    @skip_if(IS_MYSQL, 'flaky on mysql')
     def test_sum_with_frame(self):
         w = Window(order_by=[Sample.counter, Sample.value],
                    frame_type=Window.ROWS,
@@ -2947,7 +3319,7 @@ class TestWindowFunctionIntegration(ModelTestCase):
                  .select(Sample.counter,
                          fn.SUM(Sample.value).over(w).alias('rsum'))
                  .window(w)
-                 .order_by(Sample.counter)
+                 .order_by(Sample.counter, Sample.value)
                  .tuples())
         results = list(query)
         # Each row sums current + previous row's value.
@@ -2958,7 +3330,6 @@ class TestWindowFunctionIntegration(ModelTestCase):
             (2, 4.0),  # 1 + 3
             (3, 103.0)])  # 3 + 100
 
-    @skip_if(IS_MYSQL, 'flaky on mysql')
     def test_lag_lead(self):
         query = (Sample
                  .select(Sample.counter,
@@ -2966,7 +3337,7 @@ class TestWindowFunctionIntegration(ModelTestCase):
                              Sample.counter, Sample.value]).alias('prev'),
                          fn.LEAD(Sample.value, 1).over(order_by=[
                              Sample.counter, Sample.value]).alias('next'))
-                 .order_by(Sample.counter)
+                 .order_by(Sample.counter, Sample.value)
                  .tuples())
         results = list(query)
         self.assertEqual(results, [
@@ -3372,6 +3743,18 @@ class TestExistsIntegration(ModelTestCase):
         self.assertFalse(
             User.select().where(User.username == 'nobody').exists())
 
+    @requires_models(User)
+    def test_exists_database_arg(self):
+        User.create(username='huey')
+        query = User.select().where(User.username == 'huey')
+        self.assertTrue(query.exists(self.database))
+
+        alt_db = get_in_memory_db()
+        with alt_db.bind_ctx([User], False, False):
+            User.create_table()
+        self.assertFalse(query.exists(alt_db))
+        alt_db.close()
+
 
 class VL(TestModel):
     n = IntegerField()
@@ -3417,6 +3800,16 @@ class TestValuesListIntegration(ModelTestCase):
         vq = VL.select().order_by(VL.n)
         self.assertEqual([(v.n, v.s) for v in vq], [
             (1, 'One'), (2, 'two'), (3, 'Three')])
+
+    def test_values_list_in_expression(self):
+        VL.insert_many(self._data).execute()
+
+        # col.in_(ValuesList(...)) used to emit "IN VALUES (...)" and raise a
+        # syntax error. It now wraps the VALUES clause in its own parens.
+        vl = ValuesList([(1,), (3,)])
+        query = VL.select().where(VL.n.in_(vl)).order_by(VL.n)
+        self.assertEqual([(v.n, v.s) for v in query],
+                         [(1, 'one'), (3, 'three')])
 
     def test_values_list(self):
         vl = ValuesList(self._data)
@@ -3566,14 +3959,17 @@ class TestCTEIntegration(ModelTestCase):
             ('p3', 'root'),
         ])
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB, 'requires recursive cte')
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES)
+             or IS_CRDB, 'requires recursive cte')
     def test_recursive_cte(self):
         def get_parents(cname):
             C1 = Category.alias()
             C2 = Category.alias()
 
-            level = SQL('1').cast('integer').alias('level')
-            path = C1.name.cast('text').alias('path')
+            int_type = 'SIGNED' if IS_MYSQL else 'integer'
+            str_type = 'CHAR' if IS_MYSQL else 'text'
+            level = SQL('1').cast(int_type).alias('level')
+            path = C1.name.cast(str_type).alias('path')
 
             base = (C1
                     .select(C1.name, C1.parent, level, path)
@@ -3594,8 +3990,8 @@ class TestCTEIntegration(ModelTestCase):
             self.assertSQL(query, (
                 'WITH RECURSIVE "parents" AS ('
                 'SELECT "t1"."name", "t1"."parent_id", '
-                'CAST(1 AS integer) AS "level", '
-                'CAST("t1"."name" AS text) AS "path" '
+                'CAST(1 AS %s) AS "level", '
+                'CAST("t1"."name" AS %s) AS "path" '
                 'FROM "category" AS "t1" '
                 'WHERE ("t1"."name" = ?) '
                 'UNION ALL '
@@ -3607,7 +4003,8 @@ class TestCTEIntegration(ModelTestCase):
                 'ON ("t2"."name" = "parents"."parent_id")) '
                 'SELECT "parents"."name", "parents"."level", "parents"."path" '
                 'FROM "parents" '
-                'ORDER BY "parents"."level"'), [cname, 1, '->'])
+                'ORDER BY "parents"."level"') % (int_type, str_type),
+                [cname, 1, '->'])
             return query
 
         data = [row for row in get_parents('c31').tuples()]
@@ -3627,7 +4024,8 @@ class TestCTEIntegration(ModelTestCase):
         data = [(r.name, r.level, r.path) for r in query]
         self.assertEqual(data, [('root', 1, 'root')])
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB, 'requires recursive cte')
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES)
+             or IS_CRDB, 'requires recursive cte')
     def test_recursive_cte2(self):
         hierarchy = (Category
                      .select(Category.name, Value(0).alias('level'))
@@ -3652,13 +4050,16 @@ class TestCTEIntegration(ModelTestCase):
             ('p3', 1),
             ('root', 0)])
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB, 'requires recursive cte')
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES)
+             or IS_CRDB, 'requires recursive cte')
     def test_recursive_cte_docs_example(self):
         # Define the base case of our recursive CTE. This will be categories that
         # have a null parent foreign-key.
         Base = Category.alias()
-        level = Value(1).cast('integer').alias('level')
-        path = Base.name.cast('text').alias('path')
+        int_type = 'SIGNED' if IS_MYSQL else 'integer'
+        str_type = 'CHAR' if IS_MYSQL else 'text'
+        level = Value(1).cast(int_type).alias('level')
+        path = Base.name.cast(str_type).alias('path')
         base_case = (Base
                      .select(Base.name, Base.parent, level, path)
                      .where(Base.parent.is_null())
@@ -3692,7 +4093,7 @@ class TestCTEIntegration(ModelTestCase):
             ('c31', 3, 'root->p3->c31')])
 
     @requires_models(Sample)
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL, 'sqlite too old for ctes, mysql flaky')
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
     def test_cte_reuse_aggregate(self):
         data = (
             (1, (1.25, 1.5, 1.75)),
@@ -3722,7 +4123,7 @@ class TestCTEIntegration(ModelTestCase):
             (2, .2),
             (2, .4)])
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL)
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
     @requires_models(Sample)
     def test_cte_with_aggregate_filter(self):
         for i in range(1, 11):
@@ -4098,6 +4499,72 @@ class PGOnConflictTests(OnConflictTests):
         # Verify the primary-key of k2 did not change.
         u2_db = UKVP.get(UKVP.key == 'k2')
         self.assertEqual(u2_db.id, u2.id)
+
+    @requires_postgresql
+    @requires_models(UKVP)
+    def test_ignore_conflict_where(self):
+        # Postgres only. Dropping the predicate leaves ON CONFLICT ("key",
+        # "value"), which does not match the partial index, so Postgres rejects
+        # it. On SQLite the row is ignored either way, so this would not flag
+        # the regression.
+        UKVP.create(key='k1', value=1, extra=1)
+        UKVP.create(key='k2', value=2, extra=2)
+
+        # DO NOTHING must carry the partial-index predicate to match the index.
+        (UKVP.insert(key='k2', value=2, extra=5)
+         .on_conflict(action='nothing',
+                      conflict_target=(UKVP.key, UKVP.value),
+                      conflict_where=(UKVP.extra > 1))
+         .execute())
+
+        self.assertEqual(
+            sorted(UKVP.select(UKVP.key, UKVP.value, UKVP.extra).tuples()),
+            [('k1', 1, 1), ('k2', 2, 2)])
+
+    @requires_postgresql
+    @requires_models(KVCon)
+    def test_ignore_conflict_constraint(self):
+        KVCon.create(key='k1', value=1)
+
+        # ON CONFLICT ON CONSTRAINT names one constraint, so a conflict on a
+        # different constraint still raises. Without the fix the name was
+        # dropped to a bare ON CONFLICT DO NOTHING that swallows any conflict.
+        with self.assertRaises(IntegrityError):
+            with self.database.atomic():
+                (KVCon.insert(key='k2', value=1)
+                 .on_conflict(action='nothing',
+                              conflict_constraint='kvcon_key_uniq')
+                 .execute())
+
+        # A conflict on the named constraint is ignored as intended.
+        (KVCon.insert(key='k1', value=2)
+         .on_conflict(action='nothing',
+                      conflict_constraint='kvcon_key_uniq')
+         .execute())
+        self.assertEqual(
+            list(KVCon.select(KVCon.key, KVCon.value).tuples()), [('k1', 1)])
+
+    @requires_upsert
+    @skip_if(IS_CRDB, 'not verified on crdb')
+    @requires_models(KVCon)
+    def test_ignore_conflict_target_scope(self):
+        KVCon.create(key='k1', value=1)
+
+        # DO NOTHING with a conflict target only suppresses conflicts on that
+        # target. A conflict on the value column still raises. SQLite used to
+        # drop the target to a bare DO NOTHING that swallows any conflict.
+        with self.assertRaises(IntegrityError):
+            with self.database.atomic():
+                (KVCon.insert(key='k2', value=1)
+                 .on_conflict(action='nothing', conflict_target=[KVCon.key])
+                 .execute())
+
+        # A conflict on the target column is ignored.
+        (KVCon.insert(key='k1', value=2)
+         .on_conflict(action='nothing', conflict_target=[KVCon.key])
+         .execute())
+        self.assertEqual(
+            list(KVCon.select(KVCon.key, KVCon.value).tuples()), [('k1', 1)])
 
 
 @requires_mysql
@@ -4996,6 +5463,33 @@ class TestLateralJoin(ModelTestCase):
             {'username': 'u1', 'content': 'u1-t2'},
             {'username': 'u2', 'content': 'u2-t3'},
             {'username': 'u2', 'content': 'u2-t2'}])
+
+    def test_join_lateral_inner(self):
+        with self.database.atomic():
+            for i in range(3):
+                u = User.create(username='u%s' % i)
+                for j in range(4):
+                    Tweet.create(user=u, content='u%s-t%s' % (i, j))
+
+        # JOIN.LATERAL is the inner lateral: JOIN LATERAL (...) ON true. It
+        # used to emit a bare, un-runnable LATERAL (...). Same result as the
+        # LEFT variant above, minus any user with no tweets.
+        TA = Tweet.alias()
+        tweets = (TA
+                  .select(TA.content)
+                  .where(TA.user == User.id)
+                  .order_by(TA.id.desc())
+                  .limit(2)
+                  .alias('pq'))
+        query = (User
+                 .select(User.username, tweets.c.content)
+                 .join(tweets, JOIN.LATERAL)
+                 .order_by(User.id, tweets.c.content.desc())
+                 .tuples())
+        self.assertEqual(list(query), [
+            ('u0', 'u0-t3'), ('u0', 'u0-t2'),
+            ('u1', 'u1-t3'), ('u1', 'u1-t2'),
+            ('u2', 'u2-t3'), ('u2', 'u2-t2')])
 
 
 # ===========================================================================
@@ -6307,6 +6801,15 @@ class TestUpdateIntegrationRegressions(ModelTestCase):
         self.assertEqual(list(query.clone()), [(0, 0.), (1, 1.), (2, 2.),
                                                (3, 3.)])
 
+    def test_update_subquery_in_function(self):
+        # A subquery nested inside a function used as a SET value must render
+        # the subquery in full, not collapse to its alias.
+        n_users = User.select(fn.COUNT(User.id))
+        Sample.update(counter=fn.COALESCE(n_users, 0)).execute()
+        counters = [c for c, in
+                    Sample.select(Sample.counter).order_by(Sample.id).tuples()]
+        self.assertEqual(counters, [3, 3, 3, 3])
+
 
 class MGProject(TestModel):
     name = TextField()
@@ -6497,6 +7000,314 @@ class TestCompoundExistsRegression(ModelTestCase):
         User.create(username='u1')
         self.assertTrue(cq.exists())
         self.assertEqual(cq.count(), 1)
+
+    def test_exists_compound_predicate(self):
+        User.create(username='u1')
+        User.create(username='u2')
+
+        UA = User.alias()
+        lhs = User.select(User.id).where(User.username == 'u1')
+        rhs = UA.select(UA.id).where(UA.username == 'u2')
+
+        # fn.EXISTS() around a compound used to emit EXISTS((...)), a syntax
+        # error. Both arms match, so the compound is non-empty and every row
+        # qualifies. (An empty compound arm under EXISTS trips a SQLite 3.51.x
+        # optimizer bug, so keep both arms non-empty.)
+        query = (User
+                 .select()
+                 .where(fn.EXISTS(lhs | rhs))
+                 .order_by(User.username))
+        self.assertEqual([u.username for u in query], ['u1', 'u2'])
+
+
+class OJOrg(TestModel):
+    name = TextField()
+
+
+class OJUser(TestModel):
+    org = ForeignKeyField(OJOrg, null=True)
+    name = TextField()
+
+
+class OJNote(TestModel):
+    author = ForeignKeyField(OJUser, null=True)
+    content = TextField()
+
+
+class OJNoteNoFK(TestModel):
+    # Same table as OJNote, but the author column is a plain integer, so the
+    # join attribute is not a field descriptor.
+    author_id = IntegerField(null=True)
+    content = TextField()
+    class Meta:
+        table_name = 'oj_note'
+
+
+class OJNoteReq(TestModel):
+    # Same table as OJNote, but declares the fk as non-null.
+    author = ForeignKeyField(OJUser)
+    content = TextField()
+    class Meta:
+        table_name = 'oj_note'
+
+
+class TestOuterJoinPopulateNone(ModelTestCase):
+    requires = [OJOrg, OJUser, OJNote]
+
+    def setUp(self):
+        super(TestOuterJoinPopulateNone, self).setUp()
+        self.acme = OJOrg.create(name='acme')
+        self.huey = OJUser.create(org=self.acme, name='huey')
+        self.zaizee = OJUser.create(org=None, name='zaizee')  # No org.
+        OJUser.create(org=self.acme, name='mickey')  # No notes.
+        OJNote.create(author=self.huey, content='meow')
+        OJNote.create(author=None, content='???')  # No author.
+        OJNote.create(author=self.zaizee, content='zzz')
+
+    def assertNotes(self, query, expected, attr='author', model=OJNote):
+        # Populate the relation as None.
+        with self.assertQueryCount(1):
+            accum = []
+            for note in query.order_by(model.id):
+                rel = getattr(note, attr)
+                accum.append((note.content,
+                              rel.name if rel is not None else None))
+        self.assertEqual(accum, expected)
+
+    def test_join_fk(self):
+        expected = [('meow', 'huey'), ('???', None), ('zzz', 'zaizee')]
+        self.assertNotes(
+            OJNote.select(OJNote, OJUser).join(OJUser, JOIN.LEFT_OUTER),
+            expected)
+
+        UA = OJUser.alias()
+        query = OJNote.select(OJNote, UA).join(UA, JOIN.LEFT_OUTER)
+        self.assertNotes(query, expected)
+
+        # The subquery holds only huey, so zaizee's note misses as well.
+        subq = OJUser.select().where(OJUser.name == 'huey')
+        query = (OJNote.select(OJNote, subq.c.id, subq.c.name)
+                 .join(subq, JOIN.LEFT_OUTER, on=OJNote.author == subq.c.id))
+        self.assertNotes(
+            query,
+            [('meow', 'huey'), ('???', None), ('zzz', None)])
+
+    def test_join_custom_attr(self):
+        # attr= is a plain attribute, not a field descriptor.
+        expected = [('meow', 'huey'), ('???', None), ('zzz', 'zaizee')]
+
+        query = (OJNote.select(OJNote, OJUser)
+                 .join(OJUser, JOIN.LEFT_OUTER, attr='u'))
+        self.assertNotes(query, expected, attr='u')
+
+        UA = OJUser.alias()
+        query = OJNote.select(OJNote, UA).join(UA, JOIN.LEFT_OUTER, attr='u')
+        self.assertNotes(query, expected, attr='u')
+
+        subq = OJUser.select().where(OJUser.name == 'huey')
+        query = (OJNote.select(OJNote, subq.c.id, subq.c.name)
+                 .join(subq, JOIN.LEFT_OUTER, on=OJNote.author == subq.c.id,
+                       attr='u'))
+        self.assertNotes(
+            query,
+            [('meow', 'huey'), ('???', None), ('zzz', None)],
+            attr='u')
+
+    def test_join_without_fk(self):
+        expected = [('meow', 'huey'), ('???', None), ('zzz', 'zaizee')]
+
+        query = (OJNoteNoFK.select(OJNoteNoFK, OJUser)
+                 .join(OJUser, JOIN.LEFT_OUTER,
+                       on=OJNoteNoFK.author_id == OJUser.id, attr='author'))
+        self.assertNotes(query, expected, model=OJNoteNoFK)
+
+        UA = OJUser.alias()
+        query = (OJNoteNoFK.select(OJNoteNoFK, UA)
+                 .join(UA, JOIN.LEFT_OUTER, on=OJNoteNoFK.author_id == UA.id,
+                       attr='author'))
+        self.assertNotes(query, expected, model=OJNoteNoFK)
+
+        subq = OJUser.select().where(OJUser.name == 'huey')
+        query = (OJNoteNoFK.select(OJNoteNoFK, subq.c.id, subq.c.name)
+                 .join(subq, JOIN.LEFT_OUTER,
+                       on=OJNoteNoFK.author_id == subq.c.id, attr='author'))
+        self.assertNotes(
+            query,
+            [('meow', 'huey'), ('???', None), ('zzz', None)],
+            model=OJNoteNoFK)
+
+    def assertUsers(self, query, attr='ojnote'):
+        with self.assertQueryCount(1):
+            accum = []
+            for user in query.order_by(OJUser.id):
+                note = getattr(user, attr)
+                accum.append((user.name,
+                              note.content if note is not None else None))
+        self.assertEqual(accum, [('huey', 'meow'), ('zaizee', 'zzz'),
+                                 ('mickey', None)])
+
+    def test_join_backref(self):
+        # The foreign key is on the right-hand model, so the attribute
+        # defaults to the model name and is not a descriptor on OJUser.
+        self.assertUsers(
+            OJUser.select(OJUser, OJNote).join(OJNote, JOIN.LEFT_OUTER))
+
+        NA = OJNote.alias()
+        self.assertUsers(
+            OJUser.select(OJUser, NA).join(NA, JOIN.LEFT_OUTER))
+
+        query = (OJUser.select(OJUser, OJNote)
+                 .join(OJNote, JOIN.LEFT_OUTER, attr='n'))
+        self.assertUsers(query, attr='n')
+
+    def assertOrgs(self, query, expected, model=OJNote):
+        with self.assertQueryCount(1):
+            accum = []
+            for note in query.order_by(model.id):
+                author = note.author
+                org = author.org if author is not None else None
+                accum.append((
+                    note.content,
+                    author.name if author is not None else None,
+                    org.name if org is not None else None))
+        self.assertEqual(accum, expected)
+
+    def test_multi_hop(self):
+        # "???" has no author at all (the intervening model is absent), and
+        # "zzz" has an author with no org (the leaf is absent).
+        expected = [('meow', 'huey', 'acme'), ('???', None, None),
+                    ('zzz', 'zaizee', None)]
+        self.assertOrgs(
+            (OJNote.select(OJNote, OJUser, OJOrg)
+             .join(OJUser, JOIN.LEFT_OUTER)
+             .join(OJOrg, JOIN.LEFT_OUTER)), expected)
+
+        UA = OJUser.alias()
+        self.assertOrgs(
+            (OJNote.select(OJNote, UA, OJOrg)
+             .join(UA, JOIN.LEFT_OUTER)
+             .join(OJOrg, JOIN.LEFT_OUTER)), expected)
+
+        u_subq = OJUser.select().where(OJUser.name == 'huey')
+        o_subq = OJOrg.select()
+        query = (OJNoteNoFK
+                 .select(OJNoteNoFK, u_subq.c.id, u_subq.c.name,
+                         u_subq.c.org_id, o_subq.c.id, o_subq.c.name)
+                 .join(u_subq, JOIN.LEFT_OUTER,
+                       on=OJNoteNoFK.author_id == u_subq.c.id, attr='author')
+                 .join(o_subq, JOIN.LEFT_OUTER,
+                       on=u_subq.c.org_id == o_subq.c.id, attr='org'))
+        self.assertOrgs(
+            query,
+            [('meow', 'huey', 'acme'), ('???', None, None),
+             ('zzz', None, None)],
+            model=OJNoteNoFK)
+
+    def test_null_columns_vs_missed_join(self):
+        # A miss is detected by every selected column coming back NULL, so
+        # a matched row whose selected columns are all NULL also reads as
+        # None (zaizee's row joins, but his org_id is NULL).
+        query = (OJNote.select(OJNote, OJUser.org)
+                 .join(OJUser, JOIN.LEFT_OUTER))
+        with self.assertQueryCount(1):
+            accum = [(n.content, n.author is None)
+                     for n in query.order_by(OJNote.id)]
+        self.assertEqual(accum, [('meow', False), ('???', True),
+                                 ('zzz', True)])
+
+        # Selecting the pk disambiguates: only the true miss is None.
+        query = (OJNote.select(OJNote, OJUser.id, OJUser.org)
+                 .join(OJUser, JOIN.LEFT_OUTER))
+        with self.assertQueryCount(1):
+            accum = []
+            for note in query.order_by(OJNote.id):
+                a = note.author
+                accum.append((note.content,
+                              a.id if a is not None else None,
+                              a.org_id if a is not None else None))
+        self.assertEqual(accum, [
+            ('meow', self.huey.id, self.acme.id),
+            ('???', None, None),
+            ('zzz', self.zaizee.id, None)])
+
+    def test_missed_join_preserves_fk_id(self):
+        # The miss is cached on the relation rather than written through the
+        # fk descriptor, so author_id keeps the row's column value.
+        cond = (OJNote.author == OJUser.id) & (OJUser.name != 'zaizee')
+        query = (OJNote.select(OJNote, OJUser)
+                 .join(OJUser, JOIN.LEFT_OUTER, on=cond))
+        with self.assertQueryCount(1):
+            notes = list(query.order_by(OJNote.id))
+            accum = [(n.content, n.author is None, n.author_id, n.is_dirty())
+                     for n in notes]
+        self.assertEqual(accum, [
+            ('meow', False, self.huey.id, False),
+            ('???', True, None, False),
+            ('zzz', True, self.zaizee.id, False)])
+
+        # Assigning the fk id invalidates the cached miss and lazy-loads.
+        zzz = notes[2]
+        zzz.author_id = self.zaizee.id
+        with self.assertQueryCount(1):
+            self.assertEqual(zzz.author.name, 'zaizee')
+
+        # A custom attr never touches the fk.
+        query = (OJNote.select(OJNote, OJUser)
+                 .join(OJUser, JOIN.LEFT_OUTER, on=cond, attr='u'))
+        with self.assertQueryCount(1):
+            accum = [(n.content, n.u is None, n.author_id)
+                     for n in query.order_by(OJNote.id)]
+        self.assertEqual(accum, [
+            ('meow', False, self.huey.id),
+            ('???', True, None),
+            ('zzz', True, self.zaizee.id)])
+
+    def test_missed_join_not_null_fk(self):
+        # A miss on a non-null fk reads as None rather than raising
+        # DoesNotExist, and does not attempt a lazy-load.
+        cond = (OJNoteReq.author == OJUser.id) & (OJUser.name != 'zaizee')
+        query = (OJNoteReq.select(OJNoteReq, OJUser)
+                 .join(OJUser, JOIN.LEFT_OUTER, on=cond))
+        with self.assertQueryCount(1):
+            accum = [(n.content, n.author is None, n.author_id)
+                     for n in query.order_by(OJNoteReq.id)]
+        self.assertEqual(accum, [
+            ('meow', False, self.huey.id),
+            ('???', True, None),
+            ('zzz', True, self.zaizee.id)])
+
+    def test_inner_join_null_columns(self):
+        # Only outer joins populates None: an inner join leaves the attr
+        # unset when all selected columns are NULL, and the fk lazy-loads.
+        query = OJNote.select(OJNote, OJUser.org).join(OJUser)
+        with self.assertQueryCount(1):
+            notes = list(query.order_by(OJNote.id))
+            self.assertEqual([n.content for n in notes], ['meow', 'zzz'])
+        with self.assertQueryCount(0):
+            self.assertIsNotNone(notes[0].author)
+        with self.assertQueryCount(1):
+            self.assertEqual(notes[1].author.name, 'zaizee')
+
+    def test_skip_intermediate_model(self):
+        # No user columns are selected: a matched user populates as an empty
+        # shell carrying the org, or None when the org side is NULL too.
+        query = (OJNote.select(OJNote, OJOrg)
+                 .join(OJUser, JOIN.LEFT_OUTER)
+                 .join(OJOrg, JOIN.LEFT_OUTER))
+        with self.assertQueryCount(1):
+            accum = []
+            for note in query.order_by(OJNote.id):
+                a = note.author
+                if a is None:
+                    accum.append((note.content, True, None, None))
+                else:
+                    org = a.org
+                    accum.append((note.content, False, a.name,
+                                  org.name if org is not None else None))
+        self.assertEqual(accum, [
+            ('meow', False, None, 'acme'),  # Shell: unselected name is None.
+            ('???', True, None, None),
+            ('zzz', True, None, None)])
 
 
 class TestLikeColumnValue(ModelTestCase):
@@ -6968,6 +7779,53 @@ class TestModelSelectFromSubquery(ModelTestCase):
         self.assertTrue(isinstance(query[0], User))
 
 
+class TestDefaultSelectAsSource(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_source_subquery_executes(self):
+        huey = User.create(username='huey')
+        zaizee = User.create(username='zaizee')
+        Tweet.create(user=huey, content='meow')
+        Tweet.create(user=zaizee, content='hiss')
+
+        # An unnamed User.select() joined as a table used to return only the
+        # primary key, so reading username raised "no such column". Now every
+        # column comes back and the joined row rebuilds onto the foreign key
+        # attribute the same as a plain model join. The query count stays at
+        # one, proving the joined user is populated and not lazy-loaded.
+        src = User.select()
+        query = (Tweet
+                 .select(Tweet.content, src.c.username)
+                 .join(src, on=(Tweet.user == src.c.id))
+                 .order_by(Tweet.content))
+        with self.assertQueryCount(1):
+            rows = list(query)
+            self.assertEqual([(t.content, t.user.username) for t in rows],
+                             [('hiss', 'zaizee'), ('meow', 'huey')])
+
+        # A User.select().alias('u') used as a FROM table. The query model is
+        # User, so its columns rebuild onto the User row.
+        src = User.select().alias('u')
+        query = (User
+                 .select(src.c.username)
+                 .from_(src)
+                 .order_by(src.c.username))
+        with self.assertQueryCount(1):
+            self.assertEqual([u.username for u in query], ['huey', 'zaizee'])
+
+        # The User.alias().select() form worked before and must still work.
+        UA = User.alias()
+        src = UA.select()
+        query = (Tweet
+                 .select(Tweet.content, src.c.username)
+                 .join(src, on=(Tweet.user == src.c.id))
+                 .order_by(Tweet.content))
+        with self.assertQueryCount(1):
+            rows = list(query)
+            self.assertEqual([(t.content, t.user.username) for t in rows],
+                             [('hiss', 'zaizee'), ('meow', 'huey')])
+
+
 class TestModelAliasEdgeCases(BaseTestCase):
     def test_setattr_raises(self):
         UA = User.alias()
@@ -7164,67 +8022,3 @@ class TestAnalyticalQueries(ModelTestCase):
             (datetime.date(2026, 3, 1), 152, 352, -48),
             (datetime.date(2026, 4, 1), 1021, 1373, 869),
         ])
-
-
-@skip_if(sys.version_info < (3, 11, 0), 'requires 3.11')
-class TestFunctionCoerce(ModelTestCase):
-    database = get_in_memory_db()
-    requires = [Post]
-
-    def test_function_coerce(self):
-        for i in range(3):
-            for j in range(i + 1):
-                Post.create(
-                    content='p',
-                    timestamp=datetime.datetime(2026, 1, j + 1))
-
-        @self.database.func()
-        def ymd(s):
-            return datetime.datetime.fromisoformat(s).strftime('%Y%m%d')
-
-        def assertResults(agg, expected):
-            q = (Post
-                 .select(agg, fn.COUNT(Post.id))
-                 .group_by(agg)
-                 .order_by(SQL('1')))
-            self.assertEqual(list(q.tuples()), expected)
-
-        exp = fn.ymd(Post.timestamp)
-
-        convert = [
-            exp,
-            exp.alias('xyz'),
-            exp.alias('xyz').coerce(True),
-            exp.bind_to(Post).alias('xyz'),
-            exp.cast('text').coerce(True),
-            exp.cast('text').alias('timestamp').coerce(True),
-            exp.python_value(Post.timestamp.python_value),
-            fn.upper(Post.timestamp),
-
-            # I don't want to screw up people doing stuff like fn.json_extract
-            # on a field casted to json (e.g.), so this will run through the
-            # converter:
-            fn.upper(Post.timestamp.cast('text')),
-        ]
-        for e in convert:
-            assertResults(e, [
-                (datetime.datetime(2026, 1, 1), 3),
-                (datetime.datetime(2026, 1, 2), 2),
-                (datetime.datetime(2026, 1, 3), 1)])
-
-        no_convert = [
-            exp.coerce(False),
-            exp.cast('text'),
-            exp.cast('text').alias('xyz'),
-            exp.cast('text').alias('timestamp'),
-            exp.alias('xyz').coerce(False),
-            exp.cast('text').alias('xyz').coerce(False),
-            exp.python_value(Post.timestamp.python_value).cast('text'),
-            fn.upper(exp),
-            fn.upper(exp.cast('text')),
-        ]
-        for e in no_convert:
-            assertResults(e, [
-                ('20260101', 3),
-                ('20260102', 2),
-                ('20260103', 1)])

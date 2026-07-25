@@ -822,6 +822,31 @@ class TestBlobField(ModelTestCase):
             data = bytes(data)
         self.assertEqual(data, b'\xff\x01')
 
+    def test_blob_field_str(self):
+        # Strings are encoded to bytes using utf8.
+        b = BlobModel.create(data='caf\xe9 ☃')
+        b_db = BlobModel.get(BlobModel.data == 'caf\xe9 ☃')
+        self.assertEqual(b.id, b_db.id)
+
+        data = b_db.data
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        elif not isinstance(data, bytes):
+            data = bytes(data)
+        self.assertEqual(data.decode('utf8'), 'caf\xe9 ☃')
+
+    def test_blob_field_memoryview(self):
+        b = BlobModel.create(data=memoryview(b'\xff\x01\x02'))
+        b_db = BlobModel.get(BlobModel.data == b'\xff\x01\x02')
+        self.assertEqual(b.id, b_db.id)
+
+        data = b_db.data
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        elif not isinstance(data, bytes):
+            data = bytes(data)
+        self.assertEqual(data, b'\xff\x01\x02')
+
     def test_blob_on_proxy(self):
         db = Proxy()
         class NewBlobModel(Model):
@@ -1161,8 +1186,20 @@ class Bits(TestModel):
     data = BigBitField()
 
 
+class NullBits(TestModel):
+    data = BigBitField(null=True)
+
+
 class TestBitFields(ModelTestCase):
     requires = [Bits]
+
+    @requires_models(NullBits)
+    def test_bigbit_field_null(self):
+        nb = NullBits.create(data=None)
+        nb.data = None
+        nb.save()
+        query = NullBits.select().where(NullBits.data.is_null())
+        self.assertEqual([x.id for x in query], [nb.id])
 
     def test_bit_field_update(self):
         def assertFlags(expected):
@@ -1194,6 +1231,22 @@ class TestBitFields(ModelTestCase):
         # Clear multiple bits in one operation.
         Bits.update(flags=Bits.flags & ~(1 | 4)).execute()
         assertFlags([2, 2, 2, 2])
+
+    def test_bit_field_subtract(self):
+        # `x - y` clears bits: it means `x & ~y`, for an int or another column.
+        # __sub__ used to call a nonexistent bin_negated() and always raised.
+        for i in range(1, 5):
+            Bits.create(flags=i, status=6)  # status bits 2 and 4 set.
+
+        q = Bits.select((Bits.flags - 2).alias('x')).order_by(Bits.id)
+        self.assertEqual([b.x for b in q], [1, 0, 1, 4])
+
+        q = Bits.select((Bits.flags - Bits.status).alias('x')).order_by(Bits.id)
+        self.assertEqual([b.x for b in q], [1, 0, 1, 0])
+
+        Bits.update(flags=Bits.flags - (1 | 4)).execute()
+        self.assertEqual([b.flags for b in Bits.select().order_by(Bits.id)],
+                         [0, 2, 2, 0])
 
     def test_bit_field_auto_flag(self):
         class Bits2(TestModel):
@@ -2917,6 +2970,63 @@ class TestModelConversionRegression(ModelTestCase):
 
 
 class TestFieldAccessorEdgeCases(BaseTestCase):
+    def test_field_hash_distinguishes_tables(self):
+        class Customer(TestModel): pass
+
+        def make_order(table, backref):
+            meta = type('Meta', (), {'table_name': table})
+            return type('Order', (TestModel,), {
+                'Meta': meta,
+                'customer': ForeignKeyField(Customer, backref=backref)})
+
+        make_order('order_a', 'orders_a')
+        make_order('order_b', 'orders_b')
+        self.assertEqual(len(Customer._meta.backrefs), 2)
+
+        def make_order_schema(schema, backref):
+            meta = type('Meta', (), {'table_name': 'order_s',
+                                     'schema': schema})
+            return type('Order', (TestModel,), {
+                'Meta': meta,
+                'customer': ForeignKeyField(Customer, backref=backref)})
+
+        make_order_schema('s1', 'orders_s1')
+        make_order_schema('s2', 'orders_s2')
+        self.assertEqual(len(Customer._meta.backrefs), 4)
+
+    def test_field_hash_stable_after_schema_change(self):
+        class Reg(TestModel):
+            amount = IntegerField(default=0)
+        class Ref(TestModel):
+            reg = ForeignKeyField(Reg, backref='refs')
+
+        fk = Ref._meta.fields['reg']
+        self.assertIn(fk, Ref._meta.refs)
+        self.assertIn(fk, Reg._meta.backrefs)
+
+        Ref._meta.schema = 'tenant1'
+        Ref._meta.set_table_name('ref_2')
+        self.assertIn(fk, Ref._meta.refs)
+        self.assertIn(fk, Reg._meta.backrefs)
+
+        Reg._meta.remove_field('amount')
+        Ref._meta.remove_field('reg')
+
+    def test_remove_ref_multiple_fks_same_target(self):
+        class Person(TestModel):
+            name = CharField()
+        class Note(TestModel):
+            author = ForeignKeyField(Person, backref='authored')
+            editor = ForeignKeyField(Person, backref='edited')
+
+        self.assertEqual([f.name for f in Note._meta.model_refs[Person]],
+                         ['author', 'editor'])
+        Note._meta.remove_field('editor')
+        self.assertEqual([f.name for f in Note._meta.model_refs[Person]],
+                         ['author'])
+        self.assertEqual([f.name for f in Person._meta.model_backrefs[Note]],
+                         ['author'])
+
     def test_field_accessor_missing_key(self):
         u = User()
         u.__data__ = {}

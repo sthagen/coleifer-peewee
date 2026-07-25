@@ -9,6 +9,7 @@ from playhouse.reflection import *
 from .base import IS_CRDB
 from .base import IS_CYSQLITE
 from .base import IS_MYSQL
+from .base import IS_ORACLE_MYSQL
 from .base import IS_POSTGRESQL
 from .base import IS_SQLITE
 from .base import IS_SQLITE_OLD
@@ -185,6 +186,20 @@ class TestReflection(BaseReflectionTestCase):
             self.assertEqual(match.groups(), (
                 'col_types_id', 'coltypes', 'f11',
             ))
+
+    @skip_if(not IS_ORACLE_MYSQL, 'requires mysql (mariadb reports longtext)')
+    def test_mysql_json_maps_to_core_field(self):
+        self.database.execute_sql('drop table if exists rj')
+        self.database.execute_sql(
+            'create table rj (id integer not null primary key '
+            'auto_increment, data json)')
+        try:
+            models = self.introspector.generate_models(table_names=['rj'])
+            field = models['rj']._meta.fields['data']
+            self.assertTrue(isinstance(field, JSONField))
+            self.assertFalse(self.introspector.metadata.requires_extension)
+        finally:
+            self.database.execute_sql('drop table rj')
 
     def test_make_column_name(self):
         # Tests for is_foreign_key=False.
@@ -388,6 +403,23 @@ class TestReflection(BaseReflectionTestCase):
 
         category = nugget['category']
         self.assertEqual(category.name, 'category')
+
+    def test_fk_on_delete_update(self):
+        self.database.execute_sql(
+            'CREATE TABLE odu ('
+            'id INTEGER PRIMARY KEY, '
+            'rel_model_id INTEGER, '
+            'FOREIGN KEY (rel_model_id) REFERENCES rel_model (id) '
+            'ON DELETE CASCADE ON UPDATE SET NULL)')
+        try:
+            (columns, primary_keys, foreign_keys, model_names,
+             indexes) = self.introspector.introspect()
+            params = columns['odu']['rel_model_id'].get_field_parameters()
+            self.assertEqual(params.get('on_delete'), "'CASCADE'")
+            self.assertEqual(params.get('on_update'), "'SET NULL'")
+            self.assertNotIn('attr', params)
+        finally:
+            self.database.execute_sql('DROP TABLE odu')
 
     def test_get_field(self):
         (columns,
