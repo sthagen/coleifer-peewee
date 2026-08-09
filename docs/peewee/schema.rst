@@ -54,7 +54,7 @@ multiple times. To disable this, pass ``safe=False``.
    db.drop_tables([User, Tweet, Favorite], safe=False)
 
 Pass ``cascade=True`` on Postgresql to drop dependent objects and let the
-database handle ordering (MySQL parses but ignores CASCADE):
+database handle dependency resolution:
 
 .. code-block:: python
 
@@ -99,8 +99,8 @@ Truncating a table:
 
 .. code-block:: python
 
-   User._schema.truncate_table()       # No cascade.
-   User._schema.truncate_table(cascade=True)   # Postgresql only.
+   User._schema.truncate_table()  # No cascade.
+   User._schema.truncate_table(cascade=True)  # Postgresql only.
 
 .. seealso::
    :class:`SchemaManager` API reference.
@@ -110,15 +110,47 @@ Truncating a table:
 Schema Migrations
 -----------------
 
-Peewee does not include a built-in migration system. For schema changes in an
-existing deployment (adding columns, dropping columns, renaming tables,
-modifying indexes), use one of the following approaches.
+Peewee ships two layers of migration tooling in playhouse: the
+:ref:`migrate <migrate>` module, which provides a Python interface for making
+schema changes, and the :ref:`migrations runner <migration-runner>`, which
+runs versioned migration scripts. For schema changes in an existing
+deployment (adding columns, dropping columns, renaming tables, modifying
+indexes), use one of the following approaches.
 
-Playhouse migrate module
-^^^^^^^^^^^^^^^^^^^^^^^^^
+Migration runner
+^^^^^^^^^^^^^^^^
 
-The :ref:`migrate <migrate>` module in playhouse provides a set of helper
-functions for common schema changes, applied through a :class:`SchemaMigrator`:
+The :ref:`runner <migration-runner>` applies plain-python migration
+scripts in numeric order, recording each by name in a history table.
+The CLI is installed as ``pwmigrate``:
+
+.. code-block:: console
+
+   # Identifies differences between application code and schema, then
+   # generates a migration file.
+   $ pwmigrate app.settings.db generate "add karma" app.models
+   migrations/0002_add_karma.py
+
+   # Equivalent to above, but using a database URL instead of the
+   # dotted-path:
+   $ pwmigrate postgresql:///my_db generate "add karma" app.models
+
+   $ pwmigrate app.settings.db up
+   applied: 0002_add_karma
+
+Scripts define ``up(migrator, db)`` and, optionally, ``down(migrator,
+db)``. ``generate`` builds the migration from a
+:ref:`schema diff <schema-diff>` against your model definitions, while
+``create`` writes a bare template.
+
+.. seealso::
+   :ref:`migration-runner` for the runner, CLI and generation reference.
+
+Migrate module
+^^^^^^^^^^^^^^
+
+The :ref:`playhouse.migrate <migrate>` module provides a set of helper
+functions for common schema changes, applied through a :class:`~playhouse.migrate.SchemaMigrator`:
 
 .. code-block:: python
 
@@ -164,9 +196,19 @@ directly:
 SQLite limitations
 ^^^^^^^^^^^^^^^^^^
 
-SQLite has limited ALTER TABLE support. It supports ``ADD COLUMN`` and
-``RENAME TABLE`` but not ``DROP COLUMN``, ``RENAME COLUMN``, or constraint
-changes in older versions (SQLite 3.35.0+ adds ``DROP COLUMN``).
+SQLite has limited ALTER TABLE support depending on which version is installed.
+Some functionality can be emulated using a detailed fallback path which moves
+the existing table, recreates a new table, then copies into the newly-created
+table.
+
+Version-specific or limited functionality:
+
+* ``DROP COLUMN`` (3.35.0, fallback for older).
+* ``RENAME COLUMN`` (3.25.0, fallback for older).
+* ``ALTER COLUMN ... SET/DROP NOT NULL`` (3.53.0, fallback for older).
+* ``ALTER COLUMN ... DEFAULT ...`` (uses fallback)
+* ``ALTER COLUMN ... TYPE ...`` (uses fallback)
+* ``ADD/DROP CONSTRAINT`` (3.53.0, limited to certain operations).
 
 For more complex SQLite schema changes, the standard workaround is to:
 
@@ -229,8 +271,8 @@ Python model definitions:
 
 .. code-block:: shell
 
-   python -m pwiz -e postgresql my_database > models.py
-   python -m pwiz -e sqlite my_app.db > models.py
+   pwiz -e postgresql my_database > models.py
+   pwiz -e sqlite my_app.db > models.py
 
 The generated models can be used directly or as a starting point for further
 customization.

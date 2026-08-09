@@ -274,7 +274,7 @@ validation.
 | ``UUIDField``                             | ``uuid.UUID``          |
 +-------------------------------------------+------------------------+
 | ``JSONField``, ``BinaryJSONField``        | ``Any`` (an object,    |
-| (core, SQLite or Postgres extensions)     | array or scalar)       |
+| (core or Postgres extensions)             | array or scalar)       |
 +-------------------------------------------+------------------------+
 | ``IntervalField`` (Postgres)              | ``datetime.timedelta`` |
 +-------------------------------------------+------------------------+
@@ -458,9 +458,9 @@ Back-references work the same way, but the schema must be wrapped in
 .. note::
    In async applications using the :ref:`asyncio extension <pwasyncio>`,
    run validation inside the greenlet bridge unless relations were
-   preloaded. A lazy load outside ``db.run()`` raises
-   ``MissingGreenletBridge``:
-   ``data = await db.run(UserDetail.model_validate, user)``.
+   preloaded. A lazy load outside ``db.run()`` raises ``MissingGreenletBridge``,
+   which in turn triggers a pydantic ``ValidationError``. To lazy-load,
+   use ``db.run()``, e.g.: ``data = await db.run(UserDetail.model_validate, user)``.
 
 
 JSON schema output
@@ -978,7 +978,7 @@ Signal callback signature:
       :param callable receiver: a callable that takes at least two parameters,
           a "sender", which is the Model subclass that triggered the signal, and
           an "instance", which is the actual model instance.
-      :param string name: a short alias
+      :param str name: a short alias
       :param Model sender: if specified, only instances of this model class will
           trigger the receiver callback.
 
@@ -995,7 +995,7 @@ Signal callback signature:
    .. method:: disconnect(receiver=None, name=None, sender=None)
 
       :param callable receiver: the callback to disconnect
-      :param string name: a short alias
+      :param str name: a short alias
       :param Model sender: disconnect model-specific handler.
 
       Disconnect the given receiver (or the receiver with the given name alias)

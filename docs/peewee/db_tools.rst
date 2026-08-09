@@ -27,7 +27,7 @@ credentials live in environment variables.
    import os
    from playhouse.db_url import connect
 
-   db = connect(os.environ.get('DATABASE_URL', 'sqlite:////default.db'))
+   db = connect(os.environ.get('DATABASE_URL', 'sqlite:///default.db'))
 
 Pass additional keyword arguments in the query string:
 
@@ -101,13 +101,15 @@ Alternate drivers:
    :param bool unquote_user: unquote special characters in the user.
    :param connect_params: additional parameters to pass to the Database.
 
-   Parse ``url`` and return an appropriate :class:`Database` instance.
+   Parse ``url`` and return an appropriate :class:`Database` instance. A
+   URL without a database name raises ``ValueError``.
 
    Examples:
 
    * ``sqlite:///my_app.db`` - SQLite file in the current directory.
    * ``sqlite:///:memory:`` - in-memory SQLite.
    * ``sqlite:////absolute/path/to/app.db`` - absolute path SQLite.
+   * ``postgresql:///dbname`` - database running locally.
    * ``postgresql://user:password@host:5432/dbname``
    * ``mysql://user:password@host:3306/dbname``
 
@@ -138,8 +140,8 @@ Alternate drivers:
 
    .. code-block:: python
 
-       register_database(FirebirdDatabase, 'firebird')
-       db = connect('firebird://my-firebird-db')
+       register_database(ClickHouseDatabase, 'clickhouse')
+       db = connect('clickhouse:///my-db')
 
 
 .. _pool:
@@ -150,17 +152,16 @@ Connection Pooling
 .. module:: playhouse.pool
 
 The ``playhouse.pool`` module contains a number of :class:`Database` classes
-that provide connection pooling for Postgresql, MySQL and SQLite databases. The
-pool works by overriding the methods on the :class:`Database` class that open
-and close connections to the backend.
+that provide transparent connection pooling for peewee databases. The pool
+works by overriding the methods on the :class:`Database` class that open and
+close connections to the backend, and works as a drop-in replacement.
 
-In multi-threaded applications, each thread gets its own connection; the
-pool maintains up to ``max_connections`` open connections at any time.
-In single-threaded applications, a single connection is recycled.
-
-The application only needs to ensure that connections are *closed* when work
-is done - typically at the end of an HTTP request. Closing a pooled connection
-returns it to the pool rather than actually disconnecting.
+In multi-threaded or web applications, each thread gets its own connection. The
+pool maintains up to ``max_connections`` open connections at any time. The
+application only needs to ensure that connections are *closed* when work is
+done (typically at the end of an HTTP request), so the connection can be
+returned to the pool. Closing a pooled connection returns it to the pool rather
+than actually disconnecting.
 
 .. code-block:: python
 
@@ -180,12 +181,12 @@ returns it to the pool rather than actually disconnecting.
 
 .. note::
    Applications using Peewee's :ref:`asyncio integration <pwasyncio>` do not need to
-   use a special pooled database - the Async databases use a connection pool by
+   use a special pooled database. Async databases use a connection pool by
    default.
 
 .. class:: PooledDatabase(database, max_connections=20, stale_timeout=None, timeout=None, **kwargs)
 
-   Mixin class mixed into the specific backend subclasses above.
+   Common mixin class used for specific backend implementations.
 
    :param str database: The name of the database or database file.
    :param int max_connections: Maximum number of concurrent connections.
@@ -193,16 +194,14 @@ returns it to the pool rather than actually disconnecting.
    :param int stale_timeout: Seconds after which an idle connection is
        considered stale and will be discarded next time it would be reused.
    :param int timeout: Seconds to block when all connections are in use.
-       ``0`` blocks indefinitely; ``None`` (default) raises immediately.
+       ``0`` blocks indefinitely, ``None`` (default) raises immediately.
 
-   .. note::
-      Connections will not be closed exactly when they exceed their
-      ``stale_timeout``. Instead, stale connections are only closed when a new
-      connection is requested.
+   Connections will not be closed exactly when they exceed their
+   ``stale_timeout``. Instead, stale connections are only closed when a new
+   connection is requested.
 
-   .. note::
-       If the pool is exhausted and no ``timeout`` is configured, a
-       ``ValueError`` is raised.
+   If the pool is exhausted and no ``timeout`` is configured, a
+   ``MaxConnectionsExceeded`` is raised.
 
    .. method:: manual_close()
 
@@ -238,6 +237,15 @@ returns it to the pool rather than actually disconnecting.
 
    Pool implementation for MySQL / MariaDB databases. Extends :class:`MySQLDatabase`.
 
+Additional implementations exist for:
+
+* :class:`~playhouse.postgres_ext.PooledPostgresqlExtDatabase`
+* :class:`~playhouse.postgres_ext.PooledPsycopg3Database`
+* :class:`~playhouse.mysql_ext.PooledMySQLConnectorDatabase`
+* :class:`~playhouse.mysql_ext.PooledMariaDBConnectorDatabase`
+* :class:`~playhouse.cysqlite_ext.PooledCySqliteDatabase`
+* :class:`~playhouse.cockroachdb.PooledCockroachDatabase`
+
 
 .. _migrate:
 
@@ -250,20 +258,18 @@ The ``playhouse.migrate`` module provides a lightweight API for making
 incremental schema changes to an existing database without writing raw SQL.
 
 The peewee migration philosophy is that tools relying on database
-introspection, versioning, and auto-detection are often fragile, brittle and
-unnecessarily complex. Migrations can be written as simple python scripts and
-executed from the command-line. Since the migrations only depend on your
-application's :class:`Database` object, migration scripts do not introduce new
-dependencies.
+introspection, versioning, and auto-detection are often brittle and
+complex. Migrations can be written as simple python scripts and executed from
+the command-line. The :ref:`runner <migration-runner>` below adds bookkeeping
+and can be used for migration generation and execution.
 
-Supported operations:
+Supported schema-altering operations:
 
 - Add, rename, or drop columns.
 - Make columns nullable or not nullable.
-- Change a column's type.
-- Rename a table.
+- Change a column's type or server-side default.
+- Rename or drop a table.
 - Add or drop indexes and constraints.
-- Add or drop column default values.
 
 .. seealso:: :ref:`schema`
 
@@ -281,8 +287,11 @@ Supported operations:
        )
 
 .. tip::
-   Wrap migrations in ``db.atomic()`` to ensure changes are not partially
-   applied.
+   Wrap migrations in :meth:`SchemaMigrator.migration_context` to ensure
+   changes are not partially applied when transactional DDL is available
+   (SQLite and Postgres). It also temporarily disables the SQLite
+   foreign-keys pragma, so table rebuilds (required for some operations)
+   do not destroy rows via ``ON DELETE CASCADE``.
 
 Operations
 ^^^^^^^^^^
@@ -344,6 +353,12 @@ Peewee appends by default):
 
    migrate(migrator.rename_table('story', 'stories'))
 
+**Drop table:**
+
+.. code-block:: python
+
+   migrate(migrator.drop_table('story', safe=True))
+
 **Add / drop indexes:**
 
 .. code-block:: python
@@ -359,6 +374,15 @@ Peewee appends by default):
        # Drop the pub-date + status index.
        migrator.drop_index('story', 'story_pub_date_status'),
    )
+
+   # Only index published stories (sqlite and postgres).
+   story = Table('story')
+   migrate(migrator.add_index('story', ('pub_date',), False,
+                              where=(story.c.status == 'published')))
+
+   # Unique index treating NULLs as equal (postgres 15+).
+   migrate(migrator.add_index('story', ('external_id',), True,
+                              nulls_distinct=False))
 
 **Add / drop constraints:**
 
@@ -385,14 +409,31 @@ Peewee appends by default):
    # Add a default value:
    migrate(migrator.add_column_default('entry', 'status', 'draft'))
 
-   # Use a function (not supported in SQLite):
+   # Use a function expression (not supported in SQLite):
    migrate(migrator.add_column_default('entry', 'created_at', fn.NOW()))
 
    # SQLite-compatible function syntax:
-   migrate(migrator.add_column_default('entry', 'created_at', 'now()'))
+   migrate(migrator.add_column_default(
+       'entry',
+       'created_at',
+       "(datetime('now'))"))
 
    # Remove a default:
    migrate(migrator.drop_column_default('entry', 'status'))
+
+**Raw SQL:**
+
+.. code-block:: python
+
+   # Interleave data fixes with schema changes in a single plan.
+   migrate(
+       migrator.add_column('entry', 'score', IntegerField(null=True)),
+       migrator.sql('UPDATE entry SET score = %s', (0,)),
+       migrator.add_not_null('entry', 'score'),
+   )
+
+``params`` are bound by the database driver, so the placeholder is the
+driver's own: ``%s`` for postgres and mysql, ``?`` for sqlite.
 
 .. note::
    Postgres users may need to set the search-path when using a non-standard
@@ -437,16 +478,32 @@ Migration API
       Factory method that returns the appropriate :class:`SchemaMigrator`
       subclass for the given database.
 
-   .. method:: add_column(table, column_name, field)
+   .. method:: migrate(*operations)
+
+      Execute one or more schema-altering operations. Equivalent to the
+      module-level :py:func:`migrate` helper.
+
+   .. method:: migration_context(atomic=True)
+
+      Context manager wrapping a migration run in the appropriate
+      per-dialect safety: a transaction when the database supports
+      transactional DDL (and ``atomic`` is true), and on sqlite the
+      ``foreign_keys`` pragma is additionally disabled for the duration,
+      as table-rewrites would otherwise fire ``ON DELETE CASCADE``.
+
+   .. method:: add_column(table, column_name, field, allow_not_null=False)
 
       :param str table: Name of the table to add column to.
       :param str column_name: Name of the new column.
       :param Field field: A :class:`Field` instance.
+      :param bool allow_not_null: Emit the column definition as-is, skipping
+          the add-nullable-then-backfill sequence described below.
 
       Add a new column to the provided table. The ``field`` provided will be used
       to generate the appropriate column definition.
 
-      If the field is not nullable it must specify a default value.
+      If the field is not nullable it must specify a default value, unless
+      ``allow_not_null`` is set.
 
       .. note::
          For non-null columns, the following occurs:
@@ -454,6 +511,11 @@ Migration API
          1. column is added as allowing NULLs
          2. ``UPDATE`` query is executed to populate the default value
          3. column is changed to NOT NULL
+
+         With ``allow_not_null=True`` the column is added ``NOT NULL`` in a
+         single statement and no default is required. Existing rows are the
+         caller's responsibility: postgres and sqlite refuse to add the
+         column, while MySQL backfills its implicit default.
 
    .. method:: drop_column(table, column_name, cascade=True)
 
@@ -487,7 +549,7 @@ Migration API
       string literal. Otherwise the default will be treated literally.
       Postgres and MySQL support specifying the default as a peewee
       expression, e.g. ``fn.NOW()``, but Sqlite users will need to use
-      ``default='now()'`` instead.
+      ``"(datetime('now'))"`` instead.
 
    .. method:: drop_column_default(table, column)
 
@@ -497,7 +559,7 @@ Migration API
    .. method:: alter_column_type(table, column, field, cast=None)
 
       :param str table: Name of the table.
-      :param str column_name: Name of the column to modify.
+      :param str column: Name of the column to modify.
       :param Field field: :class:`Field` instance representing new
           data type.
       :param cast: (postgres-only) specify a cast expression if the
@@ -512,17 +574,32 @@ Migration API
       :param str old_name: Current name of the table.
       :param str new_name: New name for the table.
 
-   .. method:: add_index(table, columns, unique=False, using=None)
+   .. method:: drop_table(table, safe=False, cascade=False, schema=None)
+
+      :param str table: Name of the table to drop.
+      :param bool safe: Use ``IF EXISTS``.
+      :param bool cascade: Append ``CASCADE`` (not supported by sqlite).
+      :param str schema: Optional schema qualification.
+
+   .. method:: add_index(table, columns, unique=False, using=None, where=None, nulls_distinct=None)
 
       :param str table: Name of table on which to create the index.
       :param list columns: List of columns which should be indexed.
       :param bool unique: Whether the new index should specify a unique constraint.
       :param str using: Index type (where supported), e.g. GiST or GIN.
+      :param where: Expression for a partial index (sqlite and postgres).
+      :param bool nulls_distinct: For unique indexes, whether NULL values
+          are treated as distinct (postgres 15+).
 
    .. method:: drop_index(table, index_name)
 
       :param str table: Name of the table containing the index to be dropped.
       :param str index_name: Name of the index to be dropped.
+
+   .. method:: sql(sql, params=None)
+
+      Raw SQL as an operation, letting data fixes interleave with schema
+      changes in a single ``migrate()`` call.
 
    .. method:: add_constraint(table, name, constraint)
 
@@ -549,17 +626,580 @@ Migration API
 
 .. class:: SqliteMigrator(database)
 
-   SQLite has limited support for ``ALTER TABLE`` queries, so the following
-   operations are currently not supported for SQLite:
+   SQLite supports or emulates most schema-altering operations, but the code
+   path is dependent on the library version.
 
-   * ``add_constraint``
-   * ``drop_constraint``
-   * ``add_unique``
+   SQLite 3.53.0 added ``ALTER TABLE`` support for table constraints, so
+   ``add_constraint`` and ``drop_constraint`` work on 3.53 and newer.
+   Older versions raise ``NotImplementedError``. ``add_unique`` is not
+   supported on any version, as sqlite's ``ADD CONSTRAINT`` does not
+   extend to UNIQUE constraints.
 
 .. class:: MySQLMigrator(database)
 
    MySQL-specific subclass.
 
+
+.. _migration-runner:
+
+Migration Runner
+----------------
+
+.. module:: playhouse.migrations
+
+The ``playhouse.migrations`` module is a migration runner built using the
+:ref:`migration tooling <migrate>`. The runner records which scripts have been
+applied and runs pending migrations in order. The CLI is installed as
+``pwmigrate`` (or use ``python -m playhouse.migrations``).
+
+The following commands are available:
+
+* ``initial``: create an initial migration containing a snapshot of the
+  application models.
+* ``create``: create a bare skeleton migration file.
+* ``generate``: generate a migration based on changes detected between the
+  database schema and model definitions.
+* ``diff``: display differences between the database schema and model
+  definitions.
+* ``up``: apply any pending migrations.
+* ``down``: roll back one or more applied migrations.
+* ``fake``: record pending migrations as applied without running them.
+* ``status``: show which migrations have been applied and which are pending.
+
+The following sections show basic usage for common scenarios.
+
+New application
+^^^^^^^^^^^^^^^
+
+Given a models module:
+
+.. code-block:: python
+
+   # models.py, imported as `app.models` in examples.
+   from peewee import *
+
+   database = SqliteDatabase('app.db')
+
+   class User(database.Model):
+       username = CharField(unique=True)
+       email = CharField()
+
+Store the project defaults in a ``.pwmigrate`` file in the project root
+(see :ref:`pwmigrate-config-file`), so commands need no arguments:
+
+.. code-block:: ini
+
+   # .pwmigrate
+   database = app.models.database
+   models = app.models
+   # directory = migrations/
+   # table = schema_migration
+
+Then generate the initial migration. ``initial`` reads the models and creates a
+migration suitable for running on an empty database:
+
+.. code-block:: console
+
+   $ pwmigrate initial
+   migrations/0001_initial.py
+
+Equivalent to above, passing the database URL and models module explicitly:
+
+.. code-block:: console
+
+   $ pwmigrate sqlite:///app.db initial app.models
+   migrations/0001_initial.py
+
+The generated file is a python script. The model being created is recorded here
+as a frozen copy so that future changes to the application code do not affect
+the migration.
+
+.. code-block:: python
+
+   # Generated from a schema diff on 2026-08-02 21:28.
+   from peewee import *
+
+   def up(migrator, db):
+       class User(Model):
+           username = CharField(unique=True)
+           email = CharField()
+           class Meta:
+               database = db
+               table_name = 'user'
+       db.create_tables([User])
+
+
+   def down(migrator, db):
+       migrator.migrate(migrator.drop_table('user'))
+
+Apply it using ``up``:
+
+.. code-block:: console
+
+   $ pwmigrate up
+   applied: 0001_initial
+
+Applying a migration runs its script and records the name in a
+``schema_migration`` table in the database.
+
+Existing database
+^^^^^^^^^^^^^^^^^
+
+To get started with an existing database schema, generate an ``initial``
+migration that captures the current state. Then ``fake`` the initial migration.
+We fake it instead of actually running it, since the schema already exists.
+The ``fake`` command will record the initial migration as having been run:
+
+.. code-block:: console
+
+   $ pwmigrate app.models.database initial app.models
+   migrations/0001_initial.py
+
+   $ pwmigrate app.models.database fake  # Fake it against real database.
+   faked: 0001_initial
+
+Now the migrations and schema are in agreement. Creating an initial migration
+is always a good idea, as it allows you to re-create your entire schema on a
+fresh database using ``pwmigrate``.
+
+We can apply the above initial migration to stand up a test SQLite database,
+for example:
+
+.. code-block:: console
+
+   $ pwmigrate sqlite:///testing.db up
+   applied: 0001_initial
+
+.. tip::
+   If model class definitions do not exist yet, they can be generated
+   with :ref:`pwiz <pwiz>`:
+
+   .. code-block:: console
+
+      $ pwiz -e postgresql -u postgres my_db > app/models.py
+
+Making changes
+^^^^^^^^^^^^^^
+
+In this example we'll add a field to our model class:
+
+.. code-block:: python
+
+   class User(database.Model):
+       username = CharField(unique=True)
+       email = CharField()
+       karma = IntegerField(default=0)  # This field is new.
+
+Then we can run two commands to verify the change was picked up and generate a
+migration:
+
+1. ``diff`` shows any changes that were identified.
+2. ``generate`` writes the new migration.
+
+Both commands read the database and models module from the ``.pwmigrate``
+file set up earlier (see :ref:`pwmigrate-config-file`).
+
+.. code-block:: console
+
+   # Prints a list of differences between code and database schema.
+   $ pwmigrate diff
+   add column user.karma
+
+   # Generates a migration.
+   $ pwmigrate generate add_karma
+   migrations/0002_add_karma.py
+
+The generated ``up()`` adds the column:
+
+.. code-block:: python
+
+   def up(migrator, db):
+       migrator.migrate(migrator.add_column('user', 'karma', IntegerField(default=0)))
+
+
+   def down(migrator, db):
+       migrator.migrate(migrator.drop_column('user', 'karma'))
+
+Peewee's migration will populate ``default=`` for basic value types (``str``,
+``int``, ``float``, ``bool``), for ``decimal.Decimal`` values, and for the
+common callables ``datetime.datetime.now`` and ``utcnow``,
+``datetime.date.today``, ``time.time``, ``time.time_ns``, ``uuid.uuid4``,
+``dict`` and ``list``, adding any needed import. An ``enum`` member renders
+as its value. Anything else will be marked with a TODO comment at the top
+of the migration script.
+
+The differ matches columns by name, so a renamed field diffs as an add
+plus a drop. When the data must survive, replace the generated pair with
+a ``rename_column()`` operation.
+
+Run the migration:
+
+.. code-block:: console
+
+   $ pwmigrate up
+   applied: 0002_add_karma
+   $ pwmigrate status
+   [x] 0001_initial  2026-08-04 09:49:33
+   [x] 0002_add_karma  2026-08-04 09:49:33
+
+Deployments run ``pwmigrate <db> up``, or call ``run(db)`` from the
+application's startup code. :ref:`schema-diff` describes what
+generation covers.
+
+Migration files
+^^^^^^^^^^^^^^^
+
+Peewee migrations are python files with a numeric prefix, defining
+``up(migrator, db)`` and, optionally, ``down(migrator, db)``. The
+``migrator`` is a :ref:`SchemaMigrator <migrate>` bound to the connected
+database and ``db`` is the :class:`Database`, so inline models can
+subclass ``db.Model``.
+
+For anything the differ cannot write, such as a data migration, scaffold
+the next numbered file with ``create`` and fill in the body:
+
+.. code-block:: console
+
+   $ pwmigrate create create_notes
+   migrations/0003_create_notes.py
+
+.. code-block:: python
+
+   # migrations/0003_create_notes.py
+   from peewee import *
+
+   def up(migrator, db):
+       class User(db.Model):  # Stub for the FK target.
+           pass
+
+       class Note(db.Model):  # Copy model definition to decouple from app code.
+           user = ForeignKeyField(User)
+           content = TextField()
+
+       db.create_tables([Note])
+
+   def down(migrator, db):
+       migrator.migrate(migrator.drop_table('note'))
+
+Data migrations are plain python between (or instead of) schema
+operations.
+
+Generated files have the same shape. Treat one as a starting point, not
+a finished migration. Anything the differ cannot express is flagged with
+a TODO comment:
+
+.. code-block:: python
+
+   # Generated from a schema diff on 2026-08-03 16:17.
+   from peewee import *
+
+   # TODO: user.email: dropped column cannot be restored by down()
+
+   def up(migrator, db):
+       class User(Model):
+           class Meta:
+               database = db
+               table_name = 'user'
+
+       class Note(Model):
+           user = ForeignKeyField(User)
+           content = TextField()
+           class Meta:
+               database = db
+               table_name = 'note'
+       db.create_tables([Note])
+
+       migrator.migrate(migrator.add_column('user', 'karma', IntegerField(default=0)))
+       migrator.migrate(migrator.add_index('tweet', ('user_id', 'flags')))
+       migrator.migrate(migrator.drop_column('user', 'email'))
+
+
+   def down(migrator, db):
+       migrator.migrate(migrator.drop_index('tweet', 'tweet_user_id_flags'))
+       migrator.migrate(migrator.drop_column('user', 'karma'))
+       migrator.migrate(migrator.drop_table('note'))
+
+Command line
+^^^^^^^^^^^^
+
+Example usage:
+
+.. code-block:: shell
+
+   # Generate the first migration from the models, assuming an empty db:
+   pwmigrate app.settings.db initial app.models
+
+   # Fake the initial migration (if models pre-date peewee migrations).
+   pwmigrate app.settings.db fake
+
+   # Or, run the initial migration if starting from a clean db.
+   pwmigrate app.settings.db up
+
+   # List migrations and when each was applied:
+   pwmigrate app.settings.db status
+
+   # Write a skeleton migration, or generate it from the model diff:
+   pwmigrate app.settings.db create "add karma"
+   pwmigrate app.settings.db generate "add karma" app.models
+
+   # Apply pending migrations, all or up through a target:
+   pwmigrate app.settings.db up
+   pwmigrate app.settings.db up 0002_add_karma
+
+   # Revert the most recent migration, or back through a target:
+   pwmigrate app.settings.db down
+   pwmigrate app.settings.db down 0002_add_karma
+
+   # Print schema drift against the models:
+   pwmigrate app.settings.db diff app.models
+
+   # Record all pending migrations as applied without running them:
+   pwmigrate app.settings.db fake
+
+The database is given as:
+
+* dotted path to a :class:`Database` instance
+* :ref:`db_url <db-url>` string
+* a path to a sqlite database file
+
+Models are given as a dotted module path. Every model defined in the
+module is used (field-less base classes are skipped and reported).
+Models imported into the module from elsewhere are ignored, so a package
+that only re-exports its models needs the explicit-list form,
+``app.models:MODELS``.
+
+.. _pwmigrate-config-file:
+
+pwmigrate config file
+^^^^^^^^^^^^^^^^^^^^^
+
+Keep a ``.pwmigrate`` file at the project root, committed with the
+application code. It supplies per-project defaults as ``key = value``
+lines:
+
+.. code-block:: ini
+
+   database = app.settings.db
+   models = app.models
+   # directory = migrations/
+   # table = schema_migration
+
+This allows us to run migration commands without explicitly specifying the
+paths each time:
+
+.. code-block:: console
+
+   $ pwmigrate diff
+   $ pwmigrate generate "add some fields"
+   $ pwmigrate status
+   $ pwmigrate up
+
+Recognized keys:
+
+* ``database`` - database spec (dotted path, url, or sqlite filename)
+* ``directory`` - migrations directory
+* ``models`` - models module, read by ``diff``, ``initial`` and ``generate``
+* ``table`` - history table name
+
+The file is read from the working directory only. A different config
+file is named with ``-c``. Unrecognized keys warn on stderr. Arguments
+passed on the command line override any settings in the config file.
+
+Commands
+^^^^^^^^
+
++--------------+------------------------------------------------------------+
+| Command      | Meaning                                                    |
++==============+============================================================+
+| ``status``   | List migrations and applied timestamps.                    |
++--------------+------------------------------------------------------------+
+| ``up``       | Apply pending migrations in order, stopping after          |
+|              | ``target`` when given.                                     |
++--------------+------------------------------------------------------------+
+| ``down``     | Revert the most recent migration, or everything back       |
+|              | through ``target``, newest first.                          |
++--------------+------------------------------------------------------------+
+| ``initial``  | Generate the first migration from the models, assuming an  |
+|              | empty database.                                            |
++--------------+------------------------------------------------------------+
+| ``create``   | Write a skeleton migration file.                           |
++--------------+------------------------------------------------------------+
+| ``generate`` | Generate a migration from the schema diff.                 |
++--------------+------------------------------------------------------------+
+| ``fake``     | Record pending migrations as applied without running them, |
+|              | stopping after ``target`` when given.                      |
++--------------+------------------------------------------------------------+
+| ``diff``     | Print schema differences against a models module.          |
++--------------+------------------------------------------------------------+
+
+Command-line options:
+
++--------+---------------------------------------------------+--------------------+
+| Option | Meaning                                           | Example            |
++========+===================================================+====================+
+| ``-d`` | Migrations directory (default ``migrations``)     | ``-d db/schema``   |
++--------+---------------------------------------------------+--------------------+
+| ``-t`` | History table name (default ``schema_migration``) |                    |
++--------+---------------------------------------------------+--------------------+
+| ``-v`` | Echo SQL as it executes                           |                    |
++--------+---------------------------------------------------+--------------------+
+| ``-c`` | Config file supplying defaults                    | ``-c pw.conf``     |
++--------+---------------------------------------------------+--------------------+
+
+``status`` exits 0 when the database is current and 1 when migrations
+are pending, so it can gate a deploy. Validation and database errors
+exit 2.
+
+Behavior:
+
+* Files apply in numeric order (the prefix is parsed as an integer, so
+  ``2_x.py`` runs before ``10_y.py``). Applied names are recorded in a
+  history table (default ``schema_migration``), exposed as a model at
+  ``runner.History``. The history is a set, so migrations merged in from
+  a branch are applied even when their numbers are not the highest.
+* On Postgres and SQLite, each migration and its history row are wrapped
+  in a single transaction, so a failure rolls back cleanly. MySQL DDL
+  commits implicitly, so the history row is written only after every operation
+  succeeds. Set ``atomic = False`` at module level to opt a migration out of
+  transaction wrapping (e.g. for ``CREATE INDEX CONCURRENTLY``).
+* On SQLite, ``foreign_keys`` pragma is turned off for the duration of each
+  migration and restored afterwards to prevent ``ON DELETE CASCADE`` being
+  triggered during table rebuilds (required for some operations).
+* A migration that does not define ``down()`` cannot be reverted (there
+  is no requirement to write one).
+
+Python interface
+^^^^^^^^^^^^^^^^
+
+All migration-runner operations are available programmatically:
+
+.. code-block:: python
+
+   from playhouse.migrations import Runner
+
+   runner = Runner(db, directory='migrations')
+   runner.create('add karma')  # Write a skeleton file.
+   runner.status()             # [Migration(idx, name, path, applied), ...]
+   runner.up()                 # Apply everything pending, in order.
+   runner.up('0004_x')         # Apply pending up through 0004_x.
+   runner.down()               # Revert the most recent applied migration.
+   runner.down('0004_x')       # Revert back through 0004_x, inclusive.
+   runner.fake()               # Record all as applied without running.
+
+``run(db)`` is shorthand for ``Runner(db, 'migrations').up()``.
+
+Generate a migration from a diff:
+
+.. code-block:: python
+
+   from playhouse.migrations import Runner, template
+   from playhouse.schema_diff import diff_models
+
+   runner = Runner(db)
+   diff = diff_models(db, [User, Tweet, Note])
+   if diff:
+       runner.create('add karma', body=template(diff))
+
+.. class:: Runner(database, directory='migrations', table_name='schema_migration')
+
+   .. method:: up(target=None)
+
+      Apply all pending migrations in order, stopping after ``target`` if
+      given. Returns the applied names.
+
+   .. method:: down(target=None)
+
+      Revert the most recent applied migration, or, given a target, every
+      applied migration back through the target (newest first). Returns
+      the reverted names.
+
+   .. method:: status()
+
+      Return ``Migration`` namedtuples ``(idx, name, path, applied)``
+      merging migration files with history rows, in numeric order.
+      ``applied`` is None when pending, ``path`` is None when the file
+      is missing.
+
+   .. method:: fake(target=None)
+
+      Record pending migrations as applied without running them, stopping
+      after ``target`` if given. Returns the recorded names.
+
+   .. method:: create(name, body=None)
+
+      Write a numbered migration file (a skeleton, unless ``body`` is
+      given) and return its path.
+
+   .. attribute:: History
+
+      The history-table model, for manual bookkeeping repair.
+
+.. function:: run(database, directory='migrations', **kwargs)
+
+   Apply pending migrations. Shorthand for ``Runner(database, directory).up()``.
+
+.. function:: template(diff)
+
+   Render a :class:`playhouse.schema_diff.SchemaDiff` as a migration-file
+   body. See :ref:`schema-diff`.
+
+
+.. _schema-diff:
+
+Schema Diff
+-----------
+
+.. module:: playhouse.schema_diff
+
+The ``playhouse.schema_diff`` module compares model definitions against
+the live database schema and reports basic differences:
+
+* tables to create
+* columns added or removed
+* indexes added or removed
+
+Columns are compared by name alone (no types, nullability or constraints), so a
+rename appears as an addition plus a removal. Partial and expression indexes
+are compared by name only. Tables in the database that no model covers are
+ignored. Virtual models (sqlite FTS, etc.) are skipped.
+
+.. code-block:: pycon
+
+   >>> from playhouse.schema_diff import diff_models
+   >>> diff = diff_models(db, [User, Tweet, Note])
+   >>> bool(diff)
+   True
+   >>> print(diff)
+   create table note
+   add column user.karma
+   drop column user.email
+   add index tweet (user_id, flags)
+
+.. function:: diff_models(database, models)
+
+   Compare the live schema against the given models. Returns a
+   :class:`SchemaDiff` which is falsy when everything matches.
+
+.. class:: SchemaDiff
+
+   A named tuple of five lists, each mapping directly onto a
+   :class:`~playhouse.migrate.SchemaMigrator` call:
+
+   * ``create_tables``: model classes whose tables do not exist, in
+     foreign-key dependency order.
+   * ``add_columns``: the model :class:`Field` instances missing from the
+     database.
+   * ``drop_columns``: ``(table, column_name)`` for database columns no
+     model declares.
+   * ``add_indexes`` / ``drop_indexes``: :class:`IndexDiff` entries.
+
+.. class:: IndexDiff
+
+   Named tuple ``(table, name, columns, unique)``. ``columns is None``
+   marks a partial or expression index, detected by name but not
+   described. Plain additions carry ``columns``/``unique`` and no name
+   (the name is chosen at creation). Removals always carry the name to
+   drop.
 
 .. _reflection:
 
@@ -619,8 +1259,7 @@ generates Peewee model classes from its schema. It is used internally by
 
 .. function:: print_table_sql(model)
 
-   Print the ``CREATE TABLE`` SQL for a model class (without indexes or
-   constraints):
+   Print the ``CREATE TABLE`` SQL for a model class (without indexes):
 
    .. code-block:: pycon
 
@@ -665,7 +1304,7 @@ generates Peewee model classes from its schema. It is used internally by
       :param list table_names: Only generate models for the given tables.
       :param bool literal_column_names: Use the exact database column names
           as field names (rather than converting to Python naming conventions).
-      :param bool bare_fields: Do not attempt to detect field types; use
+      :param bool bare_fields: Do not attempt to detect field types, use
           :class:`BareField` for all columns (**SQLite only**).
       :param bool include_views: Also generate models for views.
       :return: A dictionary mapping table-names to model classes.
@@ -689,16 +1328,16 @@ ready-to-use Peewee model code. If you have an existing database, running
 .. code-block:: shell
 
    # Introspect a Postgresql database and write models to a file:
-   python -m pwiz -e postgresql -u postgres my_db > models.py
+   pwiz -e postgresql -u postgres my_db > models.py
 
    # Introspect a SQLite database:
-   python -m pwiz -e sqlite path/to/my.db
+   pwiz -e sqlite path/to/my.db
 
    # Introspect a MySQL database (prompts for password):
-   python -m pwiz -e mysql -u root -P my_db
+   pwiz -e mysql -u root -P my_db
 
    # Introspect only specific tables:
-   python -m pwiz -e postgresql my_db -t user,tweet,follow
+   pwiz -e postgresql my_db -t user,tweet,follow
 
 
 Command-line options:

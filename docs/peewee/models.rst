@@ -163,7 +163,7 @@ Field Type              Sqlite              Postgresql          MySQL
 ``BigIntegerField``     integer             bigint              bigint
 ``SmallIntegerField``   integer             smallint            smallint
 ``IdentityField``       not supported       int identity        not supported
-``FloatField``          real                real                real
+``FloatField``          real                real                float
 ``DoubleField``         real                double precision    double precision
 ``DecimalField``        decimal             numeric             numeric
 ``CharField``           varchar             varchar             varchar
@@ -177,7 +177,7 @@ Field Type              Sqlite              Postgresql          MySQL
 ``DateTimeField``       datetime            timestamp           datetime
 ``DateField``           date                date                date
 ``TimeField``           time                time                time
-``TimestampField``      integer             integer             integer
+``TimestampField``      integer             bigint              bigint
 ``IPField``             integer             bigint              bigint
 ``BooleanField``        integer             boolean             bool
 ``BareField``           untyped             not supported       not supported
@@ -401,7 +401,7 @@ column. Peewee allows you to access the raw foreign key value by appending
        print(tweet.user_id, tweet.content)
 
 To prevent accidentally resolving a foreign-key and triggering an additional
-query, :class:`ForeignKeyField` supports an initialization paramater
+query, :class:`ForeignKeyField` supports an initialization parameter
 ``lazy_load`` which, when disabled, behaves like the ``"_id"`` attribute:
 
 .. code-block:: python
@@ -1209,7 +1209,7 @@ Partial indexes, indexes with expressions, and more complex indexes can use the
    # Create a unique index on timestamp desc, status & 4.
    idx = Article.index(
        Article.timestamp.desc(),
-       Article.flags.bin_and(4),
+       Article.status.bin_and(4),
        unique=True)
    Article.add_index(idx)
 
@@ -1392,6 +1392,14 @@ To create a single table, use :meth:`Model.create_table`:
    :ref:`schema` for documentation on table creation and other schema
    management tasks.
 
+Migrations
+----------
+
+When models are created or modified, peewee can auto-generate migration scripts
+to apply the changes to your database schema.
+
+For details see the :ref:`schema migrations <migration-runner>` doc.
+
 .. _advanced-model-topics:
 
 Advanced Topics
@@ -1500,8 +1508,8 @@ coming from the database into a Python type:
    class RawData(BaseModel):
        value = BareField(adapt=float)
 
-For full-text search virtual tables, use :class:`SearchField` rather
-than :class:`BareField`. See :ref:`sqlite-fts`.
+For full-text search virtual tables, use :class:`~playhouse.sqlite_ext.SearchField`
+rather than :class:`BareField`. See :ref:`sqlite-fts`.
 
 .. _custom-fields:
 

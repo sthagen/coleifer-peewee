@@ -165,7 +165,7 @@ Optionally wrap the bulk insert in a transaction:
    with db.atomic():
        User.insert_many(data, fields=fields).execute()
 
-Insert queries support :meth:`~WriteQuery.returning` with Postgresql and SQLite
+Insert queries support :meth:`~_WriteQuery.returning` with Postgresql and SQLite
 to obtain the inserted rows:
 
 .. code-block:: python
@@ -208,7 +208,7 @@ inserts them efficiently. Pass ``batch_size`` to avoid hitting database limits:
    with db.atomic():
        User.bulk_create(users, batch_size=100)
 
-If you are using Postgresql (which supports the ``RETURNING`` clause), then
+If you are using Postgresql (or SQLite with ``returning_clause=True``), then
 the previously-unsaved model instances will have their new primary key
 values automatically populated. Other backends will not.
 
@@ -286,7 +286,7 @@ matching the WHERE clause:
 
 The return value is the number of rows affected.
 
-Update queries support :meth:`~WriteQuery.returning` with Postgresql and SQLite
+Update queries support :meth:`~_WriteQuery.returning` with Postgresql and SQLite
 to obtain the updated rows:
 
 .. code-block:: python
@@ -577,7 +577,7 @@ To delete an arbitrary set of rows without fetching them:
                 (Tweet.timestamp < cutoff))
             .execute())
 
-Delete queries support :meth:`~WriteQuery.returning` with Postgresql and SQLite
+Delete queries support :meth:`~_WriteQuery.returning` with Postgresql and SQLite
 to obtain the deleted rows:
 
 .. code-block:: python
@@ -681,7 +681,9 @@ specify a different row type:
 
 .. code-block:: python
 
-   data = [{'name': 'charlie'}, {'name': 'huey'}, {'name': 'mickey'}]
+   data = [{'username': 'charlie'},
+           {'username': 'huey'},
+           {'username': 'mickey'}]
    query = (User
             .insert_many(data)
             .returning(User.id, User.username)

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from contextlib import contextmanager
 from copy import deepcopy
+from functools import partial
 from functools import reduce
 from functools import wraps
 from inspect import isclass
@@ -68,7 +69,7 @@ except ImportError:
         mysql = None
 
 
-__version__ = '4.2.6'
+__version__ = '4.3.0'
 __all__ = [
     'AnyField',
     'AsIs',
@@ -283,6 +284,14 @@ def _sqlite_json_contains(haystack, needle):
 
 def __deprecated__(s):
     warnings.warn(s, DeprecationWarning)
+
+class classmethod_only(object):
+    def __init__(self, fn): self.fn = fn
+    def __get__(self, instance, instance_type=None):
+        if instance is not None:
+            raise TypeError('%s cannot be called from an instance.' %
+                            self.fn.__name__)
+        return partial(self.fn, instance_type)
 
 
 class attrdict(dict):
@@ -4514,12 +4523,6 @@ class _BasePsycopgAdapter(object):
             return self.isolation_levels[isolation_level]
         return isolation_level
 
-    def server_side_cursor(self, conn):
-        # psycopg2/3 do not allow us to use these in autocommit, even if we ARE
-        # inside a transaction - so specify withhold (not desirable!).
-        return conn.cursor(name=str(uuid.uuid1()), withhold=True)
-
-
 class Psycopg2Adapter(_BasePsycopgAdapter):
     isolation_levels = {
         1: 'READ COMMITTED',
@@ -4593,6 +4596,11 @@ class Psycopg2Adapter(_BasePsycopgAdapter):
             return True
         return False
 
+    def server_side_cursor(self, conn):
+        # psycopg2 does not allow named cursors in autocommit, even if we ARE
+        # inside a transaction - so specify withhold (not desirable!).
+        return conn.cursor(name=str(uuid.uuid1()), withhold=True)
+
 
 class Psycopg3Adapter(_BasePsycopgAdapter):
     isolation_levels = {
@@ -4660,6 +4668,12 @@ class Psycopg3Adapter(_BasePsycopgAdapter):
             return True
         return False
 
+    def server_side_cursor(self, conn):
+        # In a transaction a plain named cursor streams and is scoped to it.
+        # Otherwise the server requires withhold, which spools at declare.
+        in_txn = conn.pgconn.transaction_status == TransactionStatus.INTRANS
+        return conn.cursor(name=str(uuid.uuid1()), withhold=not in_txn)
+
 
 class PostgresqlDatabase(Database):
     field_types = {
@@ -4703,6 +4717,11 @@ class PostgresqlDatabase(Database):
             isolation_level)
 
         super(PostgresqlDatabase, self).init(database, **kwargs)
+
+    @property
+    def index_value_literals(self):
+        # Index DDL cannot take psycopg3's server-side bound parameters.
+        return isinstance(self._adapter, Psycopg3Adapter)
 
     def _connect(self):
         self._adapter.check_driver()
@@ -6574,7 +6593,7 @@ class ForeignKeyField(Field):
                            '"backref" for Field objects.')
             backref = related_name
 
-        self._is_self_reference = model == 'self'
+        self._is_self_reference = isinstance(model, str) and model == 'self'
         self.rel_model = model
         self.rel_field = field
         self.declared_backref = backref
@@ -7773,7 +7792,7 @@ class Model(Node, metaclass=ModelBase):
     def raw(cls, sql, *params):
         return ModelRaw(cls, sql, params)
 
-    @classmethod
+    @classmethod_only
     def delete(cls):
         return ModelDelete(cls)
 

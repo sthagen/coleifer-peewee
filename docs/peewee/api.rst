@@ -72,14 +72,19 @@ Database
       # Initialize database.
       db.init(db_name, host=db_host, user='postgres')
 
-   .. attribute:: param = '?'
+   .. attribute:: param
 
-      String used as parameter placeholder in SQL queries.
+      String used as parameter placeholder in SQL queries. Default is ``'?'``.
 
-   .. attribute:: quote = '""'
+   .. attribute:: quote
 
       Type of quotation-mark(s) to use to denote entities such as tables or
-      columns, specified as ``'<open quote><close quote>'``.
+      columns, specified as ``'<open quote><close quote>'``. Default is ``'""'``.
+
+   .. attribute:: sequences
+
+      Whether the database supports sequences. ``False`` by default,
+      ``True`` for Postgres.
 
    .. attribute:: Model
 
@@ -774,6 +779,24 @@ Database
          for row in query:
              print(row.month, '->', row.count)
 
+   .. method:: to_timestamp(date_field)
+
+      :param date_field: a SQL node containing a date/time, for example
+          a :class:`DateTimeField`.
+      :return: a SQL node representing the value as an integer unix
+          timestamp.
+
+      Backend-appropriate conversion of a datetime value to an integer
+      timestamp. See also :meth:`DateTimeField.to_timestamp`, which calls
+      this.
+
+   .. method:: from_timestamp(date_field)
+
+      :param date_field: a SQL node containing an integer unix timestamp.
+      :return: a SQL node representing the value as a datetime.
+
+      Inverse of :meth:`to_timestamp`.
+
    .. method:: random()
 
       :return: a SQL node representing a function call that returns a random
@@ -801,7 +824,7 @@ Database
    * Register user-defined functions, aggregates, window functions, collations
    * Load extension modules distributed as shared libraries
    * Advanced transactions (specify lock type)
-   * For additional features see :class:`CySqliteDatabase`.
+   * For additional features see :class:`~playhouse.cysqlite_ext.CySqliteDatabase`.
 
    Example of initializing a database and configuring some PRAGMAs:
 
@@ -815,11 +838,12 @@ Database
       # Alternatively, pragmas can be specified using a dictionary.
       db = SqliteDatabase('my_app.db', pragmas={'journal_mode': 'wal'})
 
-   .. method:: pragma(key, value=SENTINEL, permanent=False)
+   .. method:: pragma(key, value=SENTINEL, permanent=False, schema=None)
 
       :param key: Setting name.
       :param value: New value for the setting (optional).
       :param permanent: Apply this pragma whenever a connection is opened.
+      :param str schema: Database name to apply pragma to.
 
       Execute a PRAGMA query once on the active connection. If a value is not
       specified, then the current value will be returned.
@@ -828,9 +852,18 @@ Database
       executed whenever a new connection is opened, ensuring it is always
       in-effect.
 
+   .. attribute:: application_id
+
+      Get or set the application_id pragma for the current connection.
+
    .. attribute:: cache_size
 
       Get or set the cache_size pragma for the current connection.
+
+   .. attribute:: data_version
+
+      Get the data_version pragma for the current connection. Changes when
+      the database file is modified by another connection. Read-only.
 
    .. attribute:: foreign_keys
 
@@ -859,6 +892,10 @@ Database
    .. attribute:: synchronous
 
       Get or set the synchronous pragma for the current connection.
+
+   .. attribute:: user_version
+
+      Get or set the user_version pragma for the current connection.
 
    .. attribute:: wal_autocheckpoint
 
@@ -1132,7 +1169,7 @@ Database
        Also accepts string which is converted to the matching constant.
    :type isolation_level: int, str
    :param bool prefer_psycopg3: If both psycopg2 and psycopg3 are installed,
-       instruct Peewee to prefer psycopg3.
+       instruct Peewee to prefer psycopg3. See :ref:`psycopg2-vs-psycopg3`.
 
    Example:
 
@@ -1477,7 +1514,7 @@ Model
               .where(PageView.url == url))
          q.execute()  # Execute the query.
 
-      Update queries support :meth:`~WriteQuery.returning` with Postgresql and SQLite
+      Update queries support :meth:`~_WriteQuery.returning` with Postgresql and SQLite
       to obtain the updated rows:
 
       .. code-block:: python
@@ -1531,7 +1568,7 @@ Model
          # This INSERT query will automatically specify `active=True`:
          User.insert(username='charlie')
 
-      Insert queries support :meth:`~WriteQuery.returning` with Postgresql and
+      Insert queries support :meth:`~_WriteQuery.returning` with Postgresql and
       SQLite to obtain the inserted rows:
 
       .. code-block:: python
@@ -1603,7 +1640,7 @@ Model
                  yield {'username': username}
          User.insert_many(get_usernames()).execute()
 
-      Insert queries support :meth:`~WriteQuery.returning` with Postgresql and
+      Insert queries support :meth:`~_WriteQuery.returning` with Postgresql and
       SQLite to obtain the inserted rows:
 
       .. code-block:: python
@@ -1726,7 +1763,7 @@ Model
          q = User.delete().where(User.active == False)
          q.execute()  # Remove the rows, return number of rows removed.
 
-      Delete queries support :meth:`~WriteQuery.returning` with Postgresql and
+      Delete queries support :meth:`~_WriteQuery.returning` with Postgresql and
       SQLite to obtain the deleted rows:
 
       .. code-block:: python
@@ -2115,10 +2152,12 @@ Model
          with database:
              SomeModel.create_table()
 
-   .. classmethod:: drop_table(safe=True, **options)
+   .. classmethod:: drop_table(safe=True, drop_sequences=True, **options)
 
       :param bool safe: If set to ``True``, the drop table query will
           include an ``IF EXISTS`` clause.
+      :param bool drop_sequences: Drop any sequences associated with the
+          columns on the table (postgres only).
 
       Drop the model table.
 
@@ -2287,7 +2326,7 @@ Model
    See :ref:`relationships` for additional discussion.
 
 
-.. class:: Metadata(model, database=None, table_name=None, indexes=None, primary_key=None, constraints=None, schema=None, only_save_dirty=False, depends_on=None, options=None, without_rowid=False, strict_tables=False, **kwargs)
+.. class:: Metadata(model, database=None, table_name=None, indexes=None, primary_key=None, constraints=None, schema=None, only_save_dirty=False, depends_on=None, options=None, without_rowid=False, strict_tables=None, **kwargs)
 
    :param Model model: Model class.
    :param Database database: database model is bound to.
@@ -2414,9 +2453,10 @@ Model
 
    Model-specific implementation of SELECT query.
 
-   .. method:: get()
+   .. method:: get(database=None)
 
-      :param Database database: database to execute query against.
+      :param Database database: database to execute query against (defaults to
+          the model's configured database).
       :return: A single row from the database.
       :raises: ``DoesNotExist`` if row not found.
 
@@ -3000,9 +3040,8 @@ Fields
    reused. In conjunction with SQLite having foreign keys disabled by
    default (meaning ON DELETE is ignored, even if you specify it
    explicitly), this can lead to surprising and dangerous behaviour. To
-   avoid this, you may want to use one or both of
-   :class:`AutoIncrementField` and ``pragmas=[('foreign_keys', 'on')]``
-   when you instantiate :class:`SqliteDatabase`.
+   avoid this, you may want to use one or both of :class:`~playhouse.sqlite_ext.AutoIncrementField`
+   and ``pragmas=[('foreign_keys', 'on')]`` when you instantiate :class:`SqliteDatabase`.
 
 .. class:: BigAutoField
 
@@ -3292,10 +3331,9 @@ Fields
       '%Y-%m-%d %H:%M:%S%z' # ...with timezone offset
       '%Y-%m-%d' # year-month-day
 
-   In addition, any string accepted by
-   :py:meth:`datetime.datetime.fromisoformat` is parsed automatically,
-   including the ``T`` separator and a trailing ``Z`` (UTC). Custom
-   ``formats`` are still consulted as a fallback for non-ISO inputs (e.g.
+   In addition, any string accepted by ``datetime.datetime.fromisoformat`` is
+   parsed automatically, including the ``T`` separator and a trailing ``Z`` (UTC).
+   Custom ``formats`` are still consulted as a fallback for non-ISO inputs (e.g.
    ``'01/02/2003 01:37 PM'``).
 
    SQLite does not have a native datetime data-type, so datetimes are
@@ -3374,8 +3412,8 @@ Fields
       '%Y-%m-%d %H:%M:%S' # year-month-day hour-minute-second
       '%Y-%m-%d %H:%M:%S.%f' # year-month-day hour-minute-second.microsecond
 
-   In addition, any string accepted by
-   :py:meth:`datetime.datetime.fromisoformat` is parsed automatically.
+   In addition, any string accepted by ``datetime.datetime.fromisoformat`` is
+   parsed automatically.
 
    .. note::
       If the incoming value does not match a format, it is returned as-is.
@@ -3690,7 +3728,7 @@ Fields
 
    .. method:: as_int()
 
-      :rtype: peewee.Cast
+      :rtype: Cast
 
       Return the path's text extract cast to the backend's integer type. Use
       for numeric comparisons:
@@ -3702,7 +3740,7 @@ Fields
 
    .. method:: as_float()
 
-      :rtype: peewee.Cast
+      :rtype: Cast
 
       Return the path's text extract cast to the backend's floating-point
       type.
@@ -3983,7 +4021,7 @@ Fields
    or untyped columns, so for those cases as well you may wish to use an
    untyped field.
 
-   Accepts a special ``coerce`` parameter, a function that takes a value
+   Accepts a special ``adapt`` parameter, a function that takes a value
    coming from the database and converts it into the appropriate Python type.
 
 .. class:: ForeignKeyField(model, field=None, backref=None, on_delete=None, on_update=None, deferrable=None, object_id_name=None, lazy_load=True, constraint_name=None, **kwargs)
@@ -4231,7 +4269,7 @@ Fields
       ['CS 101', 'CS 151', 'English 101', 'English 151']
 
    To remove all relationships from a collection, you can use the
-   :meth:`~ManyToManyQuery.clear` method. Let's say that English 101 is
+   :meth:`~ManyToManyField.clear` method. Let's say that English 101 is
    canceled, so we need to remove all the students from it:
 
    .. code-block:: pycon
@@ -4404,11 +4442,9 @@ Schema Manager
 
       Execute CREATE TABLE query for the given model.
 
-   .. method:: drop_table(safe=True, drop_sequences=True, **options)
+   .. method:: drop_table(safe=True, **options)
 
       :param bool safe: Specify IF EXISTS clause.
-      :param bool drop_sequences: Drop any sequences associated with the
-          columns on the table (postgres only).
       :param options: Arbitrary options.
 
       Execute DROP TABLE query for the given model.
@@ -5285,9 +5321,21 @@ Query-builder
       aggregate function. This SQL feature is supported for Postgres and
       SQLite.
 
-   .. method:: coerce(coerce=True)
+   .. method:: order_by(*ordering)
 
-      :param bool coerce: Whether to attempt to coerce function-call result
+      :param ordering: Column(s) or expression(s) to order the aggregate's
+          input by.
+
+      Add an ``ORDER BY`` clause inside an aggregate function call:
+
+      .. code-block:: python
+
+         # GROUP_CONCAT("t1"."content" ORDER BY "t1"."timestamp")
+         fn.GROUP_CONCAT(Tweet.content).order_by(Tweet.timestamp)
+
+   .. method:: coerce(_coerce=True)
+
+      :param bool _coerce: Whether to attempt to coerce function-call result
           to a Python data-type.
 
       When coerce is ``True``, the target data-type is inferred using several
@@ -5725,11 +5773,13 @@ Queries
       specified CTEs will be overwritten. For examples of common-table
       expressions, see :ref:`cte`.
 
-   .. method:: cte(name, recursive=False, columns=None)
+   .. method:: cte(name, recursive=False, columns=None, materialized=None)
 
       :param str name: Alias for common table expression.
       :param bool recursive: Will this be a recursive CTE?
       :param list columns: List of column names (as strings).
+      :param bool materialized: Specify ``MATERIALIZED`` or ``NOT MATERIALIZED``
+          clause.
 
       Indicate that a query will be used as a common table expression. For
       example, if we are modelling a category tree and are using a
@@ -5967,7 +6017,7 @@ Queries
 
 .. class:: SelectBase()
 
-   Base-class for :class:`Select` and :class:`CompoundSelect` queries.
+   Base-class for :class:`Select` and :class:`CompoundSelectQuery` queries.
 
    .. method:: peek(database, n=1)
 
@@ -6053,14 +6103,14 @@ Queries
 
 .. class:: CompoundSelectQuery(lhs, op, rhs)
 
-   :param SelectBase lhs: A Select or CompoundSelect query.
+   :param SelectBase lhs: A :class:`Select` or :class:`CompoundSelectQuery` query.
    :param str op: Operation (e.g. UNION, INTERSECT, EXCEPT).
-   :param SelectBase rhs: A Select or CompoundSelect query.
+   :param SelectBase rhs: A :class:`Select` or :class:`CompoundSelectQuery` query.
 
    Class representing a compound SELECT query.
 
 
-.. class:: Select(from_list=None, columns=None, group_by=None, having=None, distinct=None, windows=None, for_update=None, **kwargs)
+.. class:: Select(from_list=None, columns=None, group_by=None, having=None, distinct=None, windows=None, for_update=None, lateral=None, **kwargs)
 
    :param list from_list: List of sources for FROM clause.
    :param list columns: Columns or values to select.
@@ -6069,6 +6119,8 @@ Queries
    :param distinct: Either a boolean or a list of column-like objects.
    :param list windows: List of :class:`Window` clauses.
    :param ForUpdate for_update: indicate SELECT...FOR UPDATE.
+   :param bool lateral: mark this query as the right-hand side of a
+       LATERAL join.
 
    Class representing a SELECT query.
 
@@ -6260,6 +6312,12 @@ Queries
       :param bool nowait: Specify NOWAIT option when locking.
       :param bool skip_locked: Specify SKIP LOCKED option when locking.
 
+   .. method:: lateral([lateral=True])
+
+      Mark this query as the right-hand side of a ``LATERAL`` join. When
+      joined, the subquery may reference columns from the tables to its
+      left.
+
 
 .. class:: _WriteQuery(table, returning=None, **kwargs)
 
@@ -6372,9 +6430,9 @@ Queries
       query = User.insert({User.c.username: 'alice'})
       query.execute(database)
 
-   .. method:: as_rowcount(as_rowcount=True)
+   .. method:: as_rowcount(_as_rowcount=True)
 
-      :param bool as_rowcount: Whether to return the modified row count (as
+      :param bool _as_rowcount: Whether to return the modified row count (as
           opposed to the last-inserted row id).
 
       SQLite and MySQL return the last inserted rowid. Postgresql will return a
@@ -6520,7 +6578,7 @@ Queries
    .. note::
       :meth:`ModelSelect.with_related` is the declarative, nestable form and is
       preferred for new code. ``prefetch`` is the flat-list form, kept for
-      compatibility. Minimal example of using :meth:`with_related`:
+      compatibility. Minimal example of using :meth:`~ModelSelect.with_related`:
 
       .. code-block:: python
 

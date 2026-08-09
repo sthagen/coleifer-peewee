@@ -85,7 +85,7 @@ Retrieving a Single Record
 --------------------------
 
 :meth:`Model.get` executes the query and returns the first matching row.
-If no row matches, :exc:`~Model.DoesNotExist` is raised:
+If no row matches, :class:`DoesNotExist` is raised:
 
 .. code-block:: python
 
@@ -832,9 +832,9 @@ difference:
 .. code-block:: pycon
 
    >>> Sample.create(counter=1, value=20.)
-   <Sample 6>
+   <Sample: 6>
    >>> Sample.create(counter=2, value=1.)
-   <Sample 7>
+   <Sample: 7>
 
 Our table now contains:
 
@@ -1172,9 +1172,10 @@ table, using a single query:
        timestamp = DateTimeField()
 
    # Move rows older than 24 hours from the Event table to the Archive.
+   cutoff = datetime.datetime.now() - datetime.timedelta(days=1)
    cte = (Event
           .delete()
-          .where(Event.timestamp < (datetime.now() - timedelta(days=1)))
+          .where(Event.timestamp < cutoff)
           .returning(Event)
           .cte('moved_rows'))
 

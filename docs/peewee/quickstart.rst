@@ -58,6 +58,8 @@ Create the Tables
 each model. By default ``create_table()`` specifies ``safe=True``, which uses
 ``CREATE TABLE IF NOT EXISTS``, making it safe to call on every startup.
 
+Alternately, schema changes can be handled using the :ref:`migration runner <migration-runner>`.
+
 Writing Data
 ------------
 
@@ -94,7 +96,7 @@ To delete a row:
 Reading Data
 ------------
 
-Retrieve a single row with :meth:`~Model.get`. It raises :exc:`~Model.DoesNotExist`
+Retrieve a single row with :meth:`~Model.get`. It raises :class:`DoesNotExist`
 if no match is found:
 
 .. code-block:: python

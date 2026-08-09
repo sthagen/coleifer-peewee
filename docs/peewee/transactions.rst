@@ -118,14 +118,8 @@ Explicit Transaction
 --------------------
 
 :meth:`Database.transaction` opens an explicit transaction that does not
-nest. Any ``transaction()`` call inside an outer ``transaction()`` block is
-ignored - only the outermost transaction is active.
-
-Use this only when you explicitly need a flat, non-nesting transaction. For
-most cases, ``atomic()`` is the better choice.
-
-If an exception occurs in a wrapped block, the transaction will be rolled back.
-Otherwise the statements will be committed at the end of the wrapped block.
+nest. If an exception occurs in a wrapped block, the transaction will be rolled
+back. Otherwise the statements will be committed at the end of the wrapped block.
 
 .. code-block:: python
 
@@ -139,10 +133,8 @@ Otherwise the statements will be committed at the end of the wrapped block.
 
 If you attempt to nest transactions with peewee using the
 :meth:`~Database.transaction` context manager, only the outer-most
-transaction will be used.
-
-As this may lead to unpredictable behavior, it is recommended that
-you use :meth:`~Database.atomic`.
+transaction will be used. As this may lead to unpredictable behavior, it is
+recommended that you use :meth:`~Database.atomic`.
 
 Explicit Savepoints
 -------------------
@@ -195,8 +187,10 @@ In rare cases where you need to take direct control of ``BEGIN``/``COMMIT``/
                raise
 
 ``manual_commit`` suspends Peewee's transaction management for the duration
-of the block. ``atomic()`` and ``transaction()`` have no effect inside it.
-This should rarely be needed in application code.
+of the block. Inside it, ``atomic()`` raises ``ValueError`` (``with db:``
+likewise), and ``transaction()`` is inert, issuing no begin, commit, or
+rollback. ``savepoint()`` works normally inside a transaction opened with
+``begin()``. This should rarely be needed in application code.
 
 .. _sqlite-locking:
 

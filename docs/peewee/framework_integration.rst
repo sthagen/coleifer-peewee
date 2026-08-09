@@ -364,6 +364,87 @@ starts, shut the pool down on exit).
 
 .. seealso:: :ref:`pydantic`
 
+Synchronous endpoints
+^^^^^^^^^^^^^^^^^^^^^
+
+FastAPI runs a plain ``def`` endpoint in a worker thread, so synchronous
+peewee works unmodified. Scope the connection inside the endpoint body:
+
+.. code-block:: python
+
+   from fastapi import FastAPI
+   from peewee import *
+
+
+   db = SqliteDatabase('app.db')
+
+   class User(db.Model):
+       name = TextField()
+       email = TextField(unique=True)
+
+   with db:
+       db.create_tables([User])
+
+   app = FastAPI()
+
+   @app.get('/users')
+   def list_users():
+       with db:
+           return list(User.select().dicts())
+
+   @app.post('/users')
+   def create_user(name: str, email: str):
+       with db:
+           user = User.create(name=name, email=email)
+           return {'id': user.id, 'name': user.name}
+
+Do not manage the connection with a ``yield`` dependency or as request hook.
+FastAPI dispatches a sync dependency's setup, the endpoint, and the teardown as
+three separate threadpool calls(!), and under load they land on different
+threads. Peewee's connection state is thread-local, so each operation may see a
+different local state. By using ``with db:`` inside the endpoint body, the
+connection will be scoped properly.
+
+.. _quart:
+
+Quart
+-----
+
+Quart is an async, Flask-compatible framework. Use the same request hooks as
+:ref:`flask`, but ``async`` and with the async connection methods.
+
+.. code-block:: python
+
+   from quart import Quart
+   from peewee import *
+   from playhouse.pwasyncio import AsyncPostgresqlDatabase
+
+
+   db = AsyncPostgresqlDatabase('peewee_test')
+
+   app = Quart(__name__)
+
+   @app.before_serving
+   async def _create_tables():
+       # Optionally create tables idempotently at startup.
+       async with db:
+           await db.acreate_tables([...])
+
+   @app.after_serving
+   async def _close_pool():
+       await db.close_pool()
+
+   @app.before_request
+   async def _db_connect():
+       await db.aconnect()
+
+   @app.teardown_request
+   async def _db_close(exc):
+       if not db.is_closed():
+           await db.aclose()
+
+.. seealso:: :ref:`pwasyncio`
+
 .. _starlette:
 
 Starlette
@@ -417,46 +498,6 @@ task-local (so the connection would not be used in the endpoint).
 
 .. seealso:: :ref:`pwasyncio`
 
-.. _quart:
-
-Quart
------
-
-Quart is an async, Flask-compatible framework. Use the same request hooks as
-:ref:`flask`, but ``async`` and with the async connection methods.
-
-.. code-block:: python
-
-   from quart import Quart
-   from peewee import *
-   from playhouse.pwasyncio import AsyncPostgresqlDatabase
-
-
-   db = AsyncPostgresqlDatabase('peewee_test')
-
-   app = Quart(__name__)
-
-   @app.before_serving
-   async def _create_tables():
-       # Optionally create tables idempotently at startup.
-       async with db:
-           await db.acreate_tables([...])
-
-   @app.after_serving
-   async def _close_pool():
-       await db.close_pool()
-
-   @app.before_request
-   async def _db_connect():
-       await db.aconnect()
-
-   @app.teardown_request
-   async def _db_close(exc):
-       if not db.is_closed():
-           await db.aclose()
-
-.. seealso:: :ref:`pwasyncio`
-
 .. _litestar:
 
 Litestar
@@ -467,36 +508,10 @@ Litestar is an ASGI framework. The same plain ASGI middleware used for
 
 .. code-block:: python
 
-   from contextlib import asynccontextmanager
    from litestar import Litestar
    from litestar.middleware import DefineMiddleware
-   from peewee import *
-   from playhouse.pwasyncio import AsyncPostgresqlDatabase
 
-
-   db = AsyncPostgresqlDatabase('peewee_test')
-
-   class PeeweeConnectionMiddleware:
-       def __init__(self, app, database):
-           self.app = app
-           self.database = database
-
-       async def __call__(self, scope, receive, send):
-           if scope['type'] != 'http':
-               # Pass lifespan / websocket scopes through untouched.
-               await self.app(scope, receive, send)
-               return
-           async with self.database:  # Acquire a pooled connection for the task.
-               await self.app(scope, receive, send)
-
-   @asynccontextmanager
-   async def lifespan(app):
-       # Optionally create tables idempotently at startup.
-       async with db:
-           await db.acreate_tables([...])
-
-       yield
-       await db.close_pool()
+   # See starlette example above for body of middleware and lifespan.
 
    app = Litestar(
        route_handlers=[...],  # Your handlers, etc.

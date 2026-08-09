@@ -975,8 +975,6 @@ class _BasePsycopgAdapter:
     @overload
     def isolation_level_str(self, isolation_level: _T) -> _T: ...
 
-    def server_side_cursor(self, conn): ...
-
 class Psycopg2Adapter(_BasePsycopgAdapter):
     json_type: Incomplete
     jsonb_type: Incomplete
@@ -989,6 +987,7 @@ class Psycopg2Adapter(_BasePsycopgAdapter):
     def is_connection_usable(self, conn) -> bool: ...
     def is_connection_reusable(self, conn) -> bool: ...
     def is_connection_closed(self, conn) -> bool: ...
+    def server_side_cursor(self, conn): ...
 
 class Psycopg3Adapter(_BasePsycopgAdapter):
     json_type: Incomplete
@@ -1002,6 +1001,7 @@ class Psycopg3Adapter(_BasePsycopgAdapter):
     def is_connection_usable(self, conn) -> bool: ...
     def is_connection_reusable(self, conn) -> bool: ...
     def is_connection_closed(self, conn) -> bool: ...
+    def server_side_cursor(self, conn): ...
 
 class PostgresqlDatabase(Database):
     field_types: Incomplete
@@ -1014,6 +1014,8 @@ class PostgresqlDatabase(Database):
     sequences: bool
     psycopg2_adapter: Incomplete
     psycopg3_adapter: Incomplete
+    @property
+    def index_value_literals(self) -> bool: ...  # type: ignore[override]
     def init(
         self,
         database: str | None,
@@ -1597,8 +1599,8 @@ class ForeignKeyField(Field[_V]):
         cls, model: type[_M], *args: Any, null: Literal[False] = ..., **kwargs: Unpack[_FKKwargs]
     ) -> ForeignKeyField[_M]: ...
     @overload
-    # Untyped fallback: model given as a name/"self"/deferred ref, so the related type isn't known.
-    def __new__(cls, model: Any = ..., *args: Any, **kwargs: Unpack[_FKKwargs]) -> ForeignKeyField[Any]: ...
+    # Self-reference, the only string peewee accepts. Named refs use DeferredForeignKey.
+    def __new__(cls, model: Literal["self"] = ..., *args: Any, null: bool = ..., **kwargs: Unpack[_FKKwargs]) -> ForeignKeyField[Any]: ...
 
     @property
     def field_type(self): ...  # type: ignore[override]
@@ -1616,7 +1618,8 @@ class ForeignKeyField(Field[_V]):
 class DeferredForeignKey(Field):
     field_kwargs: Incomplete
     rel_model_name: Incomplete
-    def __init__(self, rel_model_name, **kwargs) -> None: ...
+    # Model named by string, so the related type isn't knowable and null can't refine it.
+    def __init__(self, rel_model_name: str, *, null: bool = ..., **kwargs: Unpack[_FKKwargs]) -> None: ...
     __hash__ = object.__hash__
     def __deepcopy__(self, memo=None) -> DeferredForeignKey: ...
     def set_model(self, rel_model) -> None: ...
@@ -1841,6 +1844,12 @@ class _BoundModelsContext(_callable_context_manager):
         self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
     ) -> None: ...
 
+# Mirrors the runtime classmethod_only descriptor: no instance overload, so
+# instance access is an error rather than the TypeError it raises at runtime.
+@type_check_only
+class _classmethod_only(Generic[_F]):
+    def __get__(self, instance: None, owner: type) -> _F: ...
+
 class Model(metaclass=ModelBase):
     __data__: Incomplete
     __rel__: Incomplete
@@ -1866,8 +1875,7 @@ class Model(metaclass=ModelBase):
     def replace_many(cls, rows, fields=None): ...
     @classmethod
     def raw(cls, sql, *params) -> ModelRaw: ...
-    @classmethod
-    def delete(cls) -> ModelDelete: ...
+    delete: _classmethod_only[Callable[[], ModelDelete]]
     @classmethod
     def create(cls, **query) -> Self: ...
     @classmethod

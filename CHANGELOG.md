@@ -7,17 +7,58 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+In which we learn to migrate (somewhat).
+
+* Add `playhouse.migrations` as a runner for migration scripts, which are
+  python files defining `up(migrator, db)` and optionally `down(...)`.
+  Migrations are applied in numeric order a-la Django, and stored by name in a
+  history table. CLI via `pwmigrate` accepting `status`, `up`, `down`,
+  `initial`, `create`, `generate`, `fake` and `diff`. To run from python,
+  `migrations.run(db)`.
+* Add basic `playhouse.schema_diff` for comparing models against the
+  schema and reporting differences (tables to create, columns added or
+  removed, indexes added or removed).
+* Render common field defaults in generated migrations
+  (`datetime.datetime.now`, `uuid.uuid4`, `decimal.Decimal`, enum values,
+  etc.) rather than flagging them with a TODO.
+* Allow adding column to existing table as `NOT NULL` with migrator, which
+  allows skipping the 3-step process of add nullable, populate default, set not
+  null.
+* `db_url.connect()` raises `ValueError` for a url with no database name,
+  e.g. `postgres://dbname` (two slashes reads `dbname` as the host).
+* Add a `SchemaMigrator.migration_context()` helper for wrapping migrations.
+  This was wanted for SQLite in order to disable FK pragma, which could trigger
+  cascading deletes while recreating tables.
+* Allow `SchemaMigrator.from_database()` to support database proxies.
+* Add support for newer SQLite ALTER TABLE functionality from 3.53.0.
+* Do not allow `delete()` method to be called on a model instance.
+  `Model.delete()` is a classmethod for constructing a `DELETE` query, and
+  `model.delete_instance()` has always been the correct path for deleting a
+  model instance. This new check just ensures that a new user cannot
+  accidentally delete their whole table by using the class-version from an
+  instance. Fixes #2277.
+* Server-side cursors opened inside a transaction on psycopg3 are no longer
+  declared `WITH HOLD`. They stream and are scoped to the transaction, rather
+  than spooling their remaining rows server-side at commit.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.3.0...master)
+
+## 4.3.0
+
 Backwards-incompatible:
 
-* Replace ``docid`` implicit primary key on legacy ``FTSModel`` (FTS4) with
-  ``rowid``, which is equivalent. Using ``docid`` presents no benefit and
-  switching to ``rowid`` makes operations more consistent. Users have a couple
+* Specify `requires-python >= 3.8`. I've been putting off committing to
+  anything like this, since technically we still work on 3.7, but 3.8 is the
+  minimum we run on CI so it felt correct.
+* Replace `docid` implicit primary key on legacy `FTSModel` (FTS4) with
+  `rowid`, which is equivalent. Using `docid` presents no benefit and
+  switching to `rowid` makes operations more consistent. Users have a couple
   options when updating:
-    * Explicitly add ``docid = DocIDField()`` to your FTSModel classes.
-    * Update your code, replacing ``docid`` with ``rowid``. The underlying data
+    * Explicitly add `docid = DocIDField()` to your FTSModel classes.
+    * Update your code, replacing `docid` with `rowid`. The underlying data
       does not require a migration, as docid was just an alias for rowid.
 * When a RETURNING-clause insert of a single row inserts nothing, e.g. a
-  conflict was ignored, ``execute()`` returns ``None`` on every backend.
+  conflict was ignored, `execute()` returns `None` on every backend.
 
 Improvements:
 
@@ -73,12 +114,13 @@ Improvements:
 * Add support for cysqlite's sick table func decorator syntax.
 * Better behavior for INSERT when `as_rowcount()` is specified, along with
   proper return of all parts of a composite PK instead of just the 1st column.
-* ``last_insert_id()`` is implemented once on ``Database``, with backends
-  overriding ``_last_insert_rowid()`` where the driver differs. APSW and the
+* `last_insert_id()` is implemented once on `Database`, with backends
+  overriding `_last_insert_rowid()` where the driver differs. APSW and the
   MariaDB connector inherit composite primary-key support as a result, having
   previously returned only the first column.
+* Don't apply field kwargs to barefield instances w/reflection, #3064.
 
-[View commits](https://github.com/coleifer/peewee/compare/4.2.6...master)
+[View commits](https://github.com/coleifer/peewee/compare/4.2.6...4.3.0)
 
 ## 4.2.6
 
