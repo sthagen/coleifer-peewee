@@ -1648,6 +1648,8 @@ class Entity(ColumnBase):
         self._path = [p for p in path if p]
 
     def __getattr__(self, attr):
+        if attr.startswith('__') and attr.endswith('__'):
+            return super(Entity, self).__getattr__(attr)
         return Entity(*self._path + [attr])
 
     def get_sort_key(self, ctx):
@@ -2055,6 +2057,9 @@ class OnConflict(Node):
         self._conflict_constraint = conflict_constraint
 
     def get_conflict_statement(self, ctx, query):
+        if ctx.state.conflict_statement is None:
+            raise InterfaceError('ON CONFLICT clause requires the query be '
+                                 'bound to a database.')
         return ctx.state.conflict_statement(self, query)
 
     def get_conflict_update(self, ctx, query):
@@ -2361,8 +2366,8 @@ class SelectBase(_HashableSource, Source, SelectQuery):
     @database_required
     def scalar(self, database, as_tuple=False, as_dict=False):
         if as_dict:
-            return self.dicts().peek(database)
-        row = self.tuples().peek(database)
+            return self.dicts().first(database)
+        row = self.tuples().first(database)
         return row[0] if row and not as_tuple else row
 
     @database_required
@@ -2650,6 +2655,10 @@ class Select(SelectBase):
 
     @Node.copy
     def window(self, *windows):
+        aliases = [window._alias for window in windows]
+        if len(set(aliases)) != len(aliases):
+            raise ValueError('Window definitions must have unique aliases. '
+                             'Use alias= to name each window.')
         self._windows = windows if windows else None
 
     @Node.copy
@@ -3044,15 +3053,20 @@ class Insert(_WriteQuery):
 
             return self.apply_returning(ctx)
 
+    def _pk_returning(self):
+        if self.table._primary_key:
+            return (self.table.primary_key,)
+
     def _execute(self, database):
         if self._as_rowcount:
             # Strip implicit pk-returning, which breaks rowcount on sqlite.
             if not self._return_cursor:
                 self._returning = None
-        elif self._returning is None and database.returning_clause \
-             and self.table._primary_key:
-            self._returning = (self.table.primary_key,)
-            self._row_type = ROW.TUPLE
+        elif self._returning is None and database.returning_clause:
+            returning = self._pk_returning()
+            if returning:
+                self._returning = returning
+                self._row_type = ROW.TUPLE
         try:
             return super(Insert, self)._execute(database)
         except self.DefaultValuesException:
@@ -3778,8 +3792,9 @@ class Database(_callable_context_manager):
         if self.is_closed():
             self.connect()
         ctx = self.atomic()
-        self._state.ctx.append(ctx)
+        # Track the context only once entered, an aborted entry is never popped.
         ctx.__enter__()
+        self._state.ctx.append(ctx)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -4031,10 +4046,16 @@ class Database(_callable_context_manager):
             self.cursor().execute('BEGIN')
 
     def rollback(self):
+        if self.is_closed():
+            raise InterfaceError('Cannot rollback, database connection not '
+                                 'open.')
         with __exception_wrapper__:
             self.cursor().execute('ROLLBACK')
 
     def commit(self):
+        if self.is_closed():
+            raise InterfaceError('Cannot commit, database connection not '
+                                 'open.')
         with __exception_wrapper__:
             self.cursor().execute('COMMIT')
 
@@ -4376,10 +4397,16 @@ class SqliteDatabase(Database):
         self.execute_sql(statement)
 
     def commit(self):
+        if self.is_closed():
+            raise InterfaceError('Cannot commit, database connection not '
+                                 'open.')
         with __exception_wrapper__:
             return self.execute_sql('COMMIT')
 
     def rollback(self):
+        if self.is_closed():
+            raise InterfaceError('Cannot rollback, database connection not '
+                                 'open.')
         with __exception_wrapper__:
             return self.execute_sql('ROLLBACK')
 
@@ -7536,6 +7563,14 @@ class Metadata(object):
         self.table_name = table_name
         del self.table
 
+    def get_database_instance(self):
+        db = self.database
+        if db is None:
+            return
+        if isinstance(db, Proxy):
+            return db.obj if db.obj is not None else None
+        return db
+
 
 class SubclassAwareMetadata(Metadata):
     models = []
@@ -8799,9 +8834,13 @@ class ModelInsert(_ModelWriteQueryHelper, Insert):
 
     def __init__(self, *args, **kwargs):
         super(ModelInsert, self).__init__(*args, **kwargs)
-        if self._returning is None and self.model._meta.database is not None:
-            if self.model._meta.database.returning_clause:
-                self._returning = self.model._meta.get_primary_keys()
+        if self._returning is None:
+            db = self.model._meta.get_database_instance()
+            if db is not None and db.returning_clause:
+                self._returning = self._pk_returning()
+
+    def _pk_returning(self):
+        return self.model._meta.get_primary_keys() or None
 
     def returning(self, *returning):
         # By default ModelInsert will yield a `tuple` containing the

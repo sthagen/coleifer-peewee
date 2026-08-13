@@ -3710,6 +3710,20 @@ class TestScalarIntegration(ModelTestCase):
         self.assertEqual(count, 3)
 
     @requires_models(User)
+    def test_scalar_implicit_limit(self):
+        for u in ('huey', 'mickey', 'zaizee'):
+            User.create(username=u)
+        query = User.select(User.username).order_by(User.username.desc())
+        self.assertEqual(query.scalar(), 'zaizee')
+        self.assertHistory(1, [
+            ('SELECT "t1"."username" FROM "users" AS "t1" '
+             'ORDER BY "t1"."username" DESC LIMIT ?', [1])])
+
+        # The limit is applied to an internal clone, not the query itself.
+        self.assertEqual([u.username for u in query],
+                         ['zaizee', 'mickey', 'huey'])
+
+    @requires_models(User)
     def test_scalar_as_tuple(self):
         for u in ('huey', 'mickey', 'zaizee'):
             User.create(username=u)
@@ -5072,6 +5086,21 @@ class ServerDefault(TestModel):
 @requires_postgresql
 class TestReturningIntegration(ModelTestCase):
     requires = [User]
+
+    def test_insert_bind_at_execute(self):
+        class LateBound(Model):
+            username = CharField()
+
+        with self.database.bind_ctx([LateBound]):
+            LateBound.create_table()
+        try:
+            query = LateBound.insert(username='zaizee')
+            self.assertEqual(query.execute(self.database), 1)
+            with self.database.bind_ctx([LateBound]):
+                self.assertEqual(LateBound.select().count(), 1)
+        finally:
+            with self.database.bind_ctx([LateBound]):
+                LateBound.drop_table()
 
     def test_simple_returning(self):
         query = User.insert(username='charlie')
@@ -7911,6 +7940,25 @@ class TestMetadataEdgeCases(BaseTestCase):
         # After delete and re-access, we get a fresh Table.
         self.assertIsNotNone(t2)
         self.assertIsNot(t1, t2)
+
+    def test_get_database_instance(self):
+        p = DatabaseProxy()
+        db = SqliteDatabase(':memory:')
+
+        class WithDB(TestModel):
+            class Meta:
+                database = db
+        class WithProxy(TestModel):
+            class Meta:
+                database = p
+        class Unbound(Model):
+            pass
+
+        self.assertEqual(WithDB._meta.get_database_instance(), db)
+        self.assertIsNone(WithProxy._meta.get_database_instance())
+        p.initialize(db)
+        self.assertEqual(WithProxy._meta.get_database_instance(), db)
+        self.assertIsNone(Unbound._meta.get_database_instance())
 
 
 class DepParent(TestModel):
