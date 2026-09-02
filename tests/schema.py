@@ -150,6 +150,38 @@ class TestModelDDL(ModelDatabaseTestCase):
              'FOREIGN KEY ("user_id") REFERENCES "foo"."user" ("id"))'),
             ('CREATE INDEX "bar"."tweet_user_id" ON "tweet" ("user_id")')])
 
+    def test_model_sequence_schema(self):
+        class Ticket(TestModel):
+            value = IntegerField(sequence='tkt_seq')
+            class Meta:
+                database = self.database
+                schema = 'foo'
+
+        self.assertCreateTable(Ticket, [
+            ('CREATE TABLE "foo"."ticket" ("id" INTEGER NOT NULL PRIMARY KEY, '
+             '"value" INTEGER NOT NULL DEFAULT NEXTVAL(\'foo.tkt_seq\'))')])
+
+        # The column default has to name the sequence CREATE SEQUENCE makes.
+        ctx = self.database.get_sql_context()
+        seq = Ticket._schema._sequence_for_field(Ticket.value)
+        self.assertEqual(ctx.sql(seq).query()[0], '"foo"."tkt_seq"')
+
+    def test_model_sequence_qualified(self):
+        class Coupon(TestModel):
+            value = IntegerField(sequence='other.cpn_seq')
+            class Meta:
+                database = self.database
+                schema = 'foo'
+
+        # A sequence the user qualified is used as-is.
+        self.assertCreateTable(Coupon, [
+            ('CREATE TABLE "foo"."coupon" ("id" INTEGER NOT NULL PRIMARY KEY, '
+             '"value" INTEGER NOT NULL DEFAULT NEXTVAL(\'other.cpn_seq\'))')])
+
+        ctx = self.database.get_sql_context()
+        seq = Coupon._schema._sequence_for_field(Coupon.value)
+        self.assertEqual(ctx.sql(seq).query()[0], '"other"."cpn_seq"')
+
     def test_bigauto_and_fk(self):
         class CustomDB(SqliteDatabase):
             field_types = {
@@ -1316,3 +1348,38 @@ class TestSchemaGetIndexes(ModelTestCase):
         idxs = self.database.get_indexes('t', schema='s2')
         self.assertEqual([(i.name, i.columns) for i in idxs],
                          [('i1', ['c1', 'c2'])])
+
+
+@requires_postgresql
+class TestSequenceExistsSchema(ModelTestCase):
+    def setUp(self):
+        super(TestSequenceExistsSchema, self).setUp()
+        with self.database:
+            self.database.execute_sql('create schema s1')
+            self.database.execute_sql('create sequence s1.the_seq')
+
+    def tearDown(self):
+        with self.database:
+            self.database.execute_sql('drop table if exists counted')
+            self.database.execute_sql('drop schema s1 cascade')
+        super(TestSequenceExistsSchema, self).tearDown()
+
+    def test_sequence_exists_schema(self):
+        # Unqualified means the current schema, not any schema.
+        self.assertFalse(self.database.sequence_exists('the_seq'))
+        self.assertTrue(self.database.sequence_exists('s1.the_seq'))
+        self.assertTrue(self.database.sequence_exists('the_seq', 's1'))
+
+        class Counted(TestModel):
+            value = IntegerField(sequence='the_seq')
+
+        Counted._meta.set_database(self.database)
+        self.database.create_tables([Counted])
+        self.assertTrue(self.database.sequence_exists('the_seq'))
+        Counted.create()
+        Counted.create()
+        self.assertEqual(
+            [c.value for c in Counted.select().order_by(Counted.value)],
+            [1, 2])
+        self.database.drop_tables([Counted])
+        self.assertFalse(self.database.sequence_exists('the_seq'))

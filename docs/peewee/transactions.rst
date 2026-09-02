@@ -125,9 +125,9 @@ back. Otherwise the statements will be committed at the end of the wrapped block
 
    with db.transaction() as txn:
        User.create(username='mickey')
-       txn.commit()         # Commit now; a new transaction begins.
+       txn.commit()         # Commit now. A new transaction begins.
        User.create(username='huey')
-       txn.rollback()       # Roll back huey; a new transaction begins.
+       txn.rollback()       # Roll back huey. A new transaction begins.
        User.create(username='zaizee')
    # zaizee is committed when the block exits.
 
@@ -157,6 +157,34 @@ Savepoints must occur within a transaction, but can be nested arbitrarily deep.
 
 If you manually commit or roll back a savepoint, a new savepoint will
 automatically begin.
+
+Running Code After Commit
+-------------------------
+
+:meth:`Database.after_commit` registers a callable to run after the current
+transaction commits. If the transaction rolls back the callable is discarded.
+If no transaction is active, the callable runs immediately. One use is
+enqueueing work keyed on a new row's id.
+
+.. code-block:: python
+
+   with db.atomic():
+       order = Order.create(...)
+       db.after_commit(lambda: process_order(order.id))
+
+Callbacks run in registration order after the outermost block commits.
+Savepoints get no special treatment, so a callback registered in a nested block
+whose savepoint rolls back still runs if the outer transaction commits. An
+exception from a callback propagates, and later callbacks do not run. Not
+available in manual-commit mode, where peewee does not control the commit.
+
+With ``playhouse.pwasyncio`` callbacks run on the greenlet runner and may
+issue queries. A coroutine function is rejected, since it would never be
+awaited. To schedule one instead:
+
+.. code-block:: python
+
+   db.after_commit(lambda: asyncio.get_running_loop().create_task(coro()))
 
 Autocommit Mode
 ---------------
@@ -216,9 +244,23 @@ The three modes:
 * **DEFERRED** (default) - acquires the minimum necessary lock as reads and
   writes occur. Another writer can intervene between BEGIN and your first write.
 * **IMMEDIATE** - acquires a write reservation lock at BEGIN. Other writers are
-  blocked; readers can proceed.
+  blocked but readers can proceed.
 * **EXCLUSIVE** - acquires an exclusive lock at BEGIN. No other connection can
   read or write until the transaction completes.
+
+DEFERRED is a common source of trouble for concurrent writers, because a block
+that reads before it writes upgrades its lock late, and the resulting
+``SQLITE_BUSY_SNAPSHOT`` does not consult the busy-timeout. The transaction
+fails immediately and retrying cannot help, since the snapshot is already
+stale. Pass ``lock_type`` to the database to make every transaction IMMEDIATE:
+
+.. code-block:: python
+
+   db = SqliteDatabase('app.db', lock_type='IMMEDIATE')
+
+An explicit ``atomic(lock_type=...)`` still takes precedence. IMMEDIATE blocks
+other writers for the whole block, so a long read-only ``atomic()`` costs more
+than it does under DEFERRED.
 
 .. seealso::
    `SQLite locking documentation

@@ -14,6 +14,8 @@ Test case ordering:
 """
 from itertools import permutations
 from queue import Queue
+import gc
+import os
 import platform
 import re
 import threading
@@ -38,6 +40,7 @@ from .base import IS_ORACLE_MYSQL
 from .base import IS_POSTGRESQL
 from .base import IS_SQLITE
 from .base import ModelTestCase
+from .base import skip_unless
 from .base import TestModel
 from .base import db
 from .base import get_in_memory_db
@@ -213,6 +216,43 @@ class TestDatabase(DatabaseTestCase):
         db.close()
         alt_db.close()
 
+    def test_bind_ctx_decorator(self):
+        db = get_in_memory_db()
+        alt_db = get_in_memory_db()
+
+        class A(Model):
+            class Meta:
+                database = db
+        class B(Model):
+            a = ForeignKeyField(A)
+            class Meta:
+                database = db
+
+        @alt_db.bind_ctx([A, B])
+        def with_db():
+            return (A._meta.database, B._meta.database)
+
+        @A.bind_ctx(alt_db)
+        def with_model():
+            return (A._meta.database, B._meta.database)
+
+        for fn in (with_db, with_model):
+            # The context is rebuilt per-call, so it can be re-entered.
+            for _ in range(2):
+                self.assertEqual(fn(), (alt_db, alt_db))
+                self.assertEqual(A._meta.database, db)
+                self.assertEqual(B._meta.database, db)
+
+        @A.bind_ctx(alt_db, bind_refs=False, bind_backrefs=False)
+        def recurse(n):
+            if n:
+                self.assertEqual(recurse(n - 1), alt_db)
+            self.assertEqual(B._meta.database, db)
+            return A._meta.database
+
+        self.assertEqual(recurse(2), alt_db)
+        self.assertEqual(A._meta.database, db)
+
     def test_bind_regression(self):
         class Base(Model):
             class Meta:
@@ -306,6 +346,55 @@ class TestDatabase(DatabaseTestCase):
         self.assertRaises(InterfaceError, db.cursor)
 
 
+class TestQueryHooks(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [User]
+
+    def setUp(self):
+        super(TestQueryHooks, self).setUp()
+        self.events = []
+        self.database.query_hooks.append(self.events.append)
+
+    def tearDown(self):
+        del self.database.query_hooks[:]
+        super(TestQueryHooks, self).tearDown()
+
+    def test_query_hooks(self):
+        User.create(username='u1')
+        event = self.events[-1]
+        self.assertTrue('INSERT' in event.sql)
+        self.assertEqual(event.params, ['u1'])
+        self.assertTrue(event.duration >= 0.)
+        self.assertIsNone(event.exception)
+
+        n = len(self.events)
+        self.assertEqual(User.select().count(), 1)
+        self.assertEqual(len(self.events), n + 1)
+        self.assertTrue(self.events[-1].sql.startswith('SELECT'))
+
+    def test_query_hooks_transaction(self):
+        # BEGIN / COMMIT are not queries and do not reach the hooks.
+        with self.database.atomic():
+            User.create(username='u1')
+        self.assertEqual([e.sql.split()[0] for e in self.events], ['INSERT'])
+
+    def test_query_hooks_error(self):
+        with self.assertRaises(OperationalError):
+            self.database.execute_sql('select * from missing_tbl')
+        event = self.events[-1]
+        self.assertTrue('missing_tbl' in event.sql)
+        self.assertIsInstance(event.exception, OperationalError)
+
+    def test_query_hooks_propagate_errors(self):
+        def bad_hook(event):
+            raise ValueError('nope')
+        self.database.query_hooks.append(bad_hook)
+        self.assertRaises(ValueError, self.database.execute_sql, 'select 1')
+
+    def test_query_hooks_per_instance(self):
+        self.assertEqual(get_in_memory_db().query_hooks, [])
+
+
 class TestDatabaseConnection(DatabaseTestCase):
     def test_is_connection_usable(self):
         # Ensure a connection is open.
@@ -335,6 +424,38 @@ class TestDatabaseConnection(DatabaseTestCase):
             curs = self.database.execute_sql('select * from foo')
             self.assertEqual(list(curs), [])
             self.database.execute_sql('drop table foo')
+
+    @skip_unless(hasattr(os, 'fork'), 'requires fork')
+    def test_dispose_after_fork(self):
+        self.database.execute_sql('drop table if exists foo')
+        self.database.execute_sql('create table foo (data text not null)')
+        conn = self.database.connection()
+
+        pid = os.fork()
+        if pid == 0:
+            # Child. The exit code reports the result, os._exit skips the
+            # runner's teardown.
+            try:
+                self.database.dispose()
+                if not self.database.is_closed():
+                    os._exit(1)
+                del conn  # Let the parent's connection object be collected.
+                gc.collect()
+                self.database.execute_sql("insert into foo (data) values ('c')")
+                self.database.close()
+            except BaseException:
+                os._exit(2)
+            os._exit(0)
+
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(status, 0)
+
+        # The parent's connection survived the child's dispose, gc and close.
+        self.assertTrue(self.database.connection() is conn)
+        self.database.execute_sql("insert into foo (data) values ('p')")
+        curs = self.database.execute_sql('select data from foo order by data')
+        self.assertEqual([row[0] for row in curs], ['c', 'p'])
+        self.database.execute_sql('drop table foo')
 
 
 class TestSessionTransactions(DatabaseTestCase):
@@ -717,6 +838,46 @@ class TestIntrospection(ModelTestCase):
         idx, = self.database.get_indexes('q"""t')
         self.assertEqual(idx.name, 'q"""t_data')
         self.assertEqual(idx.columns, ['da"ta'])
+
+
+@requires_postgresql
+class TestIntrospectionSearchPath(DatabaseTestCase):
+    """With no schema given, introspection follows the search path."""
+    schema = 'ispath'
+
+    def setUp(self):
+        super(TestIntrospectionSearchPath, self).setUp()
+        self.execute('DROP SCHEMA IF EXISTS %s CASCADE' % self.schema)
+        self.execute('CREATE SCHEMA %s' % self.schema)
+        self.execute('CREATE TABLE %s.parent (id SERIAL PRIMARY KEY)'
+                     % self.schema)
+        self.execute('CREATE TABLE %s.child (id SERIAL PRIMARY KEY, '
+                     'parent_id INTEGER REFERENCES %s.parent (id), '
+                     'name TEXT)' % (self.schema, self.schema))
+        self.execute('CREATE INDEX child_name ON %s.child (name)'
+                     % self.schema)
+        self.execute('CREATE VIEW %s.child_names AS SELECT name FROM '
+                     '%s.child' % (self.schema, self.schema))
+        self.execute('SET search_path TO %s' % self.schema)
+
+    def tearDown(self):
+        try:
+            self.execute('DROP SCHEMA IF EXISTS %s CASCADE' % self.schema)
+        finally:
+            super(TestIntrospectionSearchPath, self).tearDown()
+
+    def test_search_path(self):
+        db = self.database
+        self.assertEqual(db.get_tables(), ['child', 'parent'])
+        self.assertEqual([v.name for v in db.get_views()], ['child_names'])
+        self.assertEqual([c.name for c in db.get_columns('child')],
+                         ['id', 'parent_id', 'name'])
+        self.assertEqual(db.get_primary_keys('child'), ['id'])
+        self.assertEqual([(fk.column, fk.dest_table)
+                          for fk in db.get_foreign_keys('child')],
+                         [('parent_id', 'parent')])
+        self.assertTrue('child_name' in
+                        [i.name for i in db.get_indexes('child')])
 
 
 # ===========================================================================

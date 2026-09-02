@@ -7,9 +7,72 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+Backwards-incompatible:
+
+* MySQL and MariaDB connections no longer set `sql_mode`. Peewee had been
+  setting `PIPES_AS_CONCAT`, but the param replaced the server's mode rather
+  than adding to it, which silently disabled `STRICT_TRANS_TABLES` (etc).
+  Going forward Peewee will not modify `sql_mode` alone by default and use
+  `CONCAT()` rather than `||` for MySQL/MariaDB.
+* MySQL and MariaDB connection charset defaults to `utf8mb4` instead of `utf8`,
+  which is an alias for `utf8mb3` and cannot store 4-byte characters.
+* A field's `sequence=` is now qualified with the model's `Meta.schema`. If the
+  name you pass already contains a dot it is treated as fully-qualified and
+  used as-is, so `sequence='other.seq'` is unaffected by `Meta.schema`. Also,
+  `sequence_exists()` accepts a schema-qualified name.
+* SQLite `BEGIN`, `COMMIT` and `ROLLBACK` are issued directly on a cursor
+  rather than through `execute_sql()`, so they are no longer debug-logged, do
+  not fire query hooks and are not counted by `count_queries()`. This matches
+  Postgres and MySQL.
+* `atomic()` and `transaction()` on a closed database with `autoconnect=False`
+  now raise `InterfaceError` on Postgres and MySQL, as they already did on
+  SQLite (and as queries do). Previously `begin()` opened a connection
+  regardless of `autoconnect`.
+
+Improvements:
+
+* Add `SqliteDatabase(..., lock_type=...)` to set the default locking strategy
+  for transactions that do not specify one, e.g. `lock_type='IMMEDIATE'`.
+* Postgres introspection (`get_tables()`, `get_columns()`, `get_indexes()`,
+  `get_primary_keys()`, `get_foreign_keys()`, `get_views()`) with no `schema`
+  now follows the search path via `current_schema()` instead of assuming
+  `public`, matching MySQL's `DATABASE()` behavior.
+* Add `Runner(db, schema=...)` and `pwmigrate --schema` for running
+  migrations against a specific schema. The history table lives in that
+  schema, so each schema tracks its own applied set and one set of migration
+  files can be run against any number of schemas.
+* Add `SchemaMigrator(db, schema=...)`, which qualifies every table name w/the
+  given schema (or database on MySQL). Not supported for SQLite, as the
+  table-rebuild rewrites DDL straight from `sqlite_master`.
+* Add `websearch=True` to `TSVectorField.match()` and `Match()` to parse the
+  query using `websearch_to_tsquery()` (pg 11+). Accepts user input without
+  raising (quoted phrases, `or`, and `-negation`).
+* Add `Database.query_hooks`, a list of callables invoked after every query
+  with a `QueryEvent` named tuple (`sql`, `params`, `duration`, `exception`),
+  on success and failure both. No timing overhead when the list is empty.
+* Add `Database.after_commit(fn)`, which runs a callable after the outermost
+  transaction commits. Hook is discarded on rollback and runs immediately if
+  no transaction is active. Use for, e.g., writing a row PK to a task queue.
+* Add `EnumField` and `IntEnumField` to `playhouse.fields`, storing
+  `member.value` and returning the member, rejecting unknown values on write
+  and comparison. `to_pydantic()` maps any field with an `enum_class`
+  attribute to the enum itself, so schemas validate membership.
+* Add `Database.dispose()` / `PooledDatabase.dispose()` for discarding and
+  resetting local connection state, e.g. in a child process after `fork()`.
+* `Model.bind_ctx()` and `Database.bind_ctx()` can be used as decorators, like
+  the other peewee context-managers. Previously the decorator form raised
+  `TypeError: '_BoundModelsContext' object is not callable`.
+* `TimeField` supports utc offsets like `DateTimeField`, parsing e.g.
+  `'11:12:13+02:00'` to an aware `datetime.time` instead of returning `str`.
+  Only sqlite stores the offset. The postgres/mysql drivers drop it on write.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.4.0...master)
+
+## 4.4.0
+
 In which we learn to migrate (somewhat).
 
-* Add `playhouse.migrations` as a runner for migration scripts, which are
+* Add `playhouse.migrations` for running migration scripts. Migrations are
   python files defining `up(migrator, db)` and optionally `down(...)`.
   Migrations are applied in numeric order a-la Django, and stored by name in a
   history table. CLI via `pwmigrate` accepting `status`, `up`, `down`,
@@ -18,9 +81,6 @@ In which we learn to migrate (somewhat).
 * Add basic `playhouse.schema_diff` for comparing models against the
   schema and reporting differences (tables to create, columns added or
   removed, indexes added or removed).
-* Render common field defaults in generated migrations
-  (`datetime.datetime.now`, `uuid.uuid4`, `decimal.Decimal`, enum values,
-  etc.) rather than flagging them with a TODO.
 * Allow adding column to existing table as `NOT NULL` with migrator, which
   allows skipping the 3-step process of add nullable, populate default, set not
   null.
@@ -43,10 +103,12 @@ In which we learn to migrate (somewhat).
 * `scalar()` applies a `LIMIT 1` via `first()`, rather than running the
   query unbounded and reading the first value. The query itself is not mutated,
   the limit is applied only on an internal copy, refs #3068.
+* Ensure `JSONField` works when proxy is already initialized. Thanks
+  @NotAFlightRisk, refs #3070.
 * `commit()` / `rollback()` on a closed db will raise rather than silently open
   a new connection.
 
-[View commits](https://github.com/coleifer/peewee/compare/4.3.0...master)
+[View commits](https://github.com/coleifer/peewee/compare/4.3.0...4.4.0)
 
 ## 4.3.0
 

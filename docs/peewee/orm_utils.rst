@@ -71,8 +71,7 @@ Model Serialization
 
 .. function:: dict_to_model(model_class, data, ignore_unknown=False)
 
-   Construct a model instance from a dictionary. Foreign keys may be
-   provided as nested dicts; back-references as lists of dicts.
+   Construct a model instance from a dictionary.
 
    :param Model model_class: The model class to construct.
    :param dict data: A dictionary of data. Foreign keys can be included as nested dictionaries, and back-references as lists of dictionaries.
@@ -514,7 +513,7 @@ Because the generated class is a regular Pydantic model, you can call
      "type": "object"
    }
 
-Note that ``name``, ``age``, and ``status`` are the only required fields. All
+``name``, ``age``, and ``status`` are the only required fields. All
 other fields have defaults (``active`` defaults to ``True``, ``bio`` defaults
 to ``None``, and ``created`` uses a ``default_factory``).
 
@@ -1267,12 +1266,12 @@ Extra Field Types
 
 .. module:: playhouse.fields
 
-``playhouse.fields`` provides two general-purpose field types.
+``playhouse.fields`` provides a handful of general-purpose field types.
 
 .. class:: CompressedField(compression_level=6, algorithm='zlib', **kwargs)
 
    Stores compressed binary data using ``zlib`` or ``bz2``. Extends
-   :class:`BlobField`; compression and decompression are transparent:
+   :class:`BlobField`. Compression and decompression are transparent:
 
    .. code-block:: python
 
@@ -1296,6 +1295,35 @@ Extra Field Types
            data = PickleField()
 
        CachedResult.create(data={'nested': [1, 2, 3]})
+
+.. class:: EnumField(enum_class, **kwargs)
+
+   Stores members of an :class:`enum.Enum` with string values in a
+   :class:`CharField`, storing ``member.value`` and returning the member.
+   Unknown values are rejected with a ``ValueError`` on both the write and
+   comparison paths.
+
+   .. code-block:: python
+
+       from playhouse.fields import EnumField
+
+       class Status(enum.Enum):
+           ACTIVE = 'active'
+           ARCHIVED = 'archived'
+
+       class Account(Model):
+           status = EnumField(Status, default=Status.ACTIVE)
+
+       Account.select().where(Account.status == Status.ARCHIVED)
+
+   ``max_length`` defaults to 255 as with :class:`CharField`.
+   :py:func:`~playhouse.pydantic_utils.to_pydantic` maps the field to the
+   enum itself, so generated schemas validate membership.
+
+.. class:: IntEnumField(enum_class, **kwargs)
+
+   Like :class:`EnumField` for enums with integer values, stored in an
+   :class:`IntegerField`.
 
 
 .. _flask-utils:
@@ -1389,7 +1417,7 @@ Excluding routes from connection management:
 
 .. class:: FlaskDB(app=None, database=None, model_class=Model, excluded_routes=None)
 
-   :param app: Flask application instance (optional; use ``init_app()`` for
+   :param app: Flask application instance (optional, use ``init_app()`` for
        the factory pattern).
    :param database: A database URL string, configuration dictionary, or a
        :class:`Database` instance.
@@ -1471,7 +1499,7 @@ Query Helpers
 
    .. method:: get_page()
 
-      Return the current page number (1-based; defaults to 1).
+      Return the current page number (1-based, defaults to 1).
 
    .. method:: get_page_count()
 

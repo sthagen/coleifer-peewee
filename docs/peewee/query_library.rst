@@ -827,8 +827,7 @@ Count the number of facilities
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 For our first foray into aggregates, we're going to stick to something
-simple. We want to know how many facilities exist - simply produce a total
-count.
+simple. We want to know how many facilities exist. Produce a total count.
 
 .. code-block:: sql
 
@@ -1451,6 +1450,56 @@ into a CTE to make it a little more clear.
         .order_by(Facility.name)
         .with_cte(monthdata))
 
+.. _json-relations-recipe:
+
+Attach each member's bookings as JSON
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Fetch every member with their bookings attached, in a single query. A
+correlated subquery gathers each member's bookings into a JSON array, with
+no second query and none of the row multiplication a join would cause. A
+member with no bookings gets an empty list.
+
+.. code-block:: sql
+
+    SELECT m.firstname, m.surname,
+           (SELECT COALESCE(json_agg(json_build_object(
+                       'facility', f.name,
+                       'starttime', b.starttime)), '[]'::json)
+            FROM bookings AS b
+            INNER JOIN facilities AS f ON b.facid = f.facid
+            WHERE b.memid = m.memid) AS bookings
+    FROM members AS m;
+
+.. code-block:: python
+
+    bookings = (Booking
+                .select(fn.COALESCE(
+                    fn.json_agg(fn.json_build_object(
+                        'facility', Facility.name,
+                        'starttime', Booking.starttime)),
+                    SQL("'[]'::json")))
+                .join(Facility)
+                .where(Booking.member == Member.memid))
+
+    query = (Member
+             .select(Member.firstname, Member.surname,
+                     bookings.alias('bookings'))
+             .dicts())
+
+    for row in query:
+        print(row['surname'], len(row['bookings']))
+
+The postgres driver parses the ``json`` column, so ``row['bookings']`` is a
+list of dicts. The function names differ by database:
+
+* postgres: ``json_agg``, ``json_build_object``
+* SQLite: ``json_group_array``, ``json_object``
+* MySQL and MariaDB: ``json_arrayagg``, ``json_object``
+
+SQLite and MySQL return the JSON as text, so pass it through
+``json.loads()``.
+
 Dates and Times
 ---------------
 
@@ -1789,7 +1838,7 @@ member ID and name, and order by ascending member id.
    for row in query:
        print(row.memid, row.firstname, row.surname)
 
-Produce a upward recommendation chain for any member
+Produce an upward recommendation chain for any member
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Produce a CTE that can return the upward recommendation chain for any member.
@@ -1818,7 +1867,7 @@ descending.
 
 .. code-block:: python
 
-   # Base-case of recursive CTE. Get member recommender where memid=27.
+   # Base-case of recursive CTE. Get every member and their recommender.
    base = (Member
           .select(Member.recommendedby, Member.memid)
           .cte('recommenders', recursive=True, columns=('recommender', 'member')))

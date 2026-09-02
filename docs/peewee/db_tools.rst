@@ -225,6 +225,11 @@ than actually disconnecting.
       Close all connections including those currently in use.
       Use with caution.
 
+   .. method:: dispose()
+
+      Discard every connection, idle or in use, without closing any. For a
+      child process after ``fork()``. See :ref:`forking`.
+
 .. class:: PooledSqliteDatabase(database, max_connections=20, stale_timeout=None, timeout=None, **kwargs)
 
    Pool implementation for SQLite databases. Extends :class:`SqliteDatabase`.
@@ -436,14 +441,13 @@ Peewee appends by default):
 driver's own: ``%s`` for postgres and mysql, ``?`` for sqlite.
 
 .. note::
-   Postgres users may need to set the search-path when using a non-standard
-   schema. This can be done as follows:
+   Pass the schema to the migrator when the tables are not in the default
+   schema.
 
    .. code-block:: python
 
-      migrator = PostgresqlMigrator(db)
+      migrator = PostgresqlMigrator(db, schema='my_schema')
       migrate(
-          migrator.set_search_path('my_schema'),
           migrator.add_column('table', 'field', TextField(default='')),
       )
 
@@ -463,16 +467,18 @@ Migration API
            migrator.add_index('t', ('col',), False),
        )
 
-.. class:: SchemaMigrator(database)
+.. class:: SchemaMigrator(database, schema=None)
 
    :param database: a :class:`Database` instance.
+   :param str schema: schema containing the tables to be migrated.
 
    The :class:`SchemaMigrator` is responsible for generating schema-altering
    statements.
 
-   .. classmethod:: from_database(database)
+   .. classmethod:: from_database(database, schema=None)
 
       :param Database database: database instance to generate migrations for.
+      :param str schema: schema containing the tables to be migrated.
       :return: :class:`SchemaMigrator` instance appropriate to provided database.
 
       Factory method that returns the appropriate :class:`SchemaMigrator`
@@ -579,9 +585,10 @@ Migration API
       :param str table: Name of the table to drop.
       :param bool safe: Use ``IF EXISTS``.
       :param bool cascade: Append ``CASCADE`` (not supported by sqlite).
-      :param str schema: Optional schema qualification.
+      :param str schema: Schema to drop the table from, overriding the
+          migrator's own schema.
 
-   .. method:: add_index(table, columns, unique=False, using=None, where=None, nulls_distinct=None)
+   .. method:: add_index(table, columns, unique=False, using=None, where=None, nulls_distinct=None, name=None)
 
       :param str table: Name of table on which to create the index.
       :param list columns: List of columns which should be indexed.
@@ -590,6 +597,9 @@ Migration API
       :param where: Expression for a partial index (sqlite and postgres).
       :param bool nulls_distinct: For unique indexes, whether NULL values
           are treated as distinct (postgres 15+).
+      :param str name: Index name. The generated default joins table and
+          column names and can differ from the name ``create_table()``
+          gives a model-declared index.
 
    .. method:: drop_index(table, index_name)
 
@@ -618,11 +628,13 @@ Migration API
       :param str table: Table to add constraint to.
       :param str column_names: One or more columns for UNIQUE constraint.
 
-.. class:: PostgresqlMigrator(database)
+.. class:: PostgresqlMigrator(database, schema=None)
 
    .. method:: set_search_path(schema_name)
 
-      Set the Postgres search path for subsequent operations.
+      Set the Postgres search path for subsequent operations. The search path
+      belongs to the connection and is lost when it is closed, so prefer the
+      migrator's ``schema`` parameter.
 
 .. class:: SqliteMigrator(database)
 
@@ -635,9 +647,16 @@ Migration API
    supported on any version, as sqlite's ``ADD CONSTRAINT`` does not
    extend to UNIQUE constraints.
 
-.. class:: MySQLMigrator(database)
+   SQLite is the one backend that does not accept a ``schema``, as the
+   table-rebuild path rewrites unqualified DDL read out of ``sqlite_master``.
+   ``drop_table()`` still takes one, for attached databases.
 
-   MySQL-specific subclass.
+.. class:: MySQLMigrator(database, schema=None)
+
+   MySQL-specific subclass. A schema is a database in MySQL, so ``schema`` is
+   the database to migrate. ``rename_table()`` keeps the table in that
+   database, where a plain ``RENAME TABLE a.t TO u`` would move it to the
+   connection's own.
 
 
 .. _migration-runner:
@@ -999,6 +1018,7 @@ Recognized keys:
 * ``database`` - database spec (dotted path, url, or sqlite filename)
 * ``directory`` - migrations directory
 * ``models`` - models module, read by ``diff``, ``initial`` and ``generate``
+* ``schema`` - schema containing the tables to be migrated
 * ``table`` - history table name
 
 The file is read from the working directory only. A different config
@@ -1100,7 +1120,17 @@ Generate a migration from a diff:
    if diff:
        runner.create('add karma', body=template(diff))
 
-.. class:: Runner(database, directory='migrations', table_name='schema_migration')
+.. class:: Runner(database, directory='migrations', table_name='schema_migration', schema=None)
+
+   :param str schema: schema containing the tables to be migrated, passed to
+       the :class:`~playhouse.migrate.SchemaMigrator`. The history table
+       lives in the same schema, so each schema tracks its own applied set
+       and one set of migration files can be run against any number of
+       schemas (``pwmigrate up -s tenant_a``, ``pwmigrate up -s tenant_b``).
+
+       When adopting ``schema=`` on a deployment whose history predates it,
+       the runner will find no history there and consider every migration
+       pending. Backfill with ``fake`` first.
 
    .. method:: up(target=None)
 
@@ -1409,8 +1439,8 @@ Example output for a SQLite database with ``user`` and ``tweet`` tables:
        class Meta:
            table_name = 'tweet'
 
-Note that ``pwiz`` detects foreign keys, unique constraints, and preserves
-explicit table names.
+``pwiz`` detects foreign keys and unique constraints, and preserves explicit
+table names.
 
 .. note::
     The ``UnknownField`` is a placeholder that is used in the event your schema

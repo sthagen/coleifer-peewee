@@ -140,6 +140,12 @@ Database
          if not db.is_closed():
              db.close()
 
+   .. method:: dispose()
+
+      Discard the connection without closing it. For a child process after
+      ``fork()``, where the inherited connection belongs to the parent. See
+      :ref:`forking`.
+
    .. method:: is_closed()
 
       :return: return ``True`` if database is closed, ``False`` if open.
@@ -226,6 +232,11 @@ Database
 
       Execute a SQL query and return a cursor over the results.
 
+      Every query peewee executes goes through this method. A subclass that
+      overrides it must keep this signature and route execution through
+      ``super().execute_sql()``, so logging and query hooks happen exactly
+      once and added behavior survives peewee upgrades.
+
       .. code-block:: python
 
          db = SqliteDatabase('my_app.db')
@@ -253,6 +264,12 @@ Database
 
          query = User.insert({'username': 'Alice'})
          db.execute(query)  # Equivalent to query.execute()
+
+   .. attribute:: query_hooks
+
+      List of callables invoked after every query with a ``QueryEvent``
+      named tuple: ``sql``, ``params``, ``duration``, ``exception``. See
+      :ref:`query-hooks`.
 
    .. method:: last_insert_id(cursor, query_type=None)
 
@@ -381,6 +398,14 @@ Database
 
       Savepoints can be committed or rolled-back within the wrapped block.
       If this occurs, a new savepoint is begun.
+
+   .. method:: after_commit(fn)
+
+      :param fn: A callable taking no arguments.
+
+      Register ``fn`` to run after the current transaction commits. Discarded
+      on rollback, and run immediately when no transaction is active. See
+      :ref:`transactions` for details.
 
    .. method:: manual_commit()
 
@@ -648,9 +673,12 @@ Database
               sql='CREATE VIEW entries_public AS SELECT ... '),
           ...]
 
-   .. method:: sequence_exists(seq)
+   .. method:: sequence_exists(seq, schema=None)
 
-      :param str seq: Name of sequence.
+      :param str seq: Name of sequence. A dotted name is read as
+          schema-qualified when ``schema`` is not given.
+      :param str schema: Schema to look in. An unqualified name is checked
+          against the current schema.
       :return: Whether sequence exists.
       :rtype: bool
 
@@ -706,8 +734,8 @@ Database
        :param bool bind_backrefs: Bind models that reference the given model
            with a foreign-key.
 
-       Create a context-manager that binds (associates) the given models with
-       the current database for the duration of the wrapped block.
+       Create a context-manager or decorator that binds (associates) the given
+       models with the current database for the duration of the wrapped block.
 
        Example:
 
@@ -807,13 +835,15 @@ Database
       this is equivalent to ``fn.random()``, for MySQL ``fn.rand()``.
 
 
-.. class:: SqliteDatabase(database, pragmas=None, regexp_function=False, rank_functions=False, timeout=5, returning_clause=None,  **kwargs)
+.. class:: SqliteDatabase(database, pragmas=None, regexp_function=False, rank_functions=False, lock_type=None, timeout=5, returning_clause=None,  **kwargs)
 
    :param pragmas: Either a dictionary or a list of 2-tuples containing
        pragma key and value to set every time a connection is opened.
    :param bool regexp_function: Make the REGEXP function available.
    :param bool rank_functions: Make the full-text search ranking functions
       available (recommended only if using FTS4).
+   :param str lock_type: Default locking strategy for transactions that do not
+       specify one: DEFERRED, IMMEDIATE or EXCLUSIVE.
    :param timeout: Set the busy-timeout on the SQLite driver (in seconds).
    :param bool returning_clause: Use `RETURNING` clause automatically for bulk
        INSERT queries (requires Sqlite 3.35 or newer).
@@ -1587,7 +1617,7 @@ Model
 
       :param rows: An iterable that yields rows to insert.
       :param list fields: List of fields being inserted.
-      :return: number of rows modified (see note).
+      :return: Depends on the database (see below).
 
       INSERT multiple rows of data.
 
@@ -1661,16 +1691,22 @@ Model
       * `Max variable number limit <https://www.sqlite.org/limits.html#max_variable_number>`_
       * `SQLite compile-time flags <https://www.sqlite.org/compile.html>`_
 
-      The default return value is the number of rows modified. However,
-      when using Postgresql, Peewee will return a cursor that yields the
-      primary-keys of the inserted rows. To disable this functionality with
-      Postgresql, append ``as_rowcount()`` to your insert.
+      The return value depends on the database:
+
+      * Postgres: cursor yielding a ``(pk,)`` tuple per inserted row.
+      * SQLite: rowid of the last inserted row. ``returning_clause=True``
+        gives the Postgres behavior.
+      * MySQL: auto-increment id of the first inserted row.
+
+      Append ``as_rowcount()`` for the number of rows inserted on any
+      database, or :meth:`~_WriteQuery.returning` (Postgres and SQLite) for
+      the inserted rows. See :ref:`insert-many-return`.
 
    .. classmethod:: insert_from(query, fields)
 
       :param Select query: SELECT query to use as source of data.
       :param fields: Fields to insert data into.
-      :return: number of rows modified (see note).
+      :return: Depends on the database (see below).
 
       Generates an ``INSERT INTO ... SELECT`` query, copying rows from one
       table into another without round-tripping data through Python:
@@ -1685,10 +1721,16 @@ Model
 
       See :ref:`bulk-inserts` for additional discussion.
 
-      The default return value is the number of rows modified. However,
-      when using Postgresql, Peewee will return a cursor that yields the
-      primary-keys of the inserted rows. To disable this functionality with
-      Postgresql, append ``as_rowcount()`` to your insert.
+      The return value depends on the database:
+
+      * Postgres: cursor yielding a ``(pk,)`` tuple per inserted row.
+      * SQLite: rowid of the last inserted row. ``returning_clause=True``
+        gives the Postgres behavior.
+      * MySQL: auto-increment id of the first inserted row.
+
+      Append ``as_rowcount()`` for the number of rows inserted on any
+      database, or :meth:`~_WriteQuery.returning` (Postgres and SQLite) for
+      the inserted rows. See :ref:`insert-many-return`.
 
    .. classmethod:: replace(__data=None, **insert)
 
@@ -2129,8 +2171,14 @@ Model
 
    .. classmethod:: bind_ctx(database, bind_refs=True, bind_backrefs=True)
 
-      Like :meth:`~Model.bind`, but returns a context manager that only
-      binds the models for the duration of the wrapped block.
+      Like :meth:`~Model.bind`, but returns a context-manager or decorator that
+      only binds the models for the duration of the wrapped block.
+
+      .. code-block:: python
+
+          @User.bind_ctx(test_db)
+          def test_something():
+              assert User._meta.database is test_db
 
       See also: :meth:`Database.bind_ctx`.
 
@@ -2168,7 +2216,7 @@ Model
 
       Truncate (delete all rows) for the model.
 
-   .. classmethod:: index(*fields, unique=False, safe=True, where=None, using=None, name=None)
+   .. classmethod:: index(*fields, unique=False, safe=True, where=None, using=None, name=None, nulls_distinct=None)
 
       :param fields: Fields to index.
       :param bool unique: Whether index is UNIQUE.
@@ -2176,6 +2224,9 @@ Model
       :param Expression where: Optional WHERE clause for index.
       :param str using: Index algorithm.
       :param str name: Optional index name.
+      :param bool nulls_distinct: Postgres-only - specify True (NULLS
+          DISTINCT) or False (NULLS NOT DISTINCT) - controls handling of
+          NULL in unique indexes.
 
       Expressive method for declaring an index on a model. Wraps the
       declaration of a :class:`ModelIndex` instance.
@@ -2333,7 +2384,7 @@ Model
    :param str table_name: Specify table name for model.
    :param list indexes: List of :class:`ModelIndex` objects.
    :param primary_key: Primary key for model (only specified if this is a
-       :class:`CompositeKey` or ``False`` for no primary key.
+       :class:`CompositeKey` or ``False`` for no primary key).
    :param list constraints: List of table constraints.
    :param str schema: Schema table exists in.
    :param bool only_save_dirty: When :meth:`~Model.save` is called, only
@@ -2672,8 +2723,8 @@ Model
                   .select(Tweet, User)
                   .join(User))
 
-         # Note that `tweet.user` is populated already since we SELECTed
-         # columns from the joined User model.
+         # `tweet.user` is populated already since we SELECTed columns
+         # from the joined User model.
          for tweet in query:
              print(tweet.user.username, '->', tweet.content)
 
@@ -2702,8 +2753,8 @@ Model
       * ``JOIN.FULL_OUTER``
       * ``JOIN.CROSS``
 
-      Example selecting tweets and joining on user in order to restrict to
-      only those tweets made by "admin" users:
+      Example selecting tweets and joining on user to restrict to only
+      those tweets made by "admin" users:
 
       .. code-block:: python
 
@@ -2798,25 +2849,10 @@ Model
       :param prefetch_type: Query type to use for the subqueries.
       :return: a list of models with selected relations prefetched.
 
-      Execute the query, prefetching the given additional resources.
-
-      .. note::
-         :meth:`with_related` is the declarative, nestable form and is preferred
-         for new code. ``prefetch`` is the flat-list form, kept for
-         compatibility. Minimal example of using :meth:`with_related`:
-
-         .. code-block:: python
-
-            query = User.select().with_related(Load(User.tweets))
-
-      Prefetch type may be one of:
-
-      * ``PREFETCH_TYPE.WHERE``
-      * ``PREFETCH_TYPE.JOIN``
-
-      See also :func:`prefetch` standalone function.
-
-      Example:
+      Execute the query, prefetching the given additional resources. Same as
+      calling :func:`prefetch` with this query as the first argument, which
+      also documents the prefetch types. :meth:`with_related` is the
+      declarative, nestable form and is preferred for new code.
 
       .. code-block:: python
 
@@ -2826,11 +2862,6 @@ Model
              print(user.username)
              for tweet in user.tweets:
                  print('  *', tweet.content)
-
-      Because ``prefetch`` must reconstruct a graph of models, it is
-      necessary to be sure that the foreign-key/primary-key of any
-      related models are selected, so that the related objects can be
-      mapped correctly.
 
       **Disambiguating multi-reference subqueries.** If a subquery relates to
       more than one previously-fetched query (for example, a ``Favorite`` row
@@ -3443,8 +3474,8 @@ Fields
 
    .. method:: truncate(date_part)
 
-      See :meth:`DateTimeField.truncate`. Note that only *year*, *month*,
-      and *day* are meaningful for :class:`DateField`.
+      See :meth:`DateTimeField.truncate`. Only *year*, *month*, and *day*
+      are meaningful for :class:`DateField`.
 
 
 .. class:: TimeField(formats=None, **kwargs)
@@ -3463,8 +3494,15 @@ Fields
       '%H:%M:%S.%f' # hour:minute:second.microsecond
       '%H:%M:%S' # hour:minute:second
       '%H:%M' # hour:minute
+      '%H:%M:%S.%f%z' # ...with timezone offset
+      '%H:%M:%S%z' # ...with timezone offset
       '%Y-%m-%d %H:%M:%S.%f' # year-month-day hour-minute-second.microsecond
       '%Y-%m-%d %H:%M:%S' # year-month-day hour-minute-second
+
+   In addition, any string accepted by ``datetime.time.fromisoformat`` or
+   ``datetime.datetime.fromisoformat`` is parsed automatically. Offsets are
+   preserved on sqlite only. The postgres and mysql drivers discard them for
+   ``TIME`` columns on write.
 
    .. note::
       If the incoming value does not match a format, it is returned as-is.
@@ -3629,9 +3667,9 @@ Fields
       Key-existence predicates, supported on **every** backend. Postgresql
       uses ``?`` / ``?&`` / ``?|``, MySQL / MariaDB use ``JSON_CONTAINS_PATH``,
       and SQLite tests ``json_type(field, path) IS NOT NULL`` per key. These
-      check for object-key existence; note that Postgresql's ``?`` *also*
-      matches a string against the elements of a top-level array, which the
-      MySQL and SQLite emulations do not.
+      check for object-key existence. Postgresql's ``?`` *also* matches a
+      string against the elements of a top-level array, which the MySQL and
+      SQLite emulations do not.
 
       .. code-block:: python
 
@@ -4035,7 +4073,7 @@ Fields
        key).
    :param str backref: Accessor name for back-reference, or "+" to disable
        the back-reference accessor.
-   :param str on_delete: ON DELETE action, e.g. ``'CASCADE'``..
+   :param str on_delete: ON DELETE action, e.g. ``'CASCADE'``.
    :param str on_update: ON UPDATE action.
    :param str deferrable: Control when constraint is enforced, e.g. ``'INITIALLY DEFERRED'``.
    :param str object_id_name: Name for object-id accessor.
@@ -4206,9 +4244,9 @@ Fields
 
    It does not matter from Peewee's perspective which model the
    :class:`ManyToManyField` goes on, since the back-reference is just
-   the mirror image. In order to write valid Python, though, you will need
-   to add the ``ManyToManyField`` on the second model so that the name of
-   the first model is in the scope.
+   the mirror image. To write valid Python, though, you will need to add
+   the ``ManyToManyField`` on the second model so that the name of the
+   first model is in scope.
 
    We still need a junction table to store the relationships between students
    and courses. This model can be accessed by calling the
@@ -4240,9 +4278,8 @@ Fields
 
    To add new relationships between objects, you can either assign the objects
    directly to the ``ManyToManyField`` attribute, or call the
-   :meth:`~ManyToManyField.add` method. The difference between the two is
-   that simply assigning will clear out any existing relationships, whereas
-   ``add()`` can preserve existing relationships.
+   :meth:`~ManyToManyField.add` method. Assigning clears out any existing
+   relationships, whereas ``add()`` preserves them.
 
    .. code-block:: pycon
 
@@ -4331,8 +4368,8 @@ Fields
       .. code-block:: python
 
          # Alice is currently enrolled in a lot of english classes
-         # as well as some Comp-Sci. He is changing majors, so we
-         # will remove all his courses.
+         # as well as some Comp-Sci. She is changing majors, so we
+         # will remove all her courses.
          english_courses = Course.select().where(
              Course.name.contains('english'))
          alice.courses.remove(english_courses)
@@ -4970,11 +5007,11 @@ Query-builder
 
    .. method:: select_from(*columns)
 
-      Create a SELECT query that utilizes the given common table expression
+      Create a SELECT query that uses the given common table expression
       as the source for a new query.
 
       :param columns: One or more columns to select from the CTE.
-      :return: :class:`Select` query utilizing the common table expression
+      :return: :class:`Select` query using the common table expression
 
    .. method:: union_all(other)
 
@@ -5075,7 +5112,7 @@ Query-builder
 
       :param str collation: Collation name to use for sorting.
       :param str nulls: Sort nulls (FIRST or LAST).
-      :return: an descending :class:`Ordering` object for the column.
+      :return: a descending :class:`Ordering` object for the column.
 
    .. method:: __invert__()
 
@@ -5174,7 +5211,7 @@ Query-builder
 
 .. function:: Desc(node, collation=None, nulls=None)
 
-   Short-hand for instantiating an descending :class:`Ordering` object.
+   Short-hand for instantiating a descending :class:`Ordering` object.
 
 
 .. class:: Expression(lhs, op, rhs, flat=False)
@@ -5215,18 +5252,18 @@ Query-builder
    Represent a CHECK constraint.
 
    MySQL may not support a ``name`` parameter when inlining the
-   constraint along with the column definition. The solution is to just
-   put the named ``Check`` constraint in the model's ``Meta.constraints``
-   list instead of in the field instances ``constraints=[...]`` list.
+   constraint along with the column definition. The solution is to put
+   the named ``Check`` constraint in the model's ``Meta.constraints``
+   list instead of in the field instance's ``constraints=[...]`` list.
 
 
 .. function:: Default(value)
 
    :param value: default value (literal).
 
-   Represent a DEFAULT constraint. It is important to note that this
-   constraint does not accept a parameterized value, so the value literal must
-   be given. If a string value is intended, it must be quoted.
+   Represent a DEFAULT constraint. This constraint does not accept a
+   parameterized value, so the value literal must be given. If a string
+   value is intended, it must be quoted.
 
    Examples:
 
@@ -5296,7 +5333,7 @@ Query-builder
                      fn.AVG(Sample.value).over([Sample.counter]))
                   .order_by(Sample.counter))
 
-         # Equivalent example Using a Window() instance instead.
+         # Equivalent example using a Window() instance instead.
          window = Window(partition_by=[Sample.counter])
          query = (Sample
                   .select(
@@ -5342,8 +5379,8 @@ Query-builder
           to a Python data-type.
 
       When coerce is ``True``, the target data-type is inferred using several
-      heuristics. Read the source for ``BaseModelCursorWrapper._initialize_columns``
-      method to see how this works.
+      heuristics. Read the source for ``_resolve_model_columns`` method to see
+      how this works.
 
    .. method:: python_value(func=None)
 
@@ -5733,8 +5770,8 @@ Queries
 
       Execute the query and return an iterator over the result-set.
 
-      Unlike :meth:`~BaseQuery.iterator`, this method will cause rows to
-      be cached in order to allow efficient iteration, indexing and slicing.
+      Unlike :meth:`~BaseQuery.iterator`, this method caches rows to allow
+      efficient iteration, indexing and slicing.
 
    .. method:: __getitem__(value)
 
@@ -6010,8 +6047,8 @@ Queries
 
    .. method:: except_(dest)
 
-      Create an EXCEPT query with ``dest``. Note that the method name has a
-      trailing "_" character since ``except`` is a Python reserved word.
+      Create an EXCEPT query with ``dest``. The method name has a trailing
+      "_" character since ``except`` is a Python reserved word.
 
    .. method:: __sub__(dest)
 
@@ -6300,14 +6337,14 @@ Queries
 
       .. code-block:: python
 
-         # Equivalent example Using a Window() instance instead.
+         # Declare a window and include it in the query with .window().
          window = Window(partition_by=[Sample.counter])
          query = (Sample
                   .select(
                      Sample.counter,
                      Sample.value,
                      fn.AVG(Sample.value).over(window))
-                  .window(window)  # Note call to ".window()"
+                  .window(window)
                   .order_by(Sample.counter))
 
    .. method:: for_update(for_update=True, of=None, nowait=None, skip_locked=None)
@@ -6441,8 +6478,8 @@ Queries
       :param bool _as_rowcount: Whether to return the modified row count (as
           opposed to the last-inserted row id).
 
-      SQLite and MySQL return the last inserted rowid. Postgresql will return a
-      cursor for iterating over the inserted id(s).
+      SQLite returns the last inserted rowid, MySQL the first auto-increment
+      id of the batch and Postgresql a cursor over the inserted primary keys.
 
       If you prefer to receive the inserted row-count, then specify
       ``as_rowcount()``:
@@ -6452,7 +6489,7 @@ Queries
          db = MySQLDatabase(...)
 
          query = User.insert_many([...])
-         # By default, the last rowid is returned:
+         # By default (MySQL), the first auto-increment id is returned:
          #last_id = query.execute()
 
          # To get the modified row-count:
@@ -6759,8 +6796,7 @@ Query-builder Internals
    .. method:: add(source)
 
       Add a source to the AliasManager's internal registry at the current
-      scope. The alias will be automatically generated using the following
-      scheme (where each level of indentation refers to a new scope):
+      scope, generating an alias for it automatically.
 
       :param Source source: Make the manager aware of a new source. If the
           source has already been added, the call is a no-op.
@@ -6790,7 +6826,7 @@ Query-builder Internals
       Pop scope from the stack.
 
 
-.. class:: State(scope, parentheses=False, subquery=False, **kwargs)
+.. class:: State(scope, parentheses=False, settings=None)
 
    Lightweight object for representing the state at a given scope. During SQL
    generation, each object visited by the :class:`Context` can inspect the
@@ -6804,10 +6840,8 @@ Query-builder Internals
 
    :param int scope: The scope rules to be applied while the state is active.
    :param bool parentheses: Wrap the contained SQL in parentheses.
-   :param bool subquery: Whether the current state is a child of an outer
-       query.
-   :param dict kwargs: Arbitrary settings which should be applied in the
-       current state.
+   :param dict settings: Arbitrary settings which should be applied in the
+       current state (or ``None``).
 
 
 .. class:: Context(**settings)
@@ -6911,7 +6945,7 @@ Constants and Helpers
 
       :param callback: A function that accepts a single parameter, the bound
           object.
-      :return: self
+      :return: the callback.
 
       Add a callback to be executed when the proxy is initialized.
 
@@ -7011,6 +7045,17 @@ Constants and Helpers
 
    .. data:: name
              sql
+
+
+.. class:: QueryEvent
+
+   Event passed to each callable in :attr:`Database.query_hooks`. See
+   :ref:`query-hooks`.
+
+   .. data:: sql
+             params
+             duration
+             exception
 
 
 Playhouse Reference

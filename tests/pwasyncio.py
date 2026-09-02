@@ -795,6 +795,25 @@ class TestQueryAexecuteErrors(unittest.IsolatedAsyncioTestCase):
         await adb.close_pool()
 
 
+class TestQueryHooksAsync(unittest.IsolatedAsyncioTestCase):
+    async def test_query_hooks(self):
+        db = AsyncSqliteDatabase(':memory:', pool_size=1)
+        events = []
+        db.query_hooks.append(events.append)
+        await db.aconnect()
+        await db.aexecute_sql('SELECT 1', ())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].sql, 'SELECT 1')
+        self.assertIsNone(events[0].exception)
+        self.assertTrue(events[0].duration >= 0.)
+
+        with self.assertRaises(OperationalError):
+            await db.aexecute_sql('SELECT * FROM missing_tbl', ())
+        self.assertEqual(len(events), 2)
+        self.assertIsInstance(events[1].exception, OperationalError)
+        await db.close_pool()
+
+
 class IntegrationTests(object):
     db_path = None
     models = [TestModel, User, Tweet, UniqueModel, AUser, ATweet, ANoLazy,
@@ -1667,6 +1686,32 @@ class IntegrationTests(object):
             await self.assertCount(1)
             await txn.arollback()
         await self.assertCount(0)
+
+    async def test_after_commit(self):
+        acc = []
+        async with self.db.atomic():
+            await self.create_record('a', 1)
+            self.db.after_commit(lambda: acc.append(1))
+            self.assertEqual(acc, [])
+        self.assertEqual(acc, [1])
+
+        def failing():
+            with self.db.atomic():
+                self.db.after_commit(lambda: acc.append(2))
+                raise ValueError('fail')
+        with self.assertRaises(ValueError):
+            await self.db.run(failing)
+        self.assertEqual(acc, [1])
+
+        # No transaction: runs immediately.
+        self.db.after_commit(lambda: acc.append(3))
+        self.assertEqual(acc, [1, 3])
+
+        # A coroutine function would never be awaited: rejected up-front.
+        async def coro_cb():
+            pass
+        with self.assertRaises(ValueError):
+            self.db.after_commit(coro_cb)
 
     async def test_nested_transactions(self):
         def nested():

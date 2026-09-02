@@ -261,8 +261,8 @@ class TestTransaction(BaseTransactionTestCase):
         save(1)
         self.assertRegister([1])
 
-    def text_atomic_exception(self):
-        def will_fail(self):
+    def test_atomic_exception(self):
+        def will_fail():
             with db.atomic():
                 self._save(1)
                 self._save(None)
@@ -270,7 +270,7 @@ class TestTransaction(BaseTransactionTestCase):
         self.assertRaises(IntegrityError, will_fail)
         self.assertRegister([])
 
-        def user_error(self):
+        def user_error():
             with db.atomic():
                 self._save(2)
                 raise ValueError
@@ -420,6 +420,77 @@ class TestTransaction(BaseTransactionTestCase):
 
 
 # ===========================================================================
+# after_commit() callbacks
+# ===========================================================================
+
+class TestAfterCommit(BaseTransactionTestCase):
+    def setUp(self):
+        super(TestAfterCommit, self).setUp()
+        self.accum = []
+
+    def hook(self, val):
+        return lambda: self.accum.append(val)
+
+    def test_after_commit(self):
+        db.after_commit(self.hook(1))  # No transaction: runs immediately.
+        self.assertEqual(self.accum, [1])
+
+        with db.atomic():
+            db.after_commit(self.hook(2))
+            self.assertEqual(self.accum, [1])
+        self.assertEqual(self.accum, [1, 2])
+
+    def test_after_commit_rollback(self):
+        with self.assertRaises(ValueError):
+            with db.atomic():
+                db.after_commit(self.hook(1))
+                raise ValueError('nope')
+        self.assertEqual(self.accum, [])
+
+        # Discarded callbacks do not resurface on the next commit.
+        with db.atomic():
+            db.after_commit(self.hook(2))
+        self.assertEqual(self.accum, [2])
+
+    def test_after_commit_explicit(self):
+        with db.atomic() as txn:
+            db.after_commit(self.hook(1))
+            txn.commit()
+            self.assertEqual(self.accum, [1])
+            db.after_commit(self.hook(2))
+            txn.rollback()
+            db.after_commit(self.hook(3))
+        self.assertEqual(self.accum, [1, 3])
+
+    @requires_nested
+    def test_after_commit_nested(self):
+        with db.atomic():
+            db.after_commit(self.hook(1))
+            with db.atomic():
+                db.after_commit(self.hook(2))
+            try:
+                with db.atomic():
+                    db.after_commit(self.hook(3))
+                    raise ValueError('sp')
+            except ValueError:
+                pass
+            self.assertEqual(self.accum, [])
+        # No savepoint granularity: 3 runs though its savepoint rolled back.
+        self.assertEqual(self.accum, [1, 2, 3])
+
+    def test_after_commit_reentrant(self):
+        with db.atomic():
+            db.after_commit(self.hook(1))
+            db.after_commit(lambda: db.after_commit(self.hook(2)))
+        self.assertEqual(self.accum, [1, 2])
+
+    def test_after_commit_manual(self):
+        with db.manual_commit():
+            self.assertRaises(ValueError, db.after_commit, self.hook(1))
+        self.assertEqual(self.accum, [])
+
+
+# ===========================================================================
 # Session (context manager) behavior
 # ===========================================================================
 
@@ -526,6 +597,20 @@ class TestSession(BaseTransactionTestCase):
 # Lock type and isolation level
 # ===========================================================================
 
+class TestBeginAutoconnect(BaseTransactionTestCase):
+    @skip_if(IS_CRDB, 'atomic() connects to read the server version')
+    def test_begin_autoconnect_false(self):
+        db = new_connection(autoconnect=False)
+        with self.assertRaises(InterfaceError):
+            with db.atomic():
+                pass
+        self.assertTrue(db.is_closed())
+        db.connect()
+        with db.atomic():
+            pass
+        db.close()
+
+
 @skip_unless(IS_SQLITE, 'requires sqlite for transaction lock type')
 class TestTransactionLockType(BaseTransactionTestCase):
     def test_lock_type(self):
@@ -552,6 +637,23 @@ class TestTransactionLockType(BaseTransactionTestCase):
                 with db2.transaction(lock_type='IMMEDIATE') as t2:
                     self._save(6)
         self.assertRegister([2, 4, 5])
+
+    def test_default_lock_type(self):
+        db = new_connection(lock_type='EXCLUSIVE')
+        db2 = new_connection(timeout=0.0001)
+        db2.connect()
+
+        with db.atomic():  # Uses the database default.
+            with self.assertRaises(OperationalError):
+                with db2.atomic('IMMEDIATE'):
+                    pass
+
+        with db.atomic('DEFERRED'):  # Explicit arg wins over the default.
+            with db2.atomic('IMMEDIATE'):
+                pass
+
+        db.close()
+        db2.close()
 
 
 class TestTransactionIsolationLevel(BaseTransactionTestCase):

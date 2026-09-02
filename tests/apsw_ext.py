@@ -56,6 +56,18 @@ class TestAPSWExtension(ModelTestCase):
         self.assertTrue(database.is_closed())
         database.connect()
 
+    def test_exception_mapping(self):
+        # apsw's own exceptions are mapped to peewee's, like sqlite3's.
+        with self.assertRaises(OperationalError) as ctx:
+            database.execute_sql('select * from no_such_table')
+        self.assertIsInstance(ctx.exception.__context__, apsw.SQLError)
+        self.assertRaises(ProgrammingError, database.execute_sql,
+                          'select ?', (1, 2))
+        User.create(username='u')
+        self.assertRaises(IntegrityError, Message.create, user=None,
+                          message='m', pub_date=datetime.datetime.now(),
+                          published=False)
+
     def test_db_register_module(self):
         database.register_module('series', VTSource())
         database.execute_sql('create virtual table foo using series()')
@@ -90,6 +102,35 @@ class TestAPSWExtension(ModelTestCase):
 
         query = User.select(fn.First(User.username)).order_by(User.username)
         self.assertEqual(query.scalar(), 'u0')
+
+    def test_db_register_window_function(self):
+        @database.window_function('my_sum')
+        class MySum(object):
+            def __init__(self):
+                self._value = 0
+
+            def step(self, value):
+                self._value += value
+
+            def inverse(self, value):
+                self._value -= value
+
+            def value(self):
+                return self._value
+
+            def finalize(self):
+                return self._value
+
+        with database.atomic():
+            for i in range(1, 4):
+                User.create(username=str(i))
+
+        query = (User
+                 .select(User.username, fn.my_sum(User.id).over(
+                     order_by=[User.id]).alias('total'))
+                 .order_by(User.id))
+        self.assertEqual([(u.username, u.total) for u in query],
+                         [('1', 1), ('2', 3), ('3', 6)])
 
     def test_db_register_collation(self):
         @database.collation()

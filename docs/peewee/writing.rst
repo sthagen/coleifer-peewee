@@ -122,15 +122,14 @@ Calling :meth:`Model.create` or :meth:`Model.save` in a loop should be avoided:
    for data_dict in data:
        User.create(**data_dict)
 
-The above is slow:
+The above is slow for several reasons:
 
-1. **Does not wrap the loop in a transaction.** Result is each
-   :meth:`~Model.create` happens in its own :ref:`transaction <transactions>`.
-2. **Python interpreter** is getting in the way, and each :class:`Insert`
-   must be generated and parsed into SQL.
-3. **Large amount of data** (in terms of raw bytes of SQL) may be sent to the
-   database to parse.
-4. **Retrieving the last insert id**, which may not be necessary.
+1. Each :meth:`~Model.create` call runs in its own
+   :ref:`transaction <transactions>`.
+2. Every row builds and parses its own :class:`Insert` query.
+3. More raw bytes of SQL are sent to the database.
+4. The last insert id is retrieved after every statement, whether or not it
+   is needed.
 
 You can get a significant speedup by wrapping this in a transaction with
 :meth:`~Database.atomic`:
@@ -165,16 +164,64 @@ Optionally wrap the bulk insert in a transaction:
    with db.atomic():
        User.insert_many(data, fields=fields).execute()
 
-Insert queries support :meth:`~_WriteQuery.returning` with Postgresql and SQLite
-to obtain the inserted rows:
+.. _insert-many-return:
+
+What ``insert_many()`` returns
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The return value depends on the database:
+
++-----------------+----------------------------------------------------+
+| Database        | ``insert_many(rows).execute()``                    |
++=================+====================================================+
+| Postgres        | Cursor yielding a ``(pk,)`` tuple per inserted row |
++-----------------+----------------------------------------------------+
+| SQLite          | rowid of the last inserted row                     |
++-----------------+----------------------------------------------------+
+| MySQL / MariaDB | Auto-increment id of the first inserted row        |
++-----------------+----------------------------------------------------+
+
+For the same result on every database, use :meth:`~Insert.as_rowcount` to
+get the number of rows inserted:
+
+.. code-block:: python
+
+   # How many rows were inserted?
+   n = User.insert_many(data).as_rowcount().execute()
+
+.. note::
+    MySQL counts a row changed by ``ON DUPLICATE KEY UPDATE`` as 2 and an unchanged
+    row as 0.
+
+Without :meth:`~Insert.as_rowcount`, Postgres returns a cursor that yields the
+primary keys, since Peewee automatically includes a ``RETURNING`` clause.
+SQLite and MySQL return ``cursor.lastrowid``. If no rows were inserted,
+SQLite returns the rowid from the previous insert and MySQL returns 0. An
+empty list runs no query and returns ``None`` on every database.
+
+Postgres and SQLite (3.35+) also accept an explicit
+:meth:`~_WriteQuery.returning`, which returns the inserted rows as model
+instances:
 
 .. code-block:: python
 
    query = (User
             .insert_many([{'username': 'alice'}, {'username': 'bob'}])
             .returning(User))
-   for user in query:
+   for user in query.execute():
        print(f'Added {user.username} with id = {user.id}')
+
+Specific columns can be returned, and the row type chosen with :meth:`~BaseQuery.tuples`,
+:meth:`~BaseQuery.dicts` or :meth:`~BaseQuery.namedtuples`:
+
+.. code-block:: python
+
+   query = User.insert_many(data).returning(User.id, User.username).dicts()
+   for row in query.execute():
+       print(row)  # {'id': 1, 'username': 'alice'}
+
+``SqliteDatabase(returning_clause=True)`` makes SQLite automatically include a
+returning clause, matching Postgres behavior.
 
 Batching large data sets
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -320,7 +367,7 @@ cycle. Performing updates atomically prevents race-conditions:
 .. code-block:: python
 
    # WRONG: reads each row into Python, increments, then saves.
-   # Vulnerable to race conditions; slow on many rows.
+   # Vulnerable to race conditions and slow on many rows.
    for stat in Stat.select().where(Stat.url == url):
        stat.counter += 1
        stat.save()
@@ -422,7 +469,7 @@ The :meth:`~Insert.on_conflict` method is much more powerful.
     .insert(username='huey', last_login=now, login_count=1)
     .on_conflict(
         # Postgresql and SQLite require identifying the conflicting constraint.
-        # MySQL does not need this.
+        # MySQL rejects it - omit conflict_target there.
         conflict_target=[User.username],
 
         # Columns whose values should come from the incoming row:
@@ -467,8 +514,8 @@ if the constraint had not fired. This allows conditional updates:
 
 There are several important concepts to understand when using ``ON CONFLICT``:
 
-* ``conflict_target=``: which column(s) have the UNIQUE constraint. For a user
-  table, this might be the user's email (SQLite and Postgresql only).
+* ``conflict_target=``: which column(s) have the UNIQUE constraint. Required
+  by SQLite and Postgresql, rejected by MySQL.
 * ``preserve=``: if a conflict occurs, this parameter is used to indicate which
   values from the **new** data we wish to update.
 * ``update=``: if a conflict occurs, this is a mapping of data to apply to the
@@ -532,7 +579,7 @@ Insert the row, and silently do nothing if a constraint would be violated:
 
 .. code-block:: python
 
-   # Insert if username does not exist; ignore if it does.
+   # Insert if username does not exist, otherwise do nothing.
    User.insert(username='huey').on_conflict_ignore().execute()
 
 Supported by SQLite, MySQL, and Postgresql.
@@ -621,7 +668,8 @@ By default, the return values upon execution of the different queries are:
 
 * ``INSERT`` - auto-incrementing primary key value of the newly-inserted row.
   When not using an auto-incrementing primary key, Postgres will return the new
-  row's primary key, but SQLite and MySQL will not.
+  row's primary key, but SQLite and MySQL will not. Multi-row inserts differ
+  by database, see :ref:`insert-many-return`.
 * ``UPDATE`` - number of rows modified
 * ``DELETE`` - number of rows deleted
 

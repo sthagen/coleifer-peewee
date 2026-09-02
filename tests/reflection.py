@@ -17,6 +17,7 @@ from .base import ModelTestCase
 from .base import TestModel
 from .base import db
 from .base import requires_models
+from .base import requires_postgresql
 from .base import requires_sqlite
 from .base import skip_if
 from .base_models import Tweet
@@ -493,18 +494,32 @@ class TestReflection(BaseReflectionTestCase):
                                 '%s not in %s' % (actual, fields))
 
 
+class NoPKId(TestModel):
+    id = IntegerField()
+    data = CharField()
+    class Meta:
+        primary_key = False
+
+
 class TestReflectNoPK(BaseReflectionTestCase):
-    requires = [NoPK]
+    requires = [NoPK, NoPKId]
 
     def test_no_pk(self):
         models = self.introspector.generate_models()
         NoPK = models['no_pk']
+        NoPKId = models['no_pk_id']
         if IS_CRDB:
             # CockroachDB always includes a "rowid".
             self.assertEqual(NoPK._meta.sorted_field_names, ['rowid', 'data'])
+            self.assertEqual(NoPKId._meta.sorted_field_names,
+                             ['rowid', 'id', 'data'])
         else:
             self.assertEqual(NoPK._meta.sorted_field_names, ['data'])
             self.assertTrue(NoPK._meta.primary_key is False)
+            # An "id" column without a constraint is not a key either.
+            self.assertEqual(NoPKId._meta.sorted_field_names, ['id', 'data'])
+            self.assertTrue(NoPKId._meta.primary_key is False)
+            self.assertTrue(isinstance(NoPKId.id, IntegerField))
 
 
 class EventLog(TestModel):
@@ -589,6 +604,75 @@ class TestReflectionDependencies(BaseReflectionTestCase):
     def test_ignore_backrefs(self):
         models = self.introspector.generate_models(table_names=['users'])
         self.assertEqual(set(models), set(('users',)))
+
+
+@requires_postgresql
+class TestCrossSchemaForeignKey(ModelTestCase):
+    def setUp(self):
+        super(TestCrossSchemaForeignKey, self).setUp()
+        with self.database:
+            for query in (
+                    'create schema rs1', 'create schema rs2',
+                    'create table rs1.author (id serial primary key)',
+                    'create table rs2.book (id serial primary key, '
+                    'author_id integer not null references rs1.author (id))'):
+                self.database.execute_sql(query)
+
+    def tearDown(self):
+        with self.database:
+            self.database.execute_sql('drop schema rs1 cascade')
+            self.database.execute_sql('drop schema rs2 cascade')
+        super(TestCrossSchemaForeignKey, self).tearDown()
+
+    def test_cross_schema_foreign_key(self):
+        # The FK target is in another schema: warn, leave a plain column.
+        introspector = Introspector.from_database(self.database, schema='rs2')
+        for kwargs in ({}, {'table_names': ['book']}):
+            with warnings.catch_warnings(record=True) as ws:
+                warnings.simplefilter('always')
+                models = introspector.generate_models(**kwargs)
+            self.assertEqual(set(models), set(('book',)))
+            self.assertTrue(isinstance(models['book'].author_id,
+                                       IntegerField))
+            self.assertTrue(any('author' in str(w.message) for w in ws))
+
+
+@requires_postgresql
+class TestReflectSearchPath(ModelTestCase):
+    # With no schema given, reflection follows the search path.
+    schema = 'rspath'
+
+    def setUp(self):
+        super(TestReflectSearchPath, self).setUp()
+        for query in (
+                'DROP SCHEMA IF EXISTS %s CASCADE' % self.schema,
+                'CREATE SCHEMA %s' % self.schema,
+                'CREATE TABLE %s.parent (id SERIAL PRIMARY KEY)' % self.schema,
+                'CREATE TABLE %s.child (id SERIAL PRIMARY KEY, '
+                'parent_id INTEGER REFERENCES %s.parent (id), name TEXT, '
+                'tags TEXT[])' % (self.schema, self.schema),
+                'CREATE INDEX child_name ON %s.child (name)' % self.schema,
+                'SET search_path TO %s' % self.schema):
+            self.database.execute_sql(query)
+
+    def tearDown(self):
+        try:
+            self.database.execute_sql('DROP SCHEMA IF EXISTS %s CASCADE'
+                                      % self.schema)
+        finally:
+            super(TestReflectSearchPath, self).tearDown()
+
+    def test_search_path(self):
+        models = generate_models(self.database)
+        self.assertEqual(sorted(models), ['child', 'parent'])
+        Child = models['child']
+        self.assertEqual(Child._meta.sorted_field_names,
+                         ['id', 'parent', 'name', 'tags'])
+        self.assertTrue(isinstance(Child.id, AutoField))
+        self.assertTrue(Child.parent.rel_model is models['parent'])
+        self.assertTrue(Child.name.index)
+        self.assertEqual(Child.tags.field_type, 'TEXT')
+        self.assertEqual(Child.tags.__class__.__name__, 'ArrayField')
 
 
 class Note(TestModel):

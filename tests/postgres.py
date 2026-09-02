@@ -8,6 +8,7 @@ from decimal import Decimal as Dc
 from types import MethodType
 
 from peewee import *
+from peewee import Psycopg3Adapter
 from playhouse.postgres_ext import *
 from playhouse.reflection import Introspector
 
@@ -542,6 +543,14 @@ class TestTSVectorField(ModelTestCase):
             'FROM "fts_model" AS "t1" '
             'WHERE (to_tsvector("t1"."data") @@ to_tsquery(?))'), ['foo bar'])
 
+        query = FTSModel.select().where(
+            Match(FTSModel.data, 'foo bar', websearch=True))
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."title", "t1"."data", "t1"."fts_data" '
+            'FROM "fts_model" AS "t1" '
+            'WHERE (to_tsvector("t1"."data") @@ websearch_to_tsquery(?))'),
+            ['foo bar'])
+
     def test_match_function(self):
         D = FTSModel.data
         self.assertMessages(Match(D, 'heart'), [1])
@@ -568,6 +577,13 @@ class TestTSVectorField(ModelTestCase):
         self.assertMessages(M('god', plain=True), [1])
         self.assertMessages(M('thing', plain=True), [2, 4])
         self.assertMessages(M('faith things', plain=True), [2, 4])
+
+        # websearch handles raw user input: quoted phrases, "or", negation.
+        self.assertMessages(M('god or things', websearch=True), [1, 2, 4])
+        self.assertMessages(M('faith -things', websearch=True), [0, 1, 3])
+        self.assertMessages(M('"small things"', websearch=True), [2])
+        self.assertMessages(M('&&&! ()', websearch=True), [])
+        self.assertRaises(ValueError, M, 'x', plain=True, websearch=True)
 
 
 def pg12():
@@ -1142,7 +1158,21 @@ class TestServerSide(ModelTestCase):
             data = [row.value for row in ServerSide(query)]
             self.assertEqual(data, list(range(100)))
 
+    def test_server_side_query_hooks(self):
+        events = []
+        self.database.query_hooks.append(events.append)
+        try:
+            query = Register.select().order_by(Register.value)
+            data = [row.value for row in ServerSide(query)]
+            self.assertEqual(data, list(range(100)))
+            self.assertEqual(len(events), 1)
+            self.assertTrue(events[0].sql.startswith('SELECT'))
+            self.assertIsNone(events[0].exception)
+        finally:
+            del self.database.query_hooks[:]
+
     def test_cursor_holdability(self):
+        is_psycopg3 = isinstance(self.database._adapter, Psycopg3Adapter)
         query = Register.select().order_by(Register.value)
 
         def is_holdable():
@@ -1155,7 +1185,7 @@ class TestServerSide(ModelTestCase):
         with self.database.atomic():
             it = iter(ServerSide(query, array_size=10))
             self.assertEqual(next(it).value, 0)
-            self.assertEqual(is_holdable(), not IS_PSYCOPG3)
+            self.assertEqual(is_holdable(), not is_psycopg3)
             self.assertEqual([r.value for r in it], list(range(1, 100)))
 
         # Without a transaction the server requires a holdable cursor.

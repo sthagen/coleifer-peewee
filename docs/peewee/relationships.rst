@@ -177,8 +177,7 @@ query that returns all rows related to the given instance.
 
 In the example schema, ``Tweet.user`` is a foreign key to ``User``. The
 ``backref='tweets'`` parameter means that every ``User`` instance gains a
-``tweets`` attribute, which is a pre-filtered :class:`ModelSelect` query of
-that user's tweets:
+``tweets`` attribute holding that user's tweets:
 
 .. code-block:: pycon
 
@@ -193,7 +192,7 @@ that user's tweets:
    alice-2
    alice-3
 
-``alice.tweets`` is a pre-filtered ``SELECT`` query:
+``alice.tweets`` corresponds to the following query:
 
 .. code-block:: pycon
 
@@ -488,8 +487,8 @@ In SQL we would write:
    INNER JOIN tweet ON (favorite.tweet_id = tweet.id)
    INNER JOIN user AS author ON (tweet.user_id = author.id);
 
-Note that we are selecting from the user table twice - once in the context of
-the user who created the favorite, and again as the author of the tweet.
+We are selecting from the user table twice - once in the context of the user
+who created the favorite, and again as the author of the tweet.
 
 With Peewee, we use :meth:`Model.alias` to alias a model class so it can be
 referenced twice in a single query:
@@ -503,9 +502,9 @@ referenced twice in a single query:
             .join_from(Favorite, Tweet)  # Join favorite -> tweet.
             .join_from(Tweet, User))     # Join tweet -> user.
 
-We can iterate over the results and access the joined values in the following
-way. Note how Peewee has resolved the fields from the various models we
-selected and reconstructed the model graph:
+We can iterate over the results and access the joined values. Peewee has
+resolved the fields from the various models we selected and reconstructed the
+model graph:
 
 .. code-block:: python
 
@@ -1171,6 +1170,64 @@ Examples:
    # MATERIALIZE: the user ids are sent inline, with no parent subquery.
    tweets = Load(User.tweets, strategy=PREFETCH_TYPE.MATERIALIZE)
    query = User.select().with_related(tweets)
+
+.. _json-relations:
+
+Loading children as JSON
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Eager loading runs one query per relation. An alternative is a single query,
+with a correlated subquery gathering each parent's children into a JSON
+array:
+
+.. code-block:: python
+
+   import json
+
+   tweets = (Tweet
+             .select(fn.json_group_array(Tweet.content))
+             .where(Tweet.user == User.id))
+
+   query = User.select(User.username, tweets.alias('tweet_json'))
+   for user in query:
+       print(user.username, json.loads(user.tweet_json))
+
+   # alice ['alice-1', 'alice-2', 'alice-3']
+   # bob ['bob-1', 'bob-2']
+   # carol []
+
+To return the children as objects rather than single values, build each one
+with ``json_object``:
+
+.. code-block:: python
+
+   tweets = (Tweet
+             .select(fn.json_group_array(fn.json_object(
+                 'id', Tweet.id, 'content', Tweet.content)))
+             .where(Tweet.user == User.id))
+
+   query = User.select(User.username, tweets.alias('tweet_json'))
+   for user in query:
+       print(user.username, json.loads(user.tweet_json))
+
+   # alice [{'id': 1, 'content': 'alice-1'}, {'id': 2, 'content': 'alice-2'},
+   #        {'id': 3, 'content': 'alice-3'}]
+   # bob [{'id': 4, 'content': 'bob-1'}, {'id': 5, 'content': 'bob-2'}]
+   # carol []
+
+Do not alias the column to ``tweets``: the fetched value would shadow the
+``User.tweets`` back-reference on the returned instances. This pattern is
+most useful when the database is remote and each additional query is costly.
+The function names differ by database:
+
+* SQLite: ``json_group_array``, ``json_object``
+* postgres: ``json_agg``, ``json_build_object``
+* MySQL and MariaDB: ``json_arrayagg``, ``json_object``
+
+The postgres driver returns the parsed list, so no ``json.loads()`` is
+needed there. On postgres and MySQL an aggregate over no rows is ``NULL``
+rather than an empty array, so wrap it:
+``fn.COALESCE(fn.json_agg(...), SQL("'[]'::json"))``.
 
 Legacy: prefetch
 ^^^^^^^^^^^^^^^^

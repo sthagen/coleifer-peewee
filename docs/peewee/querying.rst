@@ -138,18 +138,9 @@ creation, not as lookup keys:
        username='charlie',
        defaults={'joined': datetime.date.today()})
 
-When uniqueness is enforced by a database constraint, the recommended pattern
-is to attempt creation first and fall back to retrieval on failure:
-
-.. code-block:: python
-
-   try:
-       with db.atomic():
-           return User.create(username=username)
-   except IntegrityError:
-       return User.get(User.username == username)
-
-This avoids a race window between the lookup and the insert.
+When uniqueness is enforced by a database constraint, attempt the create
+first and fall back to a get on ``IntegrityError``. See
+:ref:`get-or-create-safely`.
 
 .. _filtering:
 
@@ -234,10 +225,6 @@ Method                                        SQL equivalent
 ``User.username.is_null()``                   ``username IS NULL``
 ``User.username.is_null(False)``              ``username IS NOT NULL``
 ============================================= ====================================
-
-.. note::
-   ``IN`` queries must use ``.in_()`` rather than Python's ``in`` operator,
-   because Python's ``in`` returns a boolean and cannot be overridden.
 
 .. seealso::
    :ref:`query-operators` for the full list of supported operators and methods.
@@ -671,7 +658,7 @@ running total of the current row and its two preceding rows:
    # 3   100    104.  -- (100 + 3 + 1)
 
 Technically we did not need to specify the ``end=Window.CURRENT_ROW`` because
-that is the default. It was shown in the example for demonstration.
+that is the default.
 
 Let's look at another example. In this example we will calculate the "opposite"
 of a running total, in which the total sum of all values is decreased by the
@@ -969,7 +956,7 @@ A CTE factors out a subquery and gives it a name, making complex queries more
 readable and sometimes more efficient. CTEs also support recursion.
 
 Define a CTE with :meth:`~Query.cte` and include it with
-:meth:`~Query.with_cte`:
+:meth:`~Query.with_cte`.
 
 Simple Example
 ^^^^^^^^^^^^^^
@@ -999,7 +986,7 @@ above-average for that key.
 .. code-block:: python
 
    # First we'll declare the query that will be used as a CTE. This query
-   # simply determines the average value for each key.
+   # determines the average value for each key.
    cte = (Sample
           .select(Sample.key, fn.AVG(Sample.value).alias('avg_value'))
           .group_by(Sample.key)
@@ -1156,7 +1143,7 @@ recursive CTE:
 Data-Modifying CTE
 ^^^^^^^^^^^^^^^^^^
 
-Peewee supports data-modifying CTE's.
+Peewee supports data-modifying CTEs.
 
 Example of using a data-modifying CTE to move data from one table to an archive
 table, using a single query:

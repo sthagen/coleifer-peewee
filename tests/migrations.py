@@ -15,6 +15,7 @@ from playhouse.migrations import MigrationError
 from playhouse.migrations import Runner
 from playhouse.migrations import main as migrations_cli
 from .base import BaseTestCase
+from .base import DatabaseTestCase
 from .base import IS_CRDB
 from .base import IS_MYSQL
 from .base import IS_POSTGRESQL
@@ -399,16 +400,9 @@ class TestSchemaMigration(ModelTestCase):
         with self.database.transaction():
             migrate(self.migrator.drop_column_default('person', 'first_name'))
 
-        if IS_MYSQL:
-            # MySQL, even though the column is NOT NULL, does not seem to be
-            # enforcing the constraint(?).
-            Person.create(last_name='Last2')
-            p_db = Person.get(Person.last_name == 'Last2')
-            self.assertEqual(p_db.first_name, '')
-        else:
-            with self.assertRaises(IntegrityError):
-                with self.database.transaction():
-                    Person.create(last_name='Last2')
+        with self.assertRaises((IntegrityError, OperationalError)):
+            with self.database.transaction():
+                Person.create(last_name='Last2')
 
     def test_add_not_null(self, legacy=False):
         kw = {'legacy': legacy} if IS_SQLITE else {}
@@ -560,6 +554,11 @@ class TestSchemaMigration(ModelTestCase):
         migrate(self.migrator.drop_table('dt', schema='aux'))
         self.assertFalse('dt' in self.database.get_tables('aux'))
 
+    @requires_sqlite
+    def test_migrator_schema_unsupported(self):
+        self.assertRaises(ValueError, SchemaMigrator.from_database,
+                          self.database, schema='aux')
+
     def test_add_index(self):
         # Create a unique index on first and last names.
         columns = ('first_name', 'last_name')
@@ -583,6 +582,13 @@ class TestSchemaMigration(ModelTestCase):
         with self.database.transaction():
             with self.assertRaisesCtx((IntegrityError, InternalError)):
                 Person.create(first_name='live', last_name='x')
+
+    def test_add_index_name(self):
+        migrate(self.migrator.add_index('person', ('first_name',),
+                                        name='person_fn_idx'))
+        indexes = [idx.name for idx in self.database.get_indexes('person')]
+        self.assertTrue('person_fn_idx' in indexes)
+        migrate(self.migrator.drop_index('person', 'person_fn_idx'))
 
     @requires_postgresql
     def test_add_index_nulls_distinct(self):
@@ -1228,6 +1234,239 @@ class TestFKMigrationRegression(ModelTestCase):
         self.assertEqual(obj.name, 'fb')
 
 
+@requires_postgresql
+class TestMigratorSchema(DatabaseTestCase):
+    """Operations are confined to the schema the migrator was given."""
+    target = 'migrate_target'
+    decoy = 'migrate_decoy'
+
+    def setUp(self):
+        super(TestMigratorSchema, self).setUp()
+        for schema in (self.target, self.decoy):
+            self.execute('DROP SCHEMA IF EXISTS %s CASCADE' % schema)
+            self.execute('CREATE SCHEMA %s' % schema)
+            self.execute('CREATE TABLE %s.person (id SERIAL PRIMARY KEY, '
+                         'first_name TEXT)' % schema)
+        # Unqualified names resolve to the decoy, which must stay untouched.
+        self.execute('SET search_path TO %s' % self.decoy)
+        self.migrator = SchemaMigrator.from_database(self.database,
+                                                     schema=self.target)
+
+    def tearDown(self):
+        try:
+            for schema in (self.target, self.decoy):
+                self.execute('DROP SCHEMA IF EXISTS %s CASCADE' % schema)
+        finally:
+            super(TestMigratorSchema, self).tearDown()
+
+    def columns(self, schema):
+        return sorted(c.name for c in
+                      self.database.get_columns('person', schema))
+
+    def sequences(self, schema):
+        curs = self.execute('SELECT sequence_name FROM '
+                            'information_schema.sequences '
+                            'WHERE sequence_schema = %s', (schema,))
+        return sorted(name for name, in curs.fetchall())
+
+    def test_operations(self):
+        migrate(
+            self.migrator.add_column('person', 'dob', DateField(null=True)),
+            self.migrator.add_column('person', 'karma',
+                                     IntegerField(default=0)),
+            self.migrator.rename_column('person', 'first_name', 'name'),
+            self.migrator.add_index('person', ('name',), True),
+            self.migrator.drop_index('person', 'person_name'),
+            self.migrator.drop_column('person', 'dob'))
+        self.assertEqual(self.columns(self.target), ['id', 'karma', 'name'])
+        self.assertEqual(self.columns(self.decoy), ['first_name', 'id'])
+
+    def test_reconnect(self):
+        # A new connection resets the search-path, the schema is unaffected.
+        self.database.close()
+        self.database.connect()
+        migrate(self.migrator.add_column('person', 'dob',
+                                         DateField(null=True)))
+        self.assertEqual(self.columns(self.target),
+                         ['dob', 'first_name', 'id'])
+        self.assertEqual(self.columns(self.decoy), ['first_name', 'id'])
+
+    def test_rename_table(self):
+        migrate(self.migrator.rename_table('person', 'people'))
+        self.assertEqual(self.database.get_tables(self.target), ['people'])
+        self.assertEqual(self.database.get_tables(self.decoy), ['person'])
+        self.assertEqual(self.sequences(self.target), ['people_id_seq'])
+        self.assertEqual(self.sequences(self.decoy), ['person_id_seq'])
+
+    def fk_target_schema(self, column):
+        curs = self.execute("""
+            SELECT n.nspname
+            FROM pg_constraint AS c
+            INNER JOIN pg_class AS t ON t.oid = c.confrelid
+            INNER JOIN pg_namespace AS n ON n.oid = t.relnamespace
+            INNER JOIN pg_attribute AS a ON a.attrelid = c.conrelid
+                AND a.attnum = c.conkey[1]
+            WHERE c.contype = 'f' AND c.conrelid = %s::regclass
+                AND a.attname = %s""",
+                            ('%s.person' % self.target, column))
+        return curs.fetchone()[0]
+
+    def test_foreign_key(self):
+        decoy = self.decoy
+        for schema in (self.target, decoy):
+            self.execute('CREATE TABLE %s.tag (id SERIAL PRIMARY KEY)'
+                         % schema)
+
+        class Elsewhere(Tag):
+            class Meta:
+                table_name = 'tag'
+                schema = decoy
+
+        migrate(
+            self.migrator.add_column('person', 'tag_id',
+                                     ForeignKeyField(Tag, field=Tag.id,
+                                                     null=True)),
+            self.migrator.add_column('person', 'other_id',
+                                     ForeignKeyField(Elsewhere,
+                                                     field=Elsewhere.id,
+                                                     null=True)))
+        # An unqualified model gets the migrator's schema, a model with a
+        # schema of its own keeps it.
+        self.assertEqual(self.fk_target_schema('tag_id'), self.target)
+        self.assertEqual(self.fk_target_schema('other_id'), decoy)
+
+    def test_drop_table_schema_overrides(self):
+        migrate(self.migrator.drop_table('person', schema=self.decoy))
+        self.assertEqual(self.database.get_tables(self.decoy), [])
+        self.assertEqual(self.database.get_tables(self.target), ['person'])
+
+    def test_qualified_table_name(self):
+        for op in (self.migrator.add_column('%s.person' % self.target, 'dob',
+                                            DateField(null=True)),
+                   self.migrator.add_index('%s.person' % self.target,
+                                           ('first_name',))):
+            self.assertRaises(ValueError, op.run)
+
+
+@skip_unless(IS_MYSQL)
+class TestMySQLMigratorSchema(DatabaseTestCase):
+    """A MySQL schema is a database, unqualified names use the connection's."""
+    target = 'peewee_test_ms'
+
+    @property
+    def decoy(self):
+        return self.database.database
+
+    def clean(self):
+        # FKs can point either way between decoy and target.
+        self.execute('SET FOREIGN_KEY_CHECKS=0')
+        try:
+            for table in ('mig_people', 'mig_person', 'mig_tag'):
+                self.execute('DROP TABLE IF EXISTS %s.%s'
+                             % (self.decoy, table))
+            self.execute('DROP DATABASE IF EXISTS %s' % self.target)
+        finally:
+            self.execute('SET FOREIGN_KEY_CHECKS=1')
+
+    def setUp(self):
+        super(TestMySQLMigratorSchema, self).setUp()
+        self.clean()
+        self.execute('CREATE DATABASE %s' % self.target)
+        for schema in (self.target, self.decoy):
+            self.execute('CREATE TABLE %s.mig_tag (id INT AUTO_INCREMENT '
+                         'PRIMARY KEY)' % schema)
+            self.execute('CREATE TABLE %s.mig_person (id INT AUTO_INCREMENT '
+                         'PRIMARY KEY, first_name VARCHAR(40) NOT NULL, '
+                         'tag_id INT NULL, FOREIGN KEY (tag_id) '
+                         'REFERENCES %s.mig_tag (id))' % (schema, schema))
+        self.migrator = SchemaMigrator.from_database(self.database,
+                                                     schema=self.target)
+
+    def tearDown(self):
+        try:
+            self.clean()
+        finally:
+            super(TestMySQLMigratorSchema, self).tearDown()
+
+    def columns(self, schema, table='mig_person'):
+        return sorted(c.name for c in
+                      self.database.get_columns(table, schema))
+
+    def test_operations(self):
+        migrate(
+            self.migrator.add_column('mig_person', 'dob',
+                                     DateField(null=True)),
+            self.migrator.drop_not_null('mig_person', 'first_name'),
+            self.migrator.add_not_null('mig_person', 'first_name'),
+            self.migrator.alter_column_type('mig_person', 'first_name',
+                                            CharField(80)),
+            self.migrator.rename_column('mig_person', 'first_name', 'name'),
+            self.migrator.add_index('mig_person', ('name',), False),
+            self.migrator.drop_index('mig_person', 'mig_person_name'),
+            self.migrator.drop_column('mig_person', 'dob'))
+        self.assertEqual(self.columns(self.target), ['id', 'name', 'tag_id'])
+        self.assertEqual(self.columns(self.decoy),
+                         ['first_name', 'id', 'tag_id'])
+
+    def fk_target_schema(self, column):
+        curs = self.execute('SELECT referenced_table_schema FROM '
+                            'information_schema.key_column_usage '
+                            'WHERE table_schema = %s AND '
+                            'table_name = %s AND column_name = %s',
+                            (self.target, 'mig_person', column))
+        return curs.fetchone()[0]
+
+    def test_foreign_key(self):
+        decoy = self.decoy
+
+        class Local(Tag):
+            class Meta:
+                table_name = 'mig_tag'
+
+        class Elsewhere(Tag):
+            class Meta:
+                table_name = 'mig_tag'
+                schema = decoy
+
+        migrate(
+            self.migrator.add_column('mig_person', 'local_id',
+                                     ForeignKeyField(Local, field=Local.id,
+                                                     null=True)),
+            self.migrator.add_column('mig_person', 'other_id',
+                                     ForeignKeyField(Elsewhere,
+                                                     field=Elsewhere.id,
+                                                     null=True)))
+        # An unqualified model gets the migrator's schema, a model with a
+        # schema of its own keeps it.
+        self.assertEqual(self.fk_target_schema('local_id'), self.target)
+        self.assertEqual(self.fk_target_schema('other_id'), decoy)
+
+    def test_foreign_key_column(self):
+        # Recreating the constraint reads the foreign keys of the schema.
+        migrate(self.migrator.add_not_null('mig_person', 'tag_id'),
+                self.migrator.rename_column('mig_person', 'tag_id', 'tid'))
+        self.assertEqual(self.columns(self.target),
+                         ['first_name', 'id', 'tid'])
+        self.assertEqual(self.columns(self.decoy),
+                         ['first_name', 'id', 'tag_id'])
+
+    def test_rename_table(self):
+        # An unqualified new name would move the table to the decoy.
+        migrate(self.migrator.rename_table('mig_person', 'mig_people'))
+        self.assertTrue('mig_people' in self.database.get_tables(self.target))
+        self.assertFalse('mig_people' in self.database.get_tables(self.decoy))
+
+    def test_drop_table_schema_overrides(self):
+        migrate(self.migrator.drop_table('mig_person', schema=self.decoy))
+        self.assertFalse('mig_person' in self.database.get_tables(self.decoy))
+        self.assertTrue('mig_person' in self.database.get_tables(self.target))
+
+    def test_qualified_table_name(self):
+        op = self.migrator.add_column('%s.mig_person' % self.target, 'dob',
+                                      DateField(null=True))
+        self.assertRaises(ValueError, op.run)
+
+
 # Migration runner (playhouse.migrations).
 
 def add_column_mig(column):
@@ -1497,6 +1736,72 @@ def run_cli(*args):
     with redirect_stdout(out), redirect_stderr(err):
         rc = migrations_cli(list(args))
     return rc, out.getvalue(), err.getvalue()
+
+
+@requires_postgresql
+class TestRunnerSchema(DatabaseTestCase):
+    """One set of migration files runs against any number of schemas."""
+    target = 'runner_target'
+    decoy = 'runner_decoy'
+
+    def setUp(self):
+        super(TestRunnerSchema, self).setUp()
+        self.dir = tempfile.mkdtemp()
+        for schema in (self.target, self.decoy):
+            self.execute('DROP SCHEMA IF EXISTS %s CASCADE' % schema)
+            self.execute('CREATE SCHEMA %s' % schema)
+            self.execute('CREATE TABLE %s.person (id SERIAL PRIMARY KEY, '
+                         'first_name TEXT)' % schema)
+        with open(os.path.join(self.dir, '0001_notes.py'), 'w') as fh:
+            fh.write(add_column_mig('notes'))
+        self.runner = Runner(self.database, self.dir, schema=self.target)
+
+    def tearDown(self):
+        try:
+            shutil.rmtree(self.dir, ignore_errors=True)
+            for schema in (self.target, self.decoy):
+                self.execute('DROP SCHEMA IF EXISTS %s CASCADE' % schema)
+        finally:
+            super(TestRunnerSchema, self).tearDown()
+
+    def columns(self, schema):
+        return sorted(c.name for c in
+                      self.database.get_columns('person', schema))
+
+    def tables(self, schema):
+        return self.database.get_tables(schema)
+
+    def test_up_down(self):
+        self.assertEqual(self.runner.up(), ['0001_notes'])
+        self.assertEqual(self.columns(self.target),
+                         ['first_name', 'id', 'notes'])
+        self.assertEqual(self.columns(self.decoy), ['first_name', 'id'])
+        # History lives in the schema it describes.
+        self.assertTrue('schema_migration' in self.tables(self.target))
+        self.assertFalse('schema_migration' in self.tables(self.decoy))
+
+        self.assertEqual(self.runner.down(), ['0001_notes'])
+        self.assertEqual(self.columns(self.target), ['first_name', 'id'])
+
+    def test_per_schema_history(self):
+        self.runner.up()
+        other = Runner(self.database, self.dir, schema=self.decoy)
+        self.assertEqual(other.up(), ['0001_notes'])
+        self.assertEqual(self.columns(self.decoy),
+                         ['first_name', 'id', 'notes'])
+        self.assertEqual(sorted(self.runner.applied()), ['0001_notes'])
+        self.assertEqual(sorted(other.applied()), ['0001_notes'])
+
+        # Each schema reverts independently.
+        other.down()
+        self.assertEqual(self.columns(self.decoy), ['first_name', 'id'])
+        self.assertEqual(self.columns(self.target),
+                         ['first_name', 'id', 'notes'])
+
+    def test_fake_backfill(self):
+        self.assertEqual(self.runner.fake(), ['0001_notes'])
+        self.assertEqual(self.columns(self.target), ['first_name', 'id'])
+        self.assertEqual(self.runner.up(), [])
 
 
 class TestMigrationRunnerCLI(BaseTestCase):

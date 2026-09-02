@@ -377,7 +377,7 @@ the :class:`~playhouse.shortcuts.ThreadSafeDatabaseMetadata`.
            model_metadata_class = ThreadSafeDatabaseMetadata
 
 The database can now be swapped safely while running in a multi-threaded
-environment using the :meth:`Database.bind` or :meth:`Database.bind_ctx`.
+environment using :meth:`Database.bind` or :meth:`Database.bind_ctx`.
 
 Connecting via URL
 ------------------
@@ -520,7 +520,7 @@ To manage the connection lifetime without an implicit transaction, use
 .. code-block:: python
 
    with db.connection_context():
-       # Connection is open; no implicit transaction.
+       # Connection is open, no implicit transaction.
        results = User.select()
 
 ``connection_context()`` can also decorate a function:
@@ -537,16 +537,16 @@ Using autoconnect
 
 By default Peewee will automatically open a connection if one is not available.
 This behavior is controlled by the ``autoconnect`` Database parameter. Managing
-connections explicitly is considered a **best practice**, therefore
-consider disabling the ``autoconnect`` behavior:
+connections explicitly is considered a **best practice**, so consider
+disabling the ``autoconnect`` behavior:
 
 .. code-block:: python
 
    db = PostgresqlDatabase('app', autoconnect=False)
 
 It is helpful to be explicit about connection lifetimes. If a connection cannot
-be opened, the exception will be caught when the connection is being opened,
-rather than at query time.
+be opened, the exception is raised where ``connect()`` is called, rather than
+at query time.
 
 Thread safety
 ^^^^^^^^^^^^^
@@ -560,6 +560,37 @@ only have a single connection open at a given time.
 
 Peewee's :ref:`asyncio integration <pwasyncio>` stores connection state in
 task-local storage, so the same applies to async applications.
+
+.. _forking:
+
+Forking
+^^^^^^^
+
+A forked child process inherits any open connection from the parent, and both
+processes then read and write the same socket. Closing the connection in the
+child sends the driver's disconnect over that socket, which closes the parent's
+connection too.
+
+To avoid problems:
+
+* Close the connection in the parent before ``fork``, or
+* Call :meth:`Database.dispose` / :meth:`~playhouse.pool.PooledDatabase.dispose`
+  (pool) in the child, which discards the inherited connection(s) without
+  closing. The child then connects as usual.
+
+.. code-block:: python
+
+   # gunicorn.conf.py, the app itself connects per request.
+   def post_fork(server, worker):
+       db.dispose()
+
+   # multiprocessing, each worker connects once.
+   def init():
+       db.dispose()
+       db.connect()
+
+   with multiprocessing.Pool(4, initializer=init) as pool:
+       pool.map(work, items)
 
 DB-API Connection object
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -610,9 +641,9 @@ Executing SQL
 -------------
 
 SQL queries will typically be executed by calling ``execute()`` on a query
-constructed using the query-builder APIs (or by simply iterating over a query
+constructed using the query-builder APIs (or by iterating over a query
 object in the case of a :class:`Select` query). For cases where you wish to
-execute SQL directly, use the :meth:`Database.execute_sql`:
+execute SQL directly, use :meth:`Database.execute_sql`:
 
 .. code-block:: python
 
@@ -662,6 +693,52 @@ the standard library ``logging`` module:
 
 This is the simplest way to verify what queries are being issued during
 development.
+
+.. _query-hooks:
+
+Query Hooks
+-----------
+
+For more than logging, every :class:`Database` has a ``query_hooks`` list.
+Each callable in it is invoked after every query with a single
+:class:`QueryEvent`, on success and on failure alike:
+
+.. code-block:: python
+
+   def slow_query_log(event):
+       if event.duration > 0.5:
+           logger.warning('slow query (%.2fs): %s', event.duration, event.sql)
+
+   db.query_hooks.append(slow_query_log)
+
+``QueryEvent`` is a named tuple with ``sql``, ``params``, ``duration`` (in
+seconds, including connection or cursor acquisition), and ``exception``, which
+is ``None`` on success. Hooks observe the query and cannot modify it. An
+exception raised by a hook propagates to the caller. Do not mutate ``params``.
+When the list is empty no timing is performed, so idle overhead is a single
+attribute check.
+
+A retried query (e.g. under ``ReconnectMixin``) produces one event per
+attempt. With ``playhouse.sqliteq`` write events fire on the writer thread,
+and duration measures execution, not time spent queued.
+
+An OpenTelemetry span per query, using the event's duration to backdate the
+span start:
+
+.. code-block:: python
+
+   from opentelemetry import trace
+   tracer = trace.get_tracer('peewee')
+
+   def otel_hook(event):
+       end = time.time_ns()
+       span = tracer.start_span('query', start_time=end - int(event.duration * 1e9))
+       span.set_attribute('db.statement', event.sql)
+       if event.exception is not None:
+           span.set_status(trace.StatusCode.ERROR, str(event.exception))
+       span.end(end_time=end)
+
+   db.query_hooks.append(otel_hook)
 
 .. _testing:
 
