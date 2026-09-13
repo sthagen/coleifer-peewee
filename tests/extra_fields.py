@@ -3,10 +3,10 @@ import enum
 from peewee import *
 from playhouse.fields import CompressedField
 from playhouse.fields import EnumField
+from playhouse.fields import EnumFieldMixin
 from playhouse.fields import IntEnumField
 from playhouse.fields import PickleField
 
-from .base import db
 from .base import ModelTestCase
 from .base import TestModel
 
@@ -107,3 +107,20 @@ class TestEnumField(ModelTestCase):
     def test_enum_field_invalid(self):
         self.assertRaises(ValueError, Enums.create, color='mauve')
         self.assertRaises(ValueError, Enums.create, prio=4)
+
+    def test_enum_choices(self):
+        self.assertEqual(Enums.color.choices,
+                         [('red', 'RED'), ('blue', 'BLUE')])
+        self.assertEqual(Enums.prio.choices, [(1, 'LOW'), (9, 'HIGH')])
+
+        # Explicit choices win.
+        f = EnumField(Color, choices=[('red', 'Rouge'), ('blue', 'Bleu')])
+        self.assertEqual(f.choices, [('red', 'Rouge'), ('blue', 'Bleu')])
+
+    def test_enum_member_validation(self):
+        self.assertRaises(ValueError, EnumField, Prio)
+        self.assertRaises(ValueError, IntEnumField, Color)
+
+        # A mixin subclass declaring no value type is not validated.
+        class FloatEnumField(EnumFieldMixin, FloatField): pass
+        FloatEnumField(Prio)

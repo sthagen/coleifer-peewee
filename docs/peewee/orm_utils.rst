@@ -1301,7 +1301,8 @@ Extra Field Types
    Stores members of an :class:`enum.Enum` with string values in a
    :class:`CharField`, storing ``member.value`` and returning the member.
    Unknown values are rejected with a ``ValueError`` on both the write and
-   comparison paths.
+   comparison paths. An enum whose values are not strings is rejected at
+   field construction. Use :class:`IntEnumField` for integer values.
 
    .. code-block:: python
 
@@ -1316,9 +1317,9 @@ Extra Field Types
 
        Account.select().where(Account.status == Status.ARCHIVED)
 
-   ``max_length`` defaults to 255 as with :class:`CharField`.
-   :py:func:`~playhouse.pydantic_utils.to_pydantic` maps the field to the
-   enum itself, so generated schemas validate membership.
+   ``max_length`` defaults to 255 as with :class:`CharField`. ``choices``
+   defaults to ``(member.value, member.name)`` pairs. :py:func:`~playhouse.pydantic_utils.to_pydantic`
+   maps the field to the enum itself, so generated schemas validate membership.
 
 .. class:: IntEnumField(enum_class, **kwargs)
 

@@ -7,12 +7,27 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+[View commits](https://github.com/coleifer/peewee/compare/4.5.1...master)
+
+## 4.5.1
+
+* `EnumField` and `IntEnumField` validate member value types (`str` and
+  `int` respectively) at field construction.
+* `EnumField` and `IntEnumField` default `choices` to `(value, name)` pairs
+  derived from the enum.
+* Fix #3075, migration generation for `EnumField`. Generated migrations will
+  emit the storage field type (e.g. `IntegerField`) rather than `EnumField()`.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.5.0...4.5.1)
+
+## 4.5.0
+
 Backwards-incompatible:
 
 * MySQL and MariaDB connections no longer set `sql_mode`. Peewee had been
   setting `PIPES_AS_CONCAT`, but the param replaced the server's mode rather
   than adding to it, which silently disabled `STRICT_TRANS_TABLES` (etc).
-  Going forward Peewee will not modify `sql_mode` alone by default and use
+  Going forward Peewee will not modify `sql_mode` by default and use
   `CONCAT()` rather than `||` for MySQL/MariaDB.
 * MySQL and MariaDB connection charset defaults to `utf8mb4` instead of `utf8`,
   which is an alias for `utf8mb3` and cannot store 4-byte characters.
@@ -66,7 +81,7 @@ Improvements:
   `'11:12:13+02:00'` to an aware `datetime.time` instead of returning `str`.
   Only sqlite stores the offset. The postgres/mysql drivers drop it on write.
 
-[View commits](https://github.com/coleifer/peewee/compare/4.4.0...master)
+[View commits](https://github.com/coleifer/peewee/compare/4.4.0...4.5.0)
 
 ## 4.4.0
 
