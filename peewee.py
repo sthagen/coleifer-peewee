@@ -440,7 +440,7 @@ SNAKE_CASE_STEP1 = re.compile('(.)_*([A-Z][a-z]+)')
 SNAKE_CASE_STEP2 = re.compile('([a-z0-9])_*([A-Z])')
 
 # Used for making valid Python identifiers.
-IDENTIFIER_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+IDENTIFIER_RE = re.compile(r'[^\W\d]\w*')
 
 # Helper functions that are used in various parts of the codebase.
 def merge_dict(source, overrides):
@@ -5473,11 +5473,10 @@ class CursorWrapper(object):
             if valid_identifiers:
                 column = make_identifier(column)
 
-            if column in duplicates:
+            while column in duplicates:
                 duplicates[column] += 1
                 column = '%s_%s' % (column, duplicates[column])
-            else:
-                duplicates[column] = 1
+            duplicates[column] = 1
             identifiers.append(column)
         return identifiers
 
@@ -9243,6 +9242,16 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                         q.append(_key)
 
             self._dest_reachable[dest] = frozenset(reachable)
+
+        # When a join branch is unselected, don't mark it as missing, or lazy
+        # FK resolution will break.
+        selected = frozenset(self.column_keys)
+        keep = []
+        for src, attr, dest, is_dict, is_outer, is_fk in self.src_to_dest:
+            reachable = self._dest_reachable.get(dest, frozenset())
+            if dest in selected or reachable & selected:
+                keep.append((src, attr, dest, is_dict, is_outer, is_fk))
+        self.src_to_dest = keep
 
     def process_row(self, row):
         objects = {}
